@@ -4591,6 +4591,46 @@ fn terminal_with_marker(harness: &mut EditorTestHarness, output: &str) -> (u16, 
     screen_pos_of(harness, output).unwrap()
 }
 
+/// The cell under the drag pointer belongs to the selection. Selection ranges
+/// are end-exclusive internally, so the terminal mapper must resolve a
+/// rightward drag to the end of that cell rather than its start.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_drag_select_includes_pointer_cell() {
+    let mut harness = harness_or_return!(120, 30);
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    let (col, row) = terminal_with_marker(&mut harness, "XSELECT_COPY_ME");
+
+    drag_select_row(&mut harness, col, col + 10, row).unwrap();
+    harness.editor_mut().copy_selection();
+
+    assert_eq!(
+        harness.editor_mut().clipboard_content_for_test(),
+        "XSELECT_COP",
+        "the selection should include the cell under the drag pointer"
+    );
+}
+
+/// macOS terminal emulators reserve Cmd+C for their own native selection,
+/// while Fresh owns this drag through mouse reporting. Publishing the
+/// selection on mouse-up makes the host clipboard correct even though the
+/// terminal emulator never forwards Cmd+C to Fresh.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_drag_select_mouse_up_copies_selection() {
+    let mut harness = harness_or_return!(120, 30);
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    let (col, row) = terminal_with_marker(&mut harness, "XSELECT_COPY_ME");
+
+    drag_select_row(&mut harness, col, col + 10, row).unwrap();
+
+    assert_eq!(
+        harness.editor_mut().clipboard_content_for_test(),
+        "XSELECT_COP",
+        "mouse-up should publish the completed terminal selection"
+    );
+}
+
 /// Copying a drag selection completes the gesture: the split must resume the
 /// live grid on Ctrl+C, without waiting for new output or a manual
 /// Ctrl+Space (the "stuck in scrollback after copy" complaint).

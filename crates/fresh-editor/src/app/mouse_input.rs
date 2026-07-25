@@ -344,6 +344,22 @@ impl Editor {
                     }
                 }
 
+                // The outer terminal owns Cmd+C and never forwards it while
+                // application mouse reporting is active. Publish a completed
+                // terminal drag on release so the host clipboard already has
+                // the text when its native copy shortcut fires.
+                let publish_terminal_selection =
+                    self.active_window().mouse_state.dragging_text_selection
+                        && self
+                            .active_window()
+                            .is_terminal_buffer(self.active_buffer())
+                        && self.active_cursors().iter().any(|(_, cursor)| {
+                            cursor.selection_range().is_some() || cursor.has_block_selection()
+                        });
+                if publish_terminal_selection {
+                    self.copy_selection();
+                }
+
                 // Stop dragging and clear drag state
                 self.release_widget_scrollbar();
                 self.widget_text_drag = None;
@@ -3155,6 +3171,10 @@ impl Editor {
         } else {
             None
         };
+        let terminal_grid_target_end =
+            terminal_grid_target.map(|pos| self.terminal_grid_cell_end(buffer_id, pos));
+        let terminal_grid_anchor_end =
+            terminal_grid_target.map(|_| self.terminal_grid_cell_end(buffer_id, anchor_position));
 
         let Some((target_position, new_position, anchor_position, new_sticky_column)) = self
             .active_window()
@@ -3184,6 +3204,16 @@ impl Editor {
                     } else {
                         let word_end = drag_word_end.unwrap_or(anchor_position);
                         (find_word_start(&state.buffer, target_position), word_end)
+                    }
+                } else if let (Some(target_start), Some(target_end), Some(anchor_end)) = (
+                    terminal_grid_target,
+                    terminal_grid_target_end,
+                    terminal_grid_anchor_end,
+                ) {
+                    if target_start >= anchor_position {
+                        (target_end, anchor_position)
+                    } else {
+                        (target_start, anchor_end)
                     }
                 } else {
                     (target_position, anchor_position)
