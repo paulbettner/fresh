@@ -153,6 +153,7 @@ Keyboard and mouse input is now parsed by our own `fresh-input-parser` crate ins
 * **Terminal**
   * Scrollback no longer loses output or gets stuck mid-scroll (#2649, reported by @dmknght).
   * Drag selection now includes the cell under the pointer and publishes the completed selection on mouse-up, fixing the one-cell-behind right edge and macOS `Command+C` clipboard behavior.
+  * Added `terminal.mouse_forwarding = "never"` so Fresh can own wheel scrolling and drag selection even when the inner program requests mouse tracking.
 * **Tabs & splits**
   * A long filename no longer hides other tabs, and per-split scrolling is fixed (#2650, reported by @dmknght).
   * Closing a split now asks for confirmation first.

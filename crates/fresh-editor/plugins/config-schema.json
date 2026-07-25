@@ -1275,7 +1275,7 @@
           "default": true
         },
         "mouse_forwarding": {
-          "description": "When to forward mouse events to the program running inside the\nterminal. `requested` (default) forwards button/drag events only\nto programs that enabled mouse reporting (DECSET 1000/1002/1003),\nbuttonless motion only under all-motion (1003), and lets\nShift+drag bypass forwarding so text can always be selected;\nwheel events additionally reach alternate-screen programs\n(alternate-scroll arrow synthesis for pagers). `alt_screen` is\nthe legacy rule: every mouse event is forwarded to any\nalternate-screen program, whether or not it asked for the mouse,\nwith no Shift bypass.",
+          "description": "When to forward mouse events to the program running inside the\nterminal. `requested` (default) forwards button/drag events only\nto programs that enabled mouse reporting (DECSET 1000/1002/1003),\nbuttonless motion only under all-motion (1003), and lets\nShift+drag bypass forwarding so text can always be selected;\nwheel events additionally reach alternate-screen programs\n(alternate-scroll arrow synthesis for pagers). `never` reserves\nevery mouse event for Fresh's scrollback and selection UI.\n`alt_screen` is the legacy rule: every mouse event is forwarded\nto any alternate-screen program, whether or not it asked for the\nmouse, with no Shift bypass.",
           "$ref": "#/$defs/TerminalMouseForwarding",
           "default": "requested"
         }
@@ -1309,6 +1309,11 @@
           "description": "Forward only to programs that subscribed to mouse reporting;\nShift+drag bypasses so selection always stays available.",
           "type": "string",
           "const": "requested"
+        },
+        {
+          "description": "Never forward mouse events; Fresh owns scrolling and selection.",
+          "type": "string",
+          "const": "never"
         },
         {
           "description": "Legacy: forward everything to any alternate-screen program.",

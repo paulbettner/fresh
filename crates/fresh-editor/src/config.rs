@@ -2413,10 +2413,11 @@ pub struct TerminalConfig {
     /// buttonless motion only under all-motion (1003), and lets
     /// Shift+drag bypass forwarding so text can always be selected;
     /// wheel events additionally reach alternate-screen programs
-    /// (alternate-scroll arrow synthesis for pagers). `alt_screen` is
-    /// the legacy rule: every mouse event is forwarded to any
-    /// alternate-screen program, whether or not it asked for the mouse,
-    /// with no Shift bypass.
+    /// (alternate-scroll arrow synthesis for pagers). `never` reserves
+    /// every mouse event for Fresh's scrollback and selection UI.
+    /// `alt_screen` is the legacy rule: every mouse event is forwarded
+    /// to any alternate-screen program, whether or not it asked for the
+    /// mouse, with no Shift bypass.
     #[serde(default)]
     pub mouse_forwarding: TerminalMouseForwarding,
 }
@@ -2430,6 +2431,8 @@ pub enum TerminalMouseForwarding {
     /// Shift+drag bypasses so selection always stays available.
     #[default]
     Requested,
+    /// Never forward mouse events; Fresh owns scrolling and selection.
+    Never,
     /// Legacy: forward everything to any alternate-screen program.
     AltScreen,
 }

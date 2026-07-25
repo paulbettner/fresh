@@ -68,6 +68,9 @@ impl Window {
         }
 
         let forward = match forwarding {
+            // Reserve every mouse event for Fresh's own scrollback and
+            // selection handling, even when the child requested mouse input.
+            crate::config::TerminalMouseForwarding::Never => false,
             // Legacy rule: forward every event to any alternate-screen
             // program, whether or not it asked for the mouse.
             crate::config::TerminalMouseForwarding::AltScreen => {
