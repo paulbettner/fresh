@@ -560,8 +560,8 @@ impl Editor {
                 .active_window_mut()
                 .scroll_live_terminal_at_position(col, row, delta.signum())
         {
-            // The bundled Ghostty already normalizes each wheel step to one
-            // report. Keep the live emulator active and move exactly one row.
+            // Ghostty preserves native wheel accumulation and acceleration.
+            // Each report moves one row; faster gestures emit more reports.
         } else if self.handle_overlay_prompt_scroll(col, row, delta) {
             // Floating-overlay prompt (Live Grep): the wheel scrolls the pane
             // under the pointer — the preview when over it, otherwise the
