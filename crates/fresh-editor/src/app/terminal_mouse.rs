@@ -306,6 +306,36 @@ impl Window {
         None
     }
 
+    /// Scroll the focused live terminal under the pointer while preserving
+    /// terminal mode. Returns false when the pointer is not over that terminal.
+    pub(crate) fn scroll_live_terminal_at_position(
+        &mut self,
+        col: u16,
+        row: u16,
+        delta: i32,
+    ) -> bool {
+        if !self.focused_terminal_live() {
+            return false;
+        }
+        let Some((buffer_id, _)) = self.get_terminal_content_area_at_position(col, row) else {
+            return false;
+        };
+        if buffer_id != self.active_buffer() {
+            return false;
+        }
+        let Some(terminal_id) = self.get_terminal_id(buffer_id) else {
+            return false;
+        };
+        let Some(handle) = self.terminal_manager.get(terminal_id) else {
+            return false;
+        };
+        let Ok(mut state) = handle.state.lock() else {
+            return false;
+        };
+        state.scroll_lines(delta);
+        true
+    }
+
     /// Forward a mouse event to the terminal PTY.
     /// Converts screen coordinates to terminal-relative coordinates and sends the event.
     fn forward_mouse_to_terminal(

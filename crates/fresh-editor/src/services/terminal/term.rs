@@ -902,6 +902,14 @@ impl TerminalState {
         self.dirty = true;
     }
 
+    /// Scroll the live terminal emulator without switching to Fresh's
+    /// file-backed read-only scrollback view. Fresh uses negative deltas for
+    /// wheel-up, while alacritty uses positive deltas for older history.
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(-delta));
+        self.dirty = true;
+    }
+
     // =========================================================================
     // Terminal mode flags
     // =========================================================================
@@ -1482,6 +1490,20 @@ mod tests {
         state.process_output(b"Hello, World!");
         let content = state.content_string();
         assert!(content.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn live_terminal_wheel_uses_fresh_scroll_direction() {
+        let mut state = TerminalState::new(20, 3);
+        for i in 1..=6 {
+            state.process_output(format!("ROW-{i}\r\n").as_bytes());
+        }
+
+        assert_eq!(state.term.grid().display_offset(), 0);
+        state.scroll_lines(-1);
+        assert_eq!(state.term.grid().display_offset(), 1);
+        state.scroll_lines(1);
+        assert_eq!(state.term.grid().display_offset(), 0);
     }
 
     #[test]

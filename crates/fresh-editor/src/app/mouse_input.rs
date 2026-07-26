@@ -555,6 +555,13 @@ impl Editor {
         if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
             self.active_window_mut()
                 .handle_horizontal_scroll(col, row, delta)?;
+        } else if crate::services::terminal_modes::smarty_fresh_ghostty_passthrough_enabled()
+            && self
+                .active_window_mut()
+                .scroll_live_terminal_at_position(col, row, delta.signum())
+        {
+            // The bundled Ghostty already normalizes each wheel step to one
+            // report. Keep the live emulator active and move exactly one row.
         } else if self.handle_overlay_prompt_scroll(col, row, delta) {
             // Floating-overlay prompt (Live Grep): the wheel scrolls the pane
             // under the pointer — the preview when over it, otherwise the

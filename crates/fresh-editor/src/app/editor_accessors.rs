@@ -1021,6 +1021,22 @@ impl Editor {
         }
     }
 
+    /// Live terminal content rectangles from the most recently rendered frame.
+    /// smarty-fresh reports these to its bundled Ghostty so native selection is
+    /// reserved only for terminal cells, never editor chrome or file buffers.
+    pub fn smarty_fresh_live_terminal_rects(
+        &self,
+    ) -> impl Iterator<Item = ratatui::layout::Rect> + '_ {
+        let window = self.active_window();
+        window.layout_cache.split_areas.iter().filter_map(
+            move |(split_id, buffer_id, content_rect, _, _, _)| {
+                (window.is_terminal_buffer(*buffer_id)
+                    && !window.split_terminal_scrollback(*split_id, *buffer_id))
+                .then_some(*content_rect)
+            },
+        )
+    }
+
     /// The active window's layout-cache (split-leaf rects, tab rects,
     /// file-explorer rect, view-line mappings). Mouse hit-testing and
     /// visual-line motion read from here.
