@@ -861,6 +861,69 @@ fn test_terminal_state_initialization() {
     assert!(state.cursor_visible());
 }
 
+/// Animated output must not yank a live terminal away from scrollback.
+#[test]
+#[cfg(not(windows))]
+fn test_live_terminal_scrollback_stays_put_while_output_arrives() {
+    let mut harness = harness_or_return!(80, 24);
+    harness
+        .editor_mut()
+        .set_terminal_jump_to_end_on_output(false);
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"for i in $(seq 1 80); do echo HISTORY-$i; done\n");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("HISTORY-80"))
+        .unwrap();
+
+    let buffer_id = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("active buffer should be a terminal");
+    {
+        let handle = harness
+            .editor()
+            .terminal_manager()
+            .get(terminal_id)
+            .expect("terminal handle should exist");
+        let mut state = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.scroll_lines(-5);
+        assert!(
+            !state.cursor_visible(),
+            "fixture should be reading scrollback"
+        );
+    }
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"printf '\\rANIMATED_STATUS_TICK'\n");
+    harness.wait_for_async_quiescence(3).unwrap();
+
+    let handle = harness
+        .editor()
+        .terminal_manager()
+        .get(terminal_id)
+        .expect("terminal handle should still exist");
+    let state = handle
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !state.cursor_visible(),
+        "new output must preserve a nonzero live-terminal display offset"
+    );
+}
+
 /// Test terminal bold text attribute
 /// Uses direct terminal state processing (synchronous) instead of PTY
 #[test]
