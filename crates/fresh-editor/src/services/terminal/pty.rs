@@ -59,12 +59,15 @@ pub fn key_to_pty_bytes(
             let c = if shift { c.to_ascii_uppercase() } else { c };
             Some(encode_char(c))
         }
-        // The keys below have no parameterised escape sequence to carry a
-        // modifier, so Alt is expressed the only way legacy encoding can: an
-        // `ESC` prefix (metaSendsEscape). Alt+Backspace as `ESC DEL` is
-        // readline's delete-previous-word; before this, Alt was simply dropped
-        // and the child saw a bare Backspace.
-        KeyCode::Enter => Some(maybe_esc(alt, vec![b'\r'])),
+        KeyCode::Enter => {
+            if shift {
+                // Match Ghostty's legacy modified-key encoding so shells and
+                // prompt editors can distinguish Shift+Enter from submission.
+                Some(maybe_esc(alt, b"\x1b[27;2;13~".to_vec()))
+            } else {
+                Some(maybe_esc(alt, vec![b'\r']))
+            }
+        }
         KeyCode::Tab => {
             if shift {
                 // Shift+Tab (backtab)
@@ -267,6 +270,12 @@ mod tests {
     fn test_enter() {
         let bytes = key_to_pty_bytes(KeyCode::Enter, KeyModifiers::NONE, false);
         assert_eq!(bytes, Some(vec![b'\r']));
+    }
+
+    #[test]
+    fn test_shift_enter() {
+        let bytes = key_to_pty_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false);
+        assert_eq!(bytes, Some(b"\x1b[27;2;13~".to_vec()));
     }
 
     #[test]

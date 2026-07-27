@@ -729,11 +729,9 @@ impl TerminalState {
         (cursor.column.0 as u16, cursor.line.0 as u16)
     }
 
-    /// Check if cursor is visible
+    /// Check if the live cursor is visible in the current viewport.
     pub fn cursor_visible(&self) -> bool {
-        // alacritty_terminal doesn't expose cursor visibility directly
-        // We'll assume it's always visible for now
-        true
+        self.term.grid().display_offset() == 0
     }
 
     /// Snapshot of the cursor row's text content as a plain string.
@@ -1500,10 +1498,13 @@ mod tests {
         }
 
         assert_eq!(state.term.grid().display_offset(), 0);
+        assert!(state.cursor_visible());
         state.scroll_lines(-1);
         assert_eq!(state.term.grid().display_offset(), 1);
+        assert!(!state.cursor_visible());
         state.scroll_lines(1);
         assert_eq!(state.term.grid().display_offset(), 0);
+        assert!(state.cursor_visible());
     }
 
     #[test]
