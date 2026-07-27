@@ -861,10 +861,11 @@ fn test_terminal_state_initialization() {
     assert!(state.cursor_visible());
 }
 
-/// Animated output must not yank a live terminal away from scrollback.
+/// Animated output must preserve live scrollback, while keyboard input returns
+/// the pane to the active prompt.
 #[test]
 #[cfg(not(windows))]
-fn test_live_terminal_scrollback_stays_put_while_output_arrives() {
+fn test_live_terminal_scrollback_output_and_key_behavior() {
     let mut harness = harness_or_return!(80, 24);
     harness
         .editor_mut()
@@ -909,18 +910,38 @@ fn test_live_terminal_scrollback_stays_put_while_output_arrives() {
         .send_terminal_input(b"printf '\\rANIMATED_STATUS_TICK'\n");
     harness.wait_for_async_quiescence(3).unwrap();
 
+    {
+        let handle = harness
+            .editor()
+            .terminal_manager()
+            .get(terminal_id)
+            .expect("terminal handle should still exist");
+        let state = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !state.cursor_visible(),
+            "new output must preserve a nonzero live-terminal display offset"
+        );
+    }
+
+    harness
+        .send_key(KeyCode::Char('x'), KeyModifiers::NONE)
+        .unwrap();
+
     let handle = harness
         .editor()
         .terminal_manager()
         .get(terminal_id)
-        .expect("terminal handle should still exist");
+        .expect("terminal handle should still exist after input");
     let state = handle
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     assert!(
-        !state.cursor_visible(),
-        "new output must preserve a nonzero live-terminal display offset"
+        state.cursor_visible(),
+        "terminal key input must return the live grid to the active prompt"
     );
 }
 
