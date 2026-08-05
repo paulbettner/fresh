@@ -116,8 +116,11 @@ pub struct ExitedTerminal {
     /// restart mints it a new one instead of bringing the agent back unable to
     /// drive the editor.
     pub script_access: bool,
-    /// The tab title as it read *before* the exit marker was appended, so a
-    /// restart can put it back. `None` for an auto-named tab, which re-derives
+    /// Descriptive companion marker to reactivate on restart or workspace
+    /// restore. Authentication material remains live-only on the PTY handle.
+    pub companion: Option<fresh_core::api::TerminalCompanion>,
+    /// The tab title as it read *before* the `(exited)` marker was appended, so
+    /// a restart can put it back. `None` for an auto-named tab, which re-derives
     /// its name from the reborn process.
     pub title: Option<String>,
 }
@@ -903,6 +906,12 @@ pub struct Window {
     /// just re-run their launch command.
     pub terminal_resume_commands:
         std::collections::HashMap<crate::services::terminal::TerminalId, Vec<String>>,
+    /// Persistable descriptive companion marker by terminal identity. Secrets
+    /// and live protocol state remain exclusively on the terminal handle.
+    pub terminal_companions: std::collections::HashMap<
+        crate::services::terminal::TerminalId,
+        fresh_core::api::TerminalCompanion,
+    >,
 
     /// Terminals whose child was handed a `FRESH_CMD_TOKEN` capability token
     /// (`allowScript`), mapped to the token that terminal's *current*
@@ -2246,6 +2255,7 @@ impl Window {
             ephemeral_terminals: std::collections::HashSet::new(),
             terminal_commands: std::collections::HashMap::new(),
             terminal_resume_commands: std::collections::HashMap::new(),
+            terminal_companions: std::collections::HashMap::new(),
             terminal_script_tokens: std::collections::HashMap::new(),
             exited_terminals: HashMap::new(),
             plugin_dev_workspaces: HashMap::new(),
@@ -4223,6 +4233,7 @@ mod exited_terminal_tests {
             resume: resume.map(argv),
             ephemeral: true,
             script_access: false,
+            companion: None,
             title: None,
         }
     }

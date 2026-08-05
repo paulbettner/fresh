@@ -225,8 +225,16 @@ impl Editor {
         id: BufferId,
         terminal_id: crate::services::terminal::TerminalId,
     ) {
-        // Close the terminal process
+        let terminal = fresh_core::WindowTerminalId::new(self.active_window, terminal_id);
+        self.purge_omp_companion_terminal(terminal);
+        self.active_window_mut()
+            .terminal_companions
+            .remove(&terminal_id);
         self.active_window_mut().terminal_manager.close(terminal_id);
+        if self.self_update_terminal == Some(terminal) {
+            self.finish_self_update(false);
+            self.self_update_terminal = None;
+        }
         // Drop any explicit-title marker / cached foreground name so the
         // id can't carry stale auto-naming state if a future buffer
         // reuses it.

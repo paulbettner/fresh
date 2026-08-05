@@ -18,19 +18,24 @@
 //! to append any new scrollback lines to the backing file. This ensures scrollback is
 //! written incrementally as lines scroll off screen, avoiding O(n) work on mode switches.
 
+pub(crate) use super::omp_companion::{
+    OmpCompanionLiveState, OmpCompanionSpawn, OMP_OUTPUT_FRAME_MAX, OMP_OUTPUT_PREFIX,
+    OMP_OUTPUT_TERMINATOR, OMP_SYNC_B64_LEN, OMP_TAG_B64_LEN,
+};
 use super::term::TerminalState;
 use crate::services::async_bridge::AsyncBridge;
 use crate::services::authority::TerminalWrapper;
+use fresh_core::api::{OmpCompanionCommandType, TerminalCompanion};
+pub use fresh_core::TerminalId;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-
-pub use fresh_core::TerminalId;
+use std::time::Instant;
 
 /// What a spawning terminal should do with the on-disk transcripts (rendered
 /// scrollback + raw PTY log) it is handed.
@@ -100,6 +105,10 @@ pub struct TerminalHandle {
     /// The identity tag shared with this terminal's reader/wait threads,
     /// rewritten when the handle moves to another window's manager.
     wt_id: SharedWtId,
+    /// Live capability shared with the reader. The editor bridge may clone the
+    /// Arc to drain and authenticate the latest candidate without exposing the
+    /// secret itself.
+    pub(crate) companion: Option<Arc<OmpCompanionLiveState>>,
 }
 
 impl TerminalHandle {
@@ -130,8 +139,39 @@ impl TerminalHandle {
         self.alive.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The companion kind attached to this PTY incarnation, if any.
+    pub fn companion_kind(&self) -> Option<TerminalCompanion> {
+        self.companion.as_ref().map(|companion| companion.kind())
+    }
+
+    /// Frame and admit a private OMP command to this terminal's writer queue.
+    ///
+    /// `true` means only that the exact live writer channel accepted the frame;
+    /// OMP handling is observed later through snapshots.
+    pub fn enqueue_omp_companion_command(&self, command: OmpCompanionCommandType) -> bool {
+        if !self.alive.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(companion) = &self.companion else {
+            return false;
+        };
+        let Some(frame) = companion.frame_command_if_active(command, &self.alive) else {
+            return false;
+        };
+        self.command_tx.send(TerminalCommand::Write(frame)).is_ok()
+    }
+
+    /// Revoke commands, authentication, and candidate delivery immediately.
+    /// The reader-owned output filter remains live until its final drain.
+    pub fn revoke_omp_companion(&self) {
+        if let Some(companion) = &self.companion {
+            companion.revoke_access();
+        }
+    }
+
     /// Shutdown the terminal
     pub fn shutdown(&self) {
+        self.revoke_omp_companion();
         // Receiver may be dropped if terminal already exited; nothing to do in that case.
         #[allow(clippy::let_underscore_must_use)]
         let _ = self.command_tx.send(TerminalCommand::Shutdown);
@@ -331,7 +371,7 @@ impl TerminalManager {
     /// # Returns
     /// The terminal ID if successful
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
+    pub(crate) fn spawn(
         &mut self,
         cols: u16,
         rows: u16,
@@ -342,6 +382,7 @@ impl TerminalManager {
         terminal_wrapper: crate::services::authority::TerminalWrapper,
         env_delta: crate::services::env_provider::EnvDelta,
         extra_env: HashMap<String, String>,
+        companion: Option<OmpCompanionSpawn>,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.next_id);
         self.next_id += 1;
@@ -357,6 +398,7 @@ impl TerminalManager {
             terminal_wrapper,
             env_delta,
             extra_env,
+            companion,
         )?;
 
         self.terminals.insert(id, handle);
@@ -383,6 +425,7 @@ impl TerminalManager {
         terminal_wrapper: TerminalWrapper,
         env_delta: crate::services::env_provider::EnvDelta,
         extra_env: HashMap<String, String>,
+        companion: Option<OmpCompanionSpawn>,
     ) -> Result<TerminalHandle, String> {
         let pty_pair = open_pty(cols, rows)?;
 
@@ -443,10 +486,17 @@ impl TerminalManager {
         // windows). See `fresh_core::WindowTerminalId`. Shared (not copied)
         // with the reader/wait threads so `adopt` can retag a live terminal
         // when it moves to another window's manager.
+        let companion = companion.map(|spawn| Arc::new(OmpCompanionLiveState::new(spawn)));
         let wt_id: SharedWtId = Arc::new(Mutex::new(fresh_core::WindowTerminalId::new(
             self.window_id,
             id,
         )));
+        let exit_coordinator = Arc::new(ExitCoordinator::new(
+            self.async_bridge.clone(),
+            wt_id.clone(),
+            id,
+            companion.clone(),
+        ));
 
         // Reader thread: drains PTY output, feeds the emulator, streams
         // scrollback / raw log to disk, and pings the main loop to redraw.
@@ -460,12 +510,19 @@ impl TerminalManager {
             wt_id: wt_id.clone(),
             terminal_id: id,
             alive: alive.clone(),
+            filtered_output: if companion.is_some() {
+                Vec::with_capacity(4096)
+            } else {
+                Vec::new()
+            },
+            companion: companion.clone(),
+            exit_coordinator: exit_coordinator.clone(),
         };
         thread::spawn(move || reader_loop.run());
 
-        // Wait thread: blocks on `child.wait()` and fires `TerminalExited`
-        // exactly once with the real exit code.
-        spawn_wait_thread(child, self.async_bridge.clone(), wt_id.clone(), id);
+        // Wait thread: records status; the shared barrier emits only after the
+        // reader has reached EOF and completed its final flush.
+        spawn_wait_thread(child, exit_coordinator);
 
         // Capture the PTY master fd before the master moves into the writer
         // thread. Used later by `foreground_process_name` (tab auto-naming).
@@ -495,6 +552,7 @@ impl TerminalManager {
             pid: child_pid,
             master_fd,
             wt_id,
+            companion,
         })
     }
 
@@ -532,14 +590,14 @@ impl TerminalManager {
         self.terminals.get_mut(&id)
     }
 
-    /// Close a terminal
+    /// Close a terminal, revoking its companion before removing the handle.
     pub fn close(&mut self, id: TerminalId) -> bool {
-        if let Some(handle) = self.terminals.remove(&id) {
-            handle.shutdown();
-            true
-        } else {
-            false
-        }
+        let Some(handle) = self.terminals.get(&id) else {
+            return false;
+        };
+        handle.shutdown();
+        self.terminals.remove(&id);
+        true
     }
 
     /// Get all terminal IDs
@@ -552,11 +610,12 @@ impl TerminalManager {
         self.terminals.len()
     }
 
-    /// Shutdown all terminals
+    /// Shutdown all terminals, revoking capabilities before handles disappear.
     pub fn shutdown_all(&mut self) {
-        for (_, handle) in self.terminals.drain() {
+        for handle in self.terminals.values() {
             handle.shutdown();
         }
+        self.terminals.clear();
     }
 
     /// Clean up dead terminals
@@ -564,11 +623,14 @@ impl TerminalManager {
         let dead: Vec<TerminalId> = self
             .terminals
             .iter()
-            .filter(|(_, h)| !h.is_alive())
+            .filter(|(_, handle)| !handle.is_alive())
             .map(|(id, _)| *id)
             .collect();
 
         for id in &dead {
+            if let Some(handle) = self.terminals.get(id) {
+                handle.revoke_omp_companion();
+            }
             self.terminals.remove(id);
         }
 
@@ -717,37 +779,117 @@ fn open_transcript_file(
     options.open(path).ok().map(std::io::BufWriter::new)
 }
 
-/// Wait-thread body: block on the child's exit and fire `TerminalExited` once.
-/// Owns `child` so it is the single source of the exit status (the reader
-/// thread deliberately doesn't fire it, to avoid a racing `exit_code: None`).
-fn spawn_wait_thread(
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+/// Shared child-status/reader-drained barrier. The second prerequisite clears
+/// the drained companion output filter and emits the sole `TerminalExited` notification.
+struct ExitCoordinator {
+    inner: Mutex<ExitCoordinatorState>,
     async_bridge: Option<AsyncBridge>,
     wt_id: SharedWtId,
     terminal_id: TerminalId,
+    companion: Option<Arc<OmpCompanionLiveState>>,
+}
+
+#[derive(Default)]
+struct ExitCoordinatorState {
+    child_finished: bool,
+    reader_drained: bool,
+    emitted: bool,
+    exit_code: Option<i32>,
+}
+
+impl ExitCoordinator {
+    fn new(
+        async_bridge: Option<AsyncBridge>,
+        wt_id: SharedWtId,
+        terminal_id: TerminalId,
+        companion: Option<Arc<OmpCompanionLiveState>>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(ExitCoordinatorState::default()),
+            async_bridge,
+            wt_id,
+            terminal_id,
+            companion,
+        }
+    }
+
+    fn child_finished(&self, exit_code: Option<i32>) {
+        let should_emit = {
+            let Ok(mut state) = self.inner.lock() else {
+                return;
+            };
+            state.child_finished = true;
+            state.exit_code = exit_code;
+            Self::claim_emission(&mut state)
+        };
+        if should_emit {
+            self.emit();
+        }
+    }
+
+    fn reader_drained(&self) {
+        let should_emit = {
+            let Ok(mut state) = self.inner.lock() else {
+                return;
+            };
+            state.reader_drained = true;
+            Self::claim_emission(&mut state)
+        };
+        if should_emit {
+            self.emit();
+        }
+    }
+
+    fn claim_emission(state: &mut ExitCoordinatorState) -> bool {
+        if state.child_finished && state.reader_drained && !state.emitted {
+            state.emitted = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn emit(&self) {
+        if let Some(companion) = &self.companion {
+            companion.finalize_output_filter();
+        }
+        let exit_code = self.inner.lock().ok().and_then(|state| state.exit_code);
+        let Some(bridge) = &self.async_bridge else {
+            return;
+        };
+        // Read the tag only after both prerequisites; adoption may have changed
+        // the owning window while either background thread was still active.
+        let Ok(terminal) = self.wt_id.lock().map(|id| *id) else {
+            return;
+        };
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = bridge.sender().send(
+            crate::services::async_bridge::AsyncMessage::TerminalExited {
+                terminal,
+                exit_code,
+            },
+        );
+    }
+}
+
+/// Wait-thread body: record the child's status without racing reader flushes.
+fn spawn_wait_thread(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    exit_coordinator: Arc<ExitCoordinator>,
 ) {
     thread::spawn(move || {
         let exit_code = match child.wait() {
             Ok(status) => Some(status.exit_code() as i32),
-            Err(e) => {
-                tracing::warn!("child.wait() failed for {:?}: {}", terminal_id, e);
+            Err(error) => {
+                tracing::warn!(
+                    "child.wait() failed for {:?}: {}",
+                    exit_coordinator.terminal_id,
+                    error
+                );
                 None
             }
         };
-        if let Some(bridge) = &async_bridge {
-            // Read the tag at exit time — the terminal may have been
-            // adopted by another window since it was spawned.
-            let Ok(terminal) = wt_id.lock().map(|id| *id) else {
-                return;
-            };
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = bridge.sender().send(
-                crate::services::async_bridge::AsyncMessage::TerminalExited {
-                    terminal,
-                    exit_code,
-                },
-            );
-        }
+        exit_coordinator.child_finished(exit_code);
     });
 }
 
@@ -810,6 +952,9 @@ struct ReaderLoop {
     wt_id: SharedWtId,
     terminal_id: TerminalId,
     alive: Arc<AtomicBool>,
+    companion: Option<Arc<OmpCompanionLiveState>>,
+    filtered_output: Vec<u8>,
+    exit_coordinator: Arc<ExitCoordinator>,
 }
 
 impl ReaderLoop {
@@ -821,7 +966,6 @@ impl ReaderLoop {
         loop {
             match self.reader.read(&mut buf) {
                 Ok(0) => {
-                    // EOF - process exited.
                     tracing::info!(
                         "Terminal {:?} EOF after {} total bytes",
                         self.terminal_id,
@@ -831,40 +975,66 @@ impl ReaderLoop {
                 }
                 Ok(n) => {
                     total_bytes += n;
-                    // Hot path: a busy terminal reads tens of thousands of
-                    // chunks/sec, so this stays at `trace` (off by default) to
-                    // avoid flooding the log — and, if that log is tailed into a
-                    // terminal this manager owns, a positive-feedback loop.
                     tracing::trace!(
                         "Terminal {:?} received {} bytes (total: {})",
                         self.terminal_id,
                         n,
                         total_bytes
                     );
-                    self.process_output(&buf[..n]);
-                    self.append_raw_log(&buf[..n]);
-                    self.notify_redraw();
+                    self.process_read(&buf[..n], Instant::now());
                 }
-                Err(e) => {
-                    tracing::error!("Terminal read error: {}", e);
+                Err(error) => {
+                    tracing::error!("Terminal read error: {}", error);
                     break;
                 }
             }
         }
-        self.alive
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        // Best-effort flush of log/backing files during teardown. The
-        // wait-thread is the single source of `TerminalExited`, so the reader
-        // intentionally does not fire it here (firing from both races and can
-        // yield `exit_code: None` despite a clean exit).
-        if let Some(mut w) = self.log_writer.take() {
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = w.flush();
+
+        // An unverified prefix/synchronizer fragment is ordinary output at EOF;
+        // a verified, unterminated candidate is private and is discarded.
+        let trailing_visible = self
+            .companion
+            .as_ref()
+            .map_or_else(Vec::new, |companion| companion.finish_output());
+        if !trailing_visible.is_empty() {
+            self.process_visible_output(&trailing_visible);
         }
-        if let Some(mut w) = self.backing_writer.take() {
+
+        // The reader side of the exit barrier is recorded only after every
+        // final emulator/backing/log action and writer flush has completed.
+        if let Some(writer) = self.backing_writer.as_mut() {
             #[allow(clippy::let_underscore_must_use)]
-            let _ = w.flush();
+            let _ = writer.flush();
         }
+        if let Some(writer) = self.log_writer.as_mut() {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = writer.flush();
+        }
+        self.alive.store(false, Ordering::Release);
+        self.exit_coordinator.reader_drained();
+    }
+
+    fn process_read(&mut self, bytes: &[u8], now: Instant) {
+        let Some(companion) = self.companion.as_ref() else {
+            self.process_visible_output(bytes);
+            return;
+        };
+        let notify_candidate = companion.filter_output_into(bytes, now, &mut self.filtered_output);
+        if notify_candidate {
+            self.notify_companion_candidate();
+        }
+        if !self.filtered_output.is_empty() {
+            let mut visible = std::mem::take(&mut self.filtered_output);
+            self.process_visible_output(&visible);
+            visible.clear();
+            self.filtered_output = visible;
+        }
+    }
+
+    fn process_visible_output(&mut self, bytes: &[u8]) {
+        self.process_output(bytes);
+        self.append_raw_log(bytes);
+        self.notify_redraw();
     }
 
     /// Feed `bytes` to the emulator, forward any PTY write-responses, and stream
@@ -937,6 +1107,19 @@ impl ReaderLoop {
                 .sender()
                 .send(crate::services::async_bridge::AsyncMessage::TerminalOutput { terminal });
         }
+    }
+
+    fn notify_companion_candidate(&self) {
+        let Some(bridge) = &self.async_bridge else {
+            return;
+        };
+        let Ok(terminal) = self.wt_id.lock().map(|id| *id) else {
+            return;
+        };
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = bridge.sender().send(
+            crate::services::async_bridge::AsyncMessage::OmpCompanionSnapshotReady { terminal },
+        );
     }
 }
 
@@ -1014,7 +1197,417 @@ pub fn detect_shell() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::omp_companion::{
+        omp_companion_output_tag, omp_companion_synchronizer, test_companion,
+        test_output_frame as output_frame, test_secret,
+    };
     use super::*;
+    use std::collections::VecDeque;
+    struct ChunkReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl ChunkReader {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+            }
+        }
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.chunks.front_mut() else {
+                return Ok(0);
+            };
+            let count = chunk.len().min(buf.len());
+            buf[..count].copy_from_slice(&chunk[..count]);
+            chunk.drain(..count);
+            if chunk.is_empty() {
+                self.chunks.pop_front();
+            }
+            Ok(count)
+        }
+    }
+
+    fn test_reader_loop(
+        chunks: Vec<Vec<u8>>,
+        companion: Option<Arc<OmpCompanionLiveState>>,
+        bridge: AsyncBridge,
+        log_path: &std::path::Path,
+        backing_path: &std::path::Path,
+    ) -> (
+        Arc<Mutex<TerminalState>>,
+        Arc<ExitCoordinator>,
+        Arc<AtomicBool>,
+    ) {
+        let terminal_id = TerminalId(7);
+        let wt_id = Arc::new(Mutex::new(fresh_core::WindowTerminalId::new(
+            fresh_core::WindowId(9),
+            terminal_id,
+        )));
+        let exit_coordinator = Arc::new(ExitCoordinator::new(
+            Some(bridge.clone()),
+            wt_id.clone(),
+            terminal_id,
+            companion.clone(),
+        ));
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 4)));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (response_tx, _response_rx) = mpsc::channel();
+        ReaderLoop {
+            reader: Box::new(ChunkReader::new(chunks)),
+            state: state.clone(),
+            response_tx,
+            backing_writer: open_backing_writer(Some(backing_path), BackingMode::Fresh),
+            log_writer: open_log_writer(Some(log_path), BackingMode::Fresh),
+            async_bridge: Some(bridge),
+            wt_id,
+            terminal_id,
+            alive: alive.clone(),
+            companion,
+            filtered_output: Vec::with_capacity(4096),
+            exit_coordinator: exit_coordinator.clone(),
+        }
+        .run();
+        (state, exit_coordinator, alive)
+    }
+
+    #[test]
+    fn reader_excludes_private_only_bytes_from_emulator_files_and_output_events() {
+        let secret = test_secret();
+        let companion = test_companion(secret);
+        let frame = output_frame(&secret, br#"{"version":1,"type":"snapshot"}"#);
+        let split_a = 13;
+        let split_b = frame.len() - 5;
+        let chunks = vec![
+            frame[..split_a].to_vec(),
+            frame[split_a..split_b].to_vec(),
+            frame[split_b..].to_vec(),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("raw.log");
+        let backing_path = directory.path().join("backing.txt");
+        let bridge = AsyncBridge::new();
+        let (state, _, alive) = test_reader_loop(
+            chunks,
+            Some(companion.clone()),
+            bridge.clone(),
+            &log_path,
+            &backing_path,
+        );
+
+        assert!(!alive.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"");
+        assert_eq!(std::fs::read(&backing_path).unwrap(), b"");
+        let emulator_content = match state.lock() {
+            Ok(state) => state.content_string(),
+            Err(poisoned) => poisoned.into_inner().content_string(),
+        };
+        assert!(!emulator_content.contains("fresh-omp"));
+        assert_eq!(companion.take_candidate(), Some(frame));
+        let messages = bridge.try_recv_all();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            crate::services::async_bridge::AsyncMessage::OmpCompanionSnapshotReady { .. }
+        ));
+    }
+
+    #[test]
+    fn reader_forwards_only_surrounding_public_bytes() {
+        let secret = test_secret();
+        let companion = test_companion(secret);
+        let frame = output_frame(&secret, b"snapshot");
+        let mut chunk = b"VISIBLE-BEFORE".to_vec();
+        chunk.extend_from_slice(&frame);
+        chunk.extend_from_slice(b"-VISIBLE-AFTER");
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("raw.log");
+        let backing_path = directory.path().join("backing.txt");
+        let bridge = AsyncBridge::new();
+        let (state, _, _) = test_reader_loop(
+            vec![chunk],
+            Some(companion),
+            bridge.clone(),
+            &log_path,
+            &backing_path,
+        );
+
+        assert_eq!(
+            std::fs::read(&log_path).unwrap(),
+            b"VISIBLE-BEFORE-VISIBLE-AFTER"
+        );
+        let content = match state.lock() {
+            Ok(state) => state.content_string(),
+            Err(poisoned) => poisoned.into_inner().content_string(),
+        };
+        assert!(content.contains("VISIBLE-BEFORE-VISIBLE-AFTER"));
+        assert!(!content.contains("omp-companion"));
+        let messages = bridge.try_recv_all();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    crate::services::async_bridge::AsyncMessage::TerminalOutput { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    crate::services::async_bridge::AsyncMessage::OmpCompanionSnapshotReady { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn revoked_split_candidate_stays_filtered_until_reader_drain_and_exit_barrier() {
+        let secret = test_secret();
+        let companion = test_companion(secret);
+        let frame = output_frame(&secret, b"split-after-manual-close");
+        let split = OMP_OUTPUT_PREFIX.len() + OMP_SYNC_B64_LEN + 1 + 5;
+        let mut visible = Vec::new();
+        assert!(!companion.filter_output_into(&frame[..split], Instant::now(), &mut visible,));
+        assert!(visible.is_empty());
+
+        companion.revoke_access();
+        assert!(!companion.test_output_filter_finalized());
+
+        let mut remaining = frame[split..].to_vec();
+        remaining.extend_from_slice(b"ordinary-after-close");
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("raw.log");
+        let backing_path = directory.path().join("backing.txt");
+        let bridge = AsyncBridge::new();
+        let (state, coordinator, alive) = test_reader_loop(
+            vec![remaining],
+            Some(companion.clone()),
+            bridge.clone(),
+            &log_path,
+            &backing_path,
+        );
+
+        assert!(!alive.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"ordinary-after-close");
+        let content = match state.lock() {
+            Ok(state) => state.content_string(),
+            Err(poisoned) => poisoned.into_inner().content_string(),
+        };
+        assert!(content.contains("ordinary-after-close"));
+        assert!(!content.contains("fresh-omp"));
+        assert!(companion.take_candidate().is_none());
+        assert!(!companion.test_output_filter_finalized());
+
+        let messages = bridge.try_recv_all();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            crate::services::async_bridge::AsyncMessage::TerminalOutput { .. }
+        ));
+
+        coordinator.child_finished(Some(0));
+        assert!(companion.test_output_filter_finalized());
+        let messages = bridge.try_recv_all();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            crate::services::async_bridge::AsyncMessage::TerminalExited {
+                exit_code: Some(0),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn command_frame_is_private_direction_separated_and_reports_admission() {
+        let secret = test_secret();
+        let companion = test_companion(secret);
+        let (command_tx, command_rx) = mpsc::channel();
+        let handle = TerminalHandle {
+            state: Arc::new(Mutex::new(TerminalState::new(80, 4))),
+            command_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 4,
+            cwd: None,
+            shell: "omp".to_string(),
+            pid: None,
+            master_fd: None,
+            wt_id: Arc::new(Mutex::new(fresh_core::WindowTerminalId::new(
+                fresh_core::WindowId(1),
+                TerminalId(2),
+            ))),
+            companion: Some(companion.clone()),
+        };
+
+        assert_eq!(handle.companion_kind(), Some(TerminalCompanion::Omp));
+        assert!(handle.enqueue_omp_companion_command(OmpCompanionCommandType::Cancel));
+        let TerminalCommand::Write(frame) = command_rx.recv().unwrap() else {
+            panic!("companion command must be admitted as a PTY write");
+        };
+        assert!(frame.starts_with("\u{10ffff}fresh-omp-command:v1:".as_bytes()));
+        assert!(frame.ends_with("\u{10fffe}".as_bytes()));
+        assert!(!frame
+            .windows(secret.len())
+            .any(|window| window == secret.as_slice()));
+        let payload =
+            &frame["\u{10ffff}fresh-omp-command:v1:".len()..frame.len() - "\u{10fffe}".len()];
+        let separator = payload.iter().position(|byte| *byte == b'.').unwrap();
+        assert_eq!(
+            &payload[..separator],
+            b"eyJ2ZXJzaW9uIjoxLCJ0eXBlIjoiY2FuY2VsIn0"
+        );
+        assert_eq!(
+            &payload[separator + 1..],
+            b"pnoZtZh1IvlXyDP3ukIHnEDdSb4vjqePd89L2dcBIWQ"
+        );
+
+        handle.alive.store(false, Ordering::Release);
+        assert!(!handle.enqueue_omp_companion_command(OmpCompanionCommandType::RequestSnapshot));
+        handle.alive.store(true, Ordering::Release);
+
+        companion.revoke_access();
+        assert!(!handle.enqueue_omp_companion_command(OmpCompanionCommandType::RequestSnapshot));
+        drop(command_rx);
+        assert!(!handle.enqueue_omp_companion_command(OmpCompanionCommandType::Cancel));
+    }
+
+    #[test]
+    fn command_admission_is_false_when_writer_channel_is_disconnected() {
+        let companion = test_companion(test_secret());
+        let (command_tx, command_rx) = mpsc::channel();
+        drop(command_rx);
+        let handle = TerminalHandle {
+            state: Arc::new(Mutex::new(TerminalState::new(80, 4))),
+            command_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 4,
+            cwd: None,
+            shell: "omp".to_string(),
+            pid: None,
+            master_fd: None,
+            wt_id: Arc::new(Mutex::new(fresh_core::WindowTerminalId::new(
+                fresh_core::WindowId(1),
+                TerminalId(2),
+            ))),
+            companion: Some(companion),
+        };
+        assert!(!handle.enqueue_omp_companion_command(OmpCompanionCommandType::Cancel));
+    }
+
+    #[test]
+    fn exit_is_single_and_waits_for_reader_final_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("raw.log");
+        let backing_path = directory.path().join("backing.txt");
+        let bridge = AsyncBridge::new();
+        let terminal_id = TerminalId(7);
+        let wt_id = Arc::new(Mutex::new(fresh_core::WindowTerminalId::new(
+            fresh_core::WindowId(9),
+            terminal_id,
+        )));
+        let coordinator = Arc::new(ExitCoordinator::new(
+            Some(bridge.clone()),
+            wt_id.clone(),
+            terminal_id,
+            None,
+        ));
+        coordinator.child_finished(Some(23));
+        assert!(bridge.try_recv_all().is_empty());
+
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 4)));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (response_tx, _response_rx) = mpsc::channel();
+        ReaderLoop {
+            reader: Box::new(ChunkReader::new(vec![
+                b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\n".to_vec(),
+            ])),
+            state,
+            response_tx,
+            backing_writer: open_backing_writer(Some(&backing_path), BackingMode::Fresh),
+            log_writer: open_log_writer(Some(&log_path), BackingMode::Fresh),
+            async_bridge: Some(bridge.clone()),
+            wt_id,
+            terminal_id,
+            alive: alive.clone(),
+            companion: None,
+            filtered_output: Vec::new(),
+            exit_coordinator: coordinator.clone(),
+        }
+        .run();
+
+        assert!(!alive.load(Ordering::Acquire));
+        assert_eq!(
+            std::fs::read(&log_path).unwrap(),
+            b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\n"
+        );
+        let backing = String::from_utf8(std::fs::read(&backing_path).unwrap()).unwrap();
+        assert!(backing.contains("line-0"));
+        let messages = bridge.try_recv_all();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            crate::services::async_bridge::AsyncMessage::TerminalOutput { .. }
+        ));
+        assert!(matches!(
+            &messages[1],
+            crate::services::async_bridge::AsyncMessage::TerminalExited {
+                exit_code: Some(23),
+                ..
+            }
+        ));
+        coordinator.reader_drained();
+        coordinator.child_finished(Some(99));
+        assert!(bridge.try_recv_all().is_empty());
+    }
+
+    #[test]
+    fn exit_barrier_also_waits_when_reader_finishes_first_and_revokes_before_exit() {
+        let secret = test_secret();
+        let companion = test_companion(secret);
+        let bridge = AsyncBridge::new();
+        let terminal_id = TerminalId(3);
+        let coordinator = ExitCoordinator::new(
+            Some(bridge.clone()),
+            Arc::new(Mutex::new(fresh_core::WindowTerminalId::new(
+                fresh_core::WindowId(4),
+                terminal_id,
+            ))),
+            terminal_id,
+            Some(companion.clone()),
+        );
+        coordinator.reader_drained();
+        assert!(bridge.try_recv_all().is_empty());
+        assert!(companion.verify_output_auth(
+            &omp_companion_synchronizer(&secret),
+            b"body",
+            &omp_companion_output_tag(&secret, b"body")
+        ));
+        coordinator.child_finished(None);
+        assert!(companion.take_candidate().is_none());
+        assert!(!companion.verify_output_auth(
+            &omp_companion_synchronizer(&secret),
+            b"body",
+            &omp_companion_output_tag(&secret, b"body")
+        ));
+        let messages = bridge.try_recv_all();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            crate::services::async_bridge::AsyncMessage::TerminalExited {
+                exit_code: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn test_terminal_id_display() {

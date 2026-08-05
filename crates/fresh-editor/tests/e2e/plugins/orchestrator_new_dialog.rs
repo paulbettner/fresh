@@ -1231,12 +1231,10 @@ fn expand_advanced(harness: &mut EditorTestHarness) {
 }
 
 /// The launcher prioritises the coding-CLI presets — a bare `terminal`,
-/// then `claude`, `codex`, `opencode` — ahead of the long-standing `aider`
-/// and the `custom…` escape hatch. The agent selector is a single dropdown
-/// (`Agent: [<selected> ▼]`); ←/→ cycles it through the presets in that
-/// priority order. We prove the ordering by adjacency — from `claude`, one
-/// `→` lands on `codex`, the next on `opencode` — which is independent of
-/// whichever preset the dropdown happens to open on.
+/// then `claude`, `codex`, `opencode`, and the native-TUI `omp` companion —
+/// ahead of the long-standing `aider` and the `custom…` escape hatch. The
+/// agent selector is a single dropdown (`Agent: [<selected> ▼]`); ←/→ cycles
+/// it in registry order.
 #[test]
 fn preset_row_lists_prioritised_agents_in_order() {
     let (_temp, workspace) = set_up_workspace();
@@ -1277,6 +1275,16 @@ fn preset_row_lists_prioritised_agents_in_order() {
     assert!(
         focused_line(&harness.screen_to_string()).contains("opencode"),
         "`→` from codex must select opencode next. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        focused_line(&harness.screen_to_string()).contains("omp"),
+        "`→` from opencode must select the native OMP preset next. Screen:\n{}",
         harness.screen_to_string(),
     );
 }
@@ -1581,6 +1589,40 @@ fn opencode_shows_start_prompt_without_auto_mode() {
     assert!(
         !screen.contains("Auto mode"),
         "opencode has no launch auto-mode flag, so no Auto mode checkbox. Screen:\n{screen}",
+    );
+}
+
+/// OMP accepts a launch-only positional start prompt but deliberately has no
+/// approval-bypass flag. The native companion does not widen OMP's approval
+/// posture.
+#[test]
+fn omp_shows_start_prompt_without_auto_mode() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    focus_agent_preset_stop(&mut harness);
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("omp") {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 8,
+            "stepping the preset selector never reached omp. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Start prompt"),
+        "OMP accepts the normal positional start prompt. Screen:\n{screen}",
+    );
+    assert!(
+        !screen.contains("Auto mode"),
+        "OMP must not surface an approval-bypass auto-mode flag. Screen:\n{screen}",
     );
 }
 

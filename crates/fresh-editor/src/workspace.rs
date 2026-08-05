@@ -568,6 +568,10 @@ pub struct SerializedTerminalWorkspace {
     /// read back as `false`, i.e. no grant, the safe direction.
     #[serde(default, skip_serializing_if = "is_false")]
     pub script_access: bool,
+    /// Descriptive companion marker. Capability secrets and live state are
+    /// deliberately excluded from workspace persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<fresh_core::api::TerminalCompanion>,
 }
 
 /// `skip_serializing_if` helper: keeps the default-`false` capability flag out
@@ -1781,5 +1785,31 @@ mod tests {
         }"#;
         let restored: FileExplorerState = serde_json::from_str(json).unwrap();
         assert_eq!(restored.width, crate::config::ExplorerWidth::Percent(30));
+    }
+
+    #[test]
+    fn terminal_companion_marker_is_additive_and_secret_free() {
+        let legacy = r#"{
+            "terminal_index":0,
+            "cwd":null,
+            "shell":"omp",
+            "cols":80,
+            "rows":24,
+            "log_path":"terminal.log",
+            "backing_path":"terminal.txt",
+            "command":["omp","hello"],
+            "agent_resume":{"argv":["omp","--resume","00000000-0000-0000-0000-000000000000"]}
+        }"#;
+        let legacy_terminal: SerializedTerminalWorkspace =
+            serde_json::from_str(legacy).expect("legacy terminal workspace must decode");
+        assert!(legacy_terminal.companion.is_none());
+
+        let mut marked = legacy_terminal;
+        marked.companion = Some(fresh_core::api::TerminalCompanion::Omp);
+        let json = serde_json::to_string(&marked).expect("serialize companion marker");
+        assert!(json.contains("\"companion\":\"omp\""));
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("token"));
+        assert!(!json.contains("snapshot"));
     }
 }

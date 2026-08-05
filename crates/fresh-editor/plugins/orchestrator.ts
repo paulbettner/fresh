@@ -20,18 +20,17 @@ import {
   activate,
   button,
   col,
+  divider,
   dropdown,
   flexSpacer,
   FloatingWidgetPanel,
   hintBar,
-  divider,
   key as widgetKey,
   labeledSection,
   list,
+  overlay,
   raw,
   row,
-  wrappingRow,
-  overlay,
   spacer,
   styledRow,
   text,
@@ -39,9 +38,14 @@ import {
   toggle,
   tree,
   treeNode,
-  windowEmbed,
   type WidgetSpec,
+  windowEmbed,
+  wrappingRow,
 } from "./lib/widgets.ts";
+import {
+  OmpCompanionController,
+  type OmpCompanionControllerSession,
+} from "./lib/omp_companion_controller.ts";
 
 const editor = getEditor();
 
@@ -49,16 +53,14 @@ const editor = getEditor();
 // Types
 // =============================================================================
 
-// A session's coarse activity, inferred from its agent terminal:
-//   "working" — the terminal emitted output within the last
-//               IDLE_AFTER_MS (the agent is actively producing).
-//   "idle"    — quiet: waiting for input, finished, exited, or just
-//               sitting. Also the honest default before we've seen any
-//               output, since we have no evidence of work yet.
-// This is deliberately only two states: it's all the terminal-output
-// signal can honestly support. We don't poll the process, so "working"
-// means "printing", not "alive" — an agent that goes quiet to think
-// reads as idle until it prints again.
+// A session's coarse activity. A live OMP companion snapshot is authoritative;
+// otherwise the companion controller preserves the existing OSC/output fallback:
+//   "working" — a structured working state, an active OSC command, or terminal
+//               output within IDLE_AFTER_MS.
+//   "idle"    — a structured resting state, an ended OSC command, or no recent
+//               terminal output.
+// This deliberately stays coarse: the dock only needs an activity signal, while
+// the native terminal remains the detailed agent UI.
 type AgentState = "working" | "idle";
 
 // One row in the completion popup. `kind: "history"` items
@@ -69,7 +71,7 @@ type AgentState = "working" | "idle";
 // marker + style.
 type CompletionItem = { value: string; kind?: "history" };
 
-interface AgentSession {
+interface AgentSession extends OmpCompanionControllerSession {
   // Editor's stable session id.
   id: number;
   // Durable workspace identity (`ws-…`) reported by the host window.
@@ -98,7 +100,8 @@ interface AgentSession {
   // Latest explicit OSC activity signal from the session's terminal (OSC
   // 133 command markers / OSC 9;4 progress): `true` = a command/task is
   // running, `false` = it has finished. When set, this is authoritative for
-  // the working/idle indicator (see `sessionState`), so an agent that goes
+  // the working/idle indicator (projected by
+  // `ompCompanion.activityState`), so an agent that goes
   // quiet mid-command still reads "working" and a finished one flips to
   // idle at once. `undefined`/`null` ⇒ no signal, fall back to output
   // timing.
@@ -116,10 +119,10 @@ interface AgentSession {
   sharedWorktree: boolean;
   // The terminal id Orchestrator spawned in this session, if any.
   terminalId: number | null;
-  // Coarse activity, recomputed from `lastOutputAt` at render time
-  // (see `sessionState`). Not authoritative on its own — the timestamp
-  // is. ("active" — the focused window — is computed separately from
-  // `editor.activeWindow()`.)
+  // Coarse activity, projected from the companion facet/OSC/`lastOutputAt` at
+  // render time (see `ompCompanion.activityState`). Not authoritative on its
+  // own — the timestamp is. ("active" — the focused window — is computed
+  // separately from `editor.activeWindow()`.)
   state: AgentState;
   // Wall-clock ms of the most recent terminal_output for this session,
   // or null if it has never produced output (or has no terminal). This
@@ -179,51 +182,51 @@ interface AgentSession {
 type RemoteFacet = NonNullable<AgentSession["remote"]>;
 type CreateSpec =
   | {
-      backend: "local";
-      // Directory the session roots at (typed value or resolved default).
-      projectPath: string;
-      // Explicit workspace name; "" ⇒ auto-generate at create time.
-      name: string;
-      // Agent command; "" ⇒ a bare terminal.
-      cmd: string;
-      // Enable the agent's auto/reduced-approval mode (adds the agent's
-      // documented flag, e.g. `claude --permission-mode auto`). Only honoured
-      // for a command that resolves to a known agent with an `auto` flag;
-      // ignored for a bare terminal / unknown command.
-      auto: boolean;
-      // Initial prompt to hand the agent at launch (positional or via the
-      // agent's prompt flag). "" ⇒ no prompt. Only applied to a resolved agent
-      // that documents a prompt argument; never replayed on resume.
-      startPrompt: string;
-      // Inject the Fresh CLI system prompt + mint a capability token so the
-      // agent can drive the editor from the shell. Only honoured for a command
-      // that resolves to an agent with a `systemPrompt` strategy.
-      teachFreshCli: boolean;
-      // "Checkout branch": an existing branch/ref to check out (worktree) or
-      // switch to (in-place). "" ⇒ the detected default branch (worktree only).
-      branch: string;
-      // "New branch name": when set, create the worktree on a freshly-cut
-      // branch off the checkout branch (or default). "" ⇒ no new branch.
-      // Ignored in the non-worktree (in-place checkout) path.
-      newBranch: string;
-      // Create a fresh worktree (only honoured when the path is a git tree).
-      createWorktree: boolean;
-      // Row label + project shown on the pending dock row.
-      displayLabel: string;
-      displayProject: string;
-    }
+    backend: "local";
+    // Directory the session roots at (typed value or resolved default).
+    projectPath: string;
+    // Explicit workspace name; "" ⇒ auto-generate at create time.
+    name: string;
+    // Agent command; "" ⇒ a bare terminal.
+    cmd: string;
+    // Enable the agent's auto/reduced-approval mode (adds the agent's
+    // documented flag, e.g. `claude --permission-mode auto`). Only honoured
+    // for a command that resolves to a known agent with an `auto` flag;
+    // ignored for a bare terminal / unknown command.
+    auto: boolean;
+    // Initial prompt to hand the agent at launch (positional or via the
+    // agent's prompt flag). "" ⇒ no prompt. Only applied to a resolved agent
+    // that documents a prompt argument; never replayed on resume.
+    startPrompt: string;
+    // Inject the Fresh CLI system prompt + mint a capability token so the
+    // agent can drive the editor from the shell. Only honoured for a command
+    // that resolves to an agent with a `systemPrompt` strategy.
+    teachFreshCli: boolean;
+    // "Checkout branch": an existing branch/ref to check out (worktree) or
+    // switch to (in-place). "" ⇒ the detected default branch (worktree only).
+    branch: string;
+    // "New branch name": when set, create the worktree on a freshly-cut
+    // branch off the checkout branch (or default). "" ⇒ no new branch.
+    // Ignored in the non-worktree (in-place checkout) path.
+    newBranch: string;
+    // Create a fresh worktree (only honoured when the path is a git tree).
+    createWorktree: boolean;
+    // Row label + project shown on the pending dock row.
+    displayLabel: string;
+    displayProject: string;
+  }
   | {
-      backend: "ssh" | "kubernetes";
-      // The host payload handed to `attachRemoteAgent`.
-      spec: RemoteAgentSpec;
-      // Facet stamped on both the born window and the pending placeholder.
-      facet: RemoteFacet;
-      displayLabel: string;
-      displayProject: string;
-      // The command to persist as `orchestrator.last_cmd` on success (ssh
-      // remembers it), or "" to persist nothing.
-      persistCmd: string;
-    };
+    backend: "ssh" | "kubernetes";
+    // The host payload handed to `attachRemoteAgent`.
+    spec: RemoteAgentSpec;
+    // Facet stamped on both the born window and the pending placeholder.
+    facet: RemoteFacet;
+    displayLabel: string;
+    displayProject: string;
+    // The command to persist as `orchestrator.last_cmd` on success (ssh
+    // remembers it), or "" to persist nothing.
+    persistCmd: string;
+  };
 
 interface PendingCreate {
   // `"creating"` while the background create/connect runs; `"error"` once it
@@ -300,6 +303,20 @@ interface PrInfo {
 // =============================================================================
 
 const orchestratorSessions = new Map<number, AgentSession>();
+const ompCompanion = new OmpCompanionController<AgentSession>({
+  getSession: (windowId) => orchestratorSessions.get(windowId),
+  reconcileSessions,
+  activeWindowId: () => editor.activeWindow(),
+  now: () => Date.now(),
+  delay: (ms) => editor.delay(ms),
+  sendCommand: (windowId, terminalId, type) =>
+    editor.sendOmpCompanionCommand(windowId, terminalId, type),
+  setTerminalResume: (windowId, terminalId, command) =>
+    editor.setTerminalResume(windowId, terminalId, command),
+  t: (key, args) => args === undefined ? editor.t(key) : editor.t(key, args),
+  setStatus: (message) => editor.setStatus(message),
+  refreshUi: refreshOpenDialog,
+});
 
 // Permanent display slot for each session, keyed by its canonical root
 // (NOT its id — a discovered worktree keeps its slot when it opens and its
@@ -383,8 +400,16 @@ type SessionBackend = "local" | "ssh" | "kubernetes" | "devcontainer";
 const SESSION_BACKENDS: { id: SessionBackend; label: string; key: string }[] = [
   { id: "local", label: editor.t("backend.local"), key: "type-local" },
   { id: "ssh", label: editor.t("backend.ssh"), key: "type-ssh" },
-  { id: "kubernetes", label: editor.t("backend.kubernetes"), key: "type-kubernetes" },
-  { id: "devcontainer", label: editor.t("backend.devcontainer"), key: "type-devcontainer" },
+  {
+    id: "kubernetes",
+    label: editor.t("backend.kubernetes"),
+    key: "type-kubernetes",
+  },
+  {
+    id: "devcontainer",
+    label: editor.t("backend.devcontainer"),
+    key: "type-devcontainer",
+  },
 ];
 
 interface NewSessionForm {
@@ -509,11 +534,21 @@ interface NewSessionForm {
   // history rows mixed into the completion popup — Up/Down on a
   // history-bearing field reopens the popup, where historical
   // entries appear after live completion candidates.)
-  historyCursor: { project_path: number; name: number; cmd: number; branch: number };
+  historyCursor: {
+    project_path: number;
+    name: number;
+    cmd: number;
+    branch: number;
+  };
   // Saved draft text per field: when the user first presses Up
   // we squirrel away whatever was in `value` so Down can
   // restore it.
-  historyDraft: { project_path: string; name: string; cmd: string; branch: string };
+  historyDraft: {
+    project_path: string;
+    name: string;
+    cmd: string;
+    branch: string;
+  };
   // Inline-dropdown completion state. `field` names which input
   // the suggestion list belongs to; the list is only rendered
   // while that input is focused. `items` is the post-filter set
@@ -783,14 +818,19 @@ type DockMenuTarget =
   | { kind: "session"; id: number }
   | { kind: "folder"; id: string };
 type DockMenuState =
-  | { target: DockMenuTarget; anchorCol: number; anchorRow: number; stage: "menu" }
   | {
-      target: { kind: "session"; id: number };
-      anchorCol: number;
-      anchorRow: number;
-      stage: "confirm";
-      action: "archive" | "delete";
-    };
+    target: DockMenuTarget;
+    anchorCol: number;
+    anchorRow: number;
+    stage: "menu";
+  }
+  | {
+    target: { kind: "session"; id: number };
+    anchorCol: number;
+    anchorRow: number;
+    stage: "confirm";
+    action: "archive" | "delete";
+  };
 let dockMenuPanel: FloatingWidgetPanel | null = null;
 let dockMenuState: DockMenuState | null = null;
 // Default dock width on a "typical" terminal, and the bounds the
@@ -1007,7 +1047,11 @@ function loadFolders(): DockFolder[] {
         const name = rec.name;
         const parent = rec.parent;
         if (typeof id === "string" && typeof name === "string") {
-          out.push({ id, name, parent: typeof parent === "string" ? parent : null });
+          out.push({
+            id,
+            name,
+            parent: typeof parent === "string" ? parent : null,
+          });
         }
       }
     }
@@ -1173,7 +1217,10 @@ function loadLastActive(): Record<string, number> {
 }
 
 function saveLastActive(): void {
-  editor.setGlobalState(LAST_ACTIVE_KEY, (dockLastActive ?? {}) as unknown as object);
+  editor.setGlobalState(
+    LAST_ACTIVE_KEY,
+    (dockLastActive ?? {}) as unknown as object,
+  );
 }
 
 function todayDayNumber(): number {
@@ -1208,7 +1255,11 @@ function markSessionActiveToday(s: AgentSession): void {
 function sessionLastActiveDay(s: AgentSession): number {
   const stored = loadLastActive()[normRoot(s.root)];
   if (stored !== undefined) return stored;
-  const liveMs = Math.max(s.lastOutputAt ?? 0, s.activatedAt ?? 0, s.createdAt ?? 0);
+  const liveMs = Math.max(
+    s.lastOutputAt ?? 0,
+    s.activatedAt ?? 0,
+    s.createdAt ?? 0,
+  );
   return liveMs > 0 ? Math.floor(liveMs / MS_PER_DAY) : todayDayNumber();
 }
 
@@ -1244,7 +1295,10 @@ function loadNames(): Record<string, string> {
 }
 
 function saveNames(): void {
-  editor.setGlobalState(WORKSPACE_NAMES_KEY, (dockNames ?? {}) as unknown as object);
+  editor.setGlobalState(
+    WORKSPACE_NAMES_KEY,
+    (dockNames ?? {}) as unknown as object,
+  );
 }
 
 // The manual name pinned to a workspace, if any: its own stable-id entry
@@ -1269,7 +1323,8 @@ function workspaceDisplayName(s: AgentSession): string {
   if (manual) return manual;
   const title = (s.terminalTitle ?? "").trim();
   if (title && !s.discovered) {
-    const prefix = (s.hostLabel || editor.pathBasename(s.root) || "workspace").trim();
+    const prefix = (s.hostLabel || editor.pathBasename(s.root) || "workspace")
+      .trim();
     return prefix + WORKSPACE_AUTONAME_SEP + title;
   }
   return s.hostLabel;
@@ -1403,7 +1458,10 @@ function buildDockTree(filtered: number[], activeId: number): DockTree {
 
   const emitFolder = (f: DockFolder, depth: number): void => {
     nodes.push(
-      treeNode(folderNodeEntry(f, countRec(f.id)), { depth, hasChildren: true }),
+      treeNode(folderNodeEntry(f, countRec(f.id)), {
+        depth,
+        hasChildren: true,
+      }),
     );
     keys.push(folderNodeKey(f.id));
     model.push({ kind: "folder", folderId: f.id });
@@ -1414,7 +1472,9 @@ function buildDockTree(filtered: number[], activeId: number): DockTree {
   // single-row line either way.
   const card = dockMode && dockView === "card";
   const emitSession = (id: number, depth: number): void => {
-    const primary = card ? sessionCardPrimary(id, activeId) : sessionNodeEntry(id, activeId);
+    const primary = card
+      ? sessionCardPrimary(id, activeId)
+      : sessionNodeEntry(id, activeId);
     nodes.push(
       treeNode(primary, {
         depth,
@@ -1430,7 +1490,9 @@ function buildDockTree(filtered: number[], activeId: number): DockTree {
       if (searching && countRec(f.id) === 0) continue;
       emitFolder(f, depth);
       walk(f.id, depth + 1);
-      for (const sid of membersByFolder.get(f.id) ?? []) emitSession(sid, depth + 1);
+      for (const sid of membersByFolder.get(f.id) ?? []) {
+        emitSession(sid, depth + 1);
+      }
     }
   };
   walk(null, 0);
@@ -1465,7 +1527,9 @@ function folderNodeEntry(f: DockFolder, count: number): TextPropertyEntry {
 // Message colour: red once the create has failed, amber while it is still
 // creating or is paused (interrupted, awaiting resume).
 function pendingMsgFg(p: PendingCreate): string {
-  return p.phase === "error" ? "ui.status_error_indicator_fg" : "diagnostic.warning_fg";
+  return p.phase === "error"
+    ? "ui.status_error_indicator_fg"
+    : "diagnostic.warning_fg";
 }
 
 // `error` and `paused` are actionable — Enter retries / resumes them — while
@@ -1609,6 +1673,7 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
     text: s.label,
     style: { fg: isActive ? "ui.help_key_fg" : undefined, bold: true },
   });
+
   // A remote session surfaces its backend target (host / ns·pod) coloured
   // by the connection state — pill parity (the pill shows it at the right
   // end of line 1).
@@ -1818,10 +1883,9 @@ function reconcileSessions(): void {
       // time. Core makes it the *active* window, so claim the pending facet
       // only for the active id — otherwise a pre-existing untracked window
       // processed first would wrongly grab it. Cleared once claimed.
-      const remote =
-        pendingRemoteFacet && s.id === editor.activeWindow()
-          ? pendingRemoteFacet
-          : undefined;
+      const remote = pendingRemoteFacet && s.id === editor.activeWindow()
+        ? pendingRemoteFacet
+        : undefined;
       if (remote) pendingRemoteFacet = null;
       orchestratorSessions.set(s.id, {
         id: s.id,
@@ -1849,7 +1913,9 @@ function reconcileSessions(): void {
       applyResolvedLabel(existing);
       existing.root = s.root;
       existing.projectPath = s.project_path;
-      if (s.shared_worktree != null) existing.sharedWorktree = s.shared_worktree;
+      if (s.shared_worktree != null) {
+        existing.sharedWorktree = s.shared_worktree;
+      }
       // Keep the backend facet in step with the host's view: adopt it when
       // missing (a dormant session that predates the facet, or one whose
       // plugin-side record was created before the snapshot carried it), and
@@ -2006,21 +2072,6 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
 // 5s is a reasonable middle.
 const IDLE_AFTER_MS = 5000;
 
-// Coarse activity for a session, derived purely from how recently its
-// terminal produced output. This is the single source of truth — the
-// stored `state` field is just a cache of this for persistence/sorting.
-// No output ever (or no terminal) ⇒ idle: we have no evidence of work.
-function sessionState(s: AgentSession): AgentState {
-  // An explicit OSC activity signal (shell integration / progress) is
-  // authoritative over the output-timing heuristic: a command running keeps
-  // the workspace "working" even while it prints nothing, and a finished
-  // command flips it idle at once rather than riding out IDLE_AFTER_MS.
-  if (s.oscRunning === true) return "working";
-  if (s.oscRunning === false) return "idle";
-  if (s.lastOutputAt === null) return "idle";
-  return Date.now() - s.lastOutputAt < IDLE_AFTER_MS ? "working" : "idle";
-}
-
 // Age is shown at DAY granularity on purpose. A finer (s/m/h) counter ticks
 // every second/minute, and because the dock re-renders on the probe-poll
 // cadence, each tick changed the serialized card → a real frame → a full
@@ -2039,35 +2090,18 @@ function ageString(createdAt: number): string {
 // Status symbol
 //
 // Each live session shows a single status symbol in the row's left margin —
-// before the checkbox and name — so every name lines up in the same column
-// regardless of state. Activity is derived from how recently the session's
-// terminal printed (see `sessionState`):
+// before the checkbox and name — so every name lines up in the same column.
+// `ompCompanion.statusEntry` projects a live structured error/activity state,
+// then falls back to the existing OSC/output activity heuristic:
 //
-//   working : `*` in the warning/progress colour — terminal actively printing
-//   idle    : `✓` in the added/green colour       — quiet / waiting / done
+//   working : `*` in the warning/progress colour
+//   idle    : `·` in the muted resting colour
+//   error   : `!` in the status-error colour (live OMP facet only)
 //
-// `*` is ASCII; `✓` (U+2713) is a single-cell glyph present in essentially
-// every terminal font — both avoid the box-drawing / half-block / emoji
-// glyphs that render unevenly. Colours are theme keys so they track the
-// active theme. On-disk (discovered) rows have no agent process, so they get
-// no symbol (a blank margin) and keep their `· on-disk` tag instead.
+// All are single-cell glyphs with theme-key colours. On-disk (discovered) rows
+// have no agent process, so they keep their separate hollow-ring marker.
 // =============================================================================
 
-interface StatusSymbol {
-  // The single glyph painted in the left margin.
-  glyph: string;
-  // Theme key for the glyph colour, resolved by the host.
-  fg: string;
-}
-
-const STATE_SYMBOL: Record<AgentState, StatusSymbol> = {
-  // In progress — amber/warning, an asterisk reads as "busy/spinner".
-  working: { glyph: "*", fg: "diagnostic.warning_fg" },
-  // Quiet / waiting — a small dim dot. Deliberately understated: idle is
-  // the resting state, so it shouldn't draw the eye the way a green
-  // check (which reads as "done/success") did.
-  idle: { glyph: "·", fg: "ui.menu_disabled_fg" },
-};
 
 // Width of the left status margin: glyph + trailing space.
 const STATUS_MARGIN_W = 2;
@@ -2083,7 +2117,9 @@ const REMOTE_GLYPH: Record<SessionBackend, string> = {
 };
 
 // Theme colour for a remote facet's state.
-function remoteStateFg(state: "starting" | "running" | "stopped" | "error"): string {
+function remoteStateFg(
+  state: "starting" | "running" | "stopped" | "error",
+): string {
   switch (state) {
     case "running":
       return "diagnostic.info_fg";
@@ -2265,19 +2301,19 @@ function filterSessions(needle: string): number[] {
     // each time) keeps the grouped, current-project-first browse order.
     const comparator = dockMode
       ? (a: number, b: number) => {
-          const sa = orchestratorSessions.get(a)!;
-          const sb = orchestratorSessions.get(b)!;
-          const da = sessionLastActiveDay(sa);
-          const db = sessionLastActiveDay(sb);
-          if (da !== db) return db - da; // more recent active-day first
-          // Same day (the common case): fall back to the permanent first-seen
-          // slot — the dock's long-standing stable order. Keeping this
-          // *ascending* means within-day order is unchanged from before the
-          // recency feature, so a discovered worktree keeps its position when
-          // it opens and the persistent dock never reshuffles intra-day; only
-          // a genuine cross-day change floats a workspace up.
-          return stableOrderKey(sa) - stableOrderKey(sb);
-        }
+        const sa = orchestratorSessions.get(a)!;
+        const sb = orchestratorSessions.get(b)!;
+        const da = sessionLastActiveDay(sa);
+        const db = sessionLastActiveDay(sb);
+        if (da !== db) return db - da; // more recent active-day first
+        // Same day (the common case): fall back to the permanent first-seen
+        // slot — the dock's long-standing stable order. Keeping this
+        // *ascending* means within-day order is unchanged from before the
+        // recency feature, so a discovered worktree keeps its position when
+        // it opens and the persistent dock never reshuffles intra-day; only
+        // a genuine cross-day change floats a workspace up.
+        return stableOrderKey(sa) - stableOrderKey(sb);
+      }
       : byProjectThenStable;
     const ids = allIds.slice().sort(comparator);
     if (scope === "current") {
@@ -2391,12 +2427,17 @@ const BRANCH_ICON = "▸";
 // the pill's alone.
 function gitLineParts(s: AgentSession): { left: Entry[]; right: Entry[] } {
   const dim = "ui.menu_disabled_fg";
-  let branch = s.branch || (s.discovered ? editor.t("pill.branch_worktree") : editor.t("pill.branch_detached"));
+  let branch = s.branch ||
+    (s.discovered
+      ? editor.t("pill.branch_worktree")
+      : editor.t("pill.branch_detached"));
   // Cap the branch so it doesn't push the right-aligned git summary off
   // the tail (the host truncates the row's *end*, which is the summary)
   // on a normal-width card. Very narrow docks may still clip it.
   const BRANCH_CAP = 28;
-  if (branch.length > BRANCH_CAP) branch = branch.slice(0, BRANCH_CAP - 1) + "…";
+  if (branch.length > BRANCH_CAP) {
+    branch = branch.slice(0, BRANCH_CAP - 1) + "…";
+  }
   const left: Entry[] = [
     { text: BRANCH_ICON + " ", style: { fg: dim } },
     { text: branch, style: { fg: dim } },
@@ -2421,19 +2462,34 @@ function gitLineParts(s: AgentSession): { left: Entry[]; right: Entry[] } {
     return { left, right };
   }
   if (g.ahead && g.ahead > 0) {
-    right.push({ text: `${sep()}↑${g.ahead}`, style: { fg: "ui.file_status_added_fg" } });
+    right.push({
+      text: `${sep()}↑${g.ahead}`,
+      style: { fg: "ui.file_status_added_fg" },
+    });
   }
   if (g.behind && g.behind > 0) {
-    right.push({ text: `${sep()}↓${g.behind}`, style: { fg: "diagnostic.warning_fg" } });
+    right.push({
+      text: `${sep()}↓${g.behind}`,
+      style: { fg: "diagnostic.warning_fg" },
+    });
   }
   if (g.added) {
-    right.push({ text: `${sep()}+${g.added}`, style: { fg: "ui.file_status_added_fg" } });
+    right.push({
+      text: `${sep()}+${g.added}`,
+      style: { fg: "ui.file_status_added_fg" },
+    });
   }
   if (g.deleted) {
-    right.push({ text: `${sep()}−${g.deleted}`, style: { fg: "ui.file_status_deleted_fg" } });
+    right.push({
+      text: `${sep()}−${g.deleted}`,
+      style: { fg: "ui.file_status_deleted_fg" },
+    });
   }
   if (right.length === 0) {
-    right.push({ text: editor.t("pill.clean"), style: { fg: dim, italic: true } });
+    right.push({
+      text: editor.t("pill.clean"),
+      style: { fg: dim, italic: true },
+    });
   }
   return { left, right };
 }
@@ -2453,24 +2509,44 @@ function prLineEntries(s: AgentSession): Entry[] {
       { text: editor.t("pill.pr_prefix"), style: { fg: dim } },
       { text: `#${p.number}`, style: { fg: "ui.help_key_fg", bold: true } },
     ];
-    if (p.isDraft) out.push({ text: editor.t("pill.pr_draft"), style: { fg: dim } });
+    if (p.isDraft) {
+      out.push({ text: editor.t("pill.pr_draft"), style: { fg: dim } });
+    }
     if (p.checksFail && p.checksFail > 0) {
-      out.push({ text: ` ✗${p.checksFail}`, style: { fg: "diagnostic.error_fg" } });
+      out.push({
+        text: ` ✗${p.checksFail}`,
+        style: { fg: "diagnostic.error_fg" },
+      });
     } else if (p.checksPending && p.checksPending > 0) {
-      out.push({ text: ` •${p.checksPending}`, style: { fg: "diagnostic.warning_fg" } });
+      out.push({
+        text: ` •${p.checksPending}`,
+        style: { fg: "diagnostic.warning_fg" },
+      });
     } else if (p.checksPass && p.checksPass > 0) {
-      out.push({ text: ` ✓${p.checksPass}`, style: { fg: "ui.file_status_added_fg" } });
+      out.push({
+        text: ` ✓${p.checksPass}`,
+        style: { fg: "ui.file_status_added_fg" },
+      });
     }
     if (p.comments && p.comments > 0) {
       out.push({ text: ` ●${p.comments}`, style: { fg: dim } });
     }
     if (p.reviewDecision === "APPROVED") {
-      out.push({ text: editor.t("pill.pr_approved"), style: { fg: "ui.file_status_added_fg" } });
+      out.push({
+        text: editor.t("pill.pr_approved"),
+        style: { fg: "ui.file_status_added_fg" },
+      });
     } else if (p.reviewDecision === "CHANGES_REQUESTED") {
-      out.push({ text: editor.t("pill.pr_chg_req"), style: { fg: "diagnostic.warning_fg" } });
+      out.push({
+        text: editor.t("pill.pr_chg_req"),
+        style: { fg: "diagnostic.warning_fg" },
+      });
     }
     if (p.mergeable === "CONFLICTING") {
-      out.push({ text: editor.t("pill.pr_conflicts"), style: { fg: "diagnostic.error_fg" } });
+      out.push({
+        text: editor.t("pill.pr_conflicts"),
+        style: { fg: "diagnostic.error_fg" },
+      });
     }
     return out;
   }
@@ -2480,13 +2556,16 @@ function prLineEntries(s: AgentSession): Entry[] {
   // caller renders a blank spacer line in its place (keeping the card a
   // uniform three lines) rather than a "no PR yet" placeholder.
   if (s.discovered) {
-    return [{ text: editor.t("pill.on_disk_worktree"), style: { fg: dim, italic: true } }];
+    return [{
+      text: editor.t("pill.on_disk_worktree"),
+      style: { fg: dim, italic: true },
+    }];
   }
   return [];
 }
 
 // On-disk (discovered, unopened) worktrees get a dim hollow ring in the
-// status column — distinct from the live `*` working / `✓` idle glyphs.
+// status column — distinct from the live `*` working / `·` idle glyphs.
 const ON_DISK_GLYPH = "○";
 
 // A flex row: left group, host-filled spacer, right group. The host
@@ -2514,8 +2593,7 @@ function stateGlyphEntry(s: AgentSession): Entry {
   if (s.discovered) {
     return { text: ON_DISK_GLYPH + " ", style: { fg: "ui.menu_disabled_fg" } };
   }
-  const sym = STATE_SYMBOL[sessionState(s)];
-  return { text: sym.glyph + " ", style: { fg: sym.fg, bold: true } };
+  return ompCompanion.statusEntry(s, IDLE_AFTER_MS);
 }
 
 // Build one session row for the modal picker's list. (The dock's own
@@ -2540,7 +2618,12 @@ function renderPillSpec(
   activeId: number,
 ): WidgetSpec {
   const s = orchestratorSessions.get(id);
-  if (!s) return labeledSection({ label: "", child: styledRow([{ text: editor.t("pill.unknown") }]) });
+  if (!s) {
+    return labeledSection({
+      label: "",
+      child: styledRow([{ text: editor.t("pill.unknown") }]),
+    });
+  }
   // A being-created placeholder renders its status in place of the live
   // pill body: name on line 1, the creating/connecting/error message on
   // line 2 (amber while creating, red on failure), and a retry hint on the
@@ -2556,9 +2639,9 @@ function renderPillSpec(
   // so their rows render exactly as before (the facet is backend-opaque).
   const remoteGlyph: Entry[] = s.remote
     ? [{
-        text: REMOTE_GLYPH[s.remote.kind] + " ",
-        style: { fg: remoteStateFg(s.remote.state), bold: true },
-      }]
+      text: REMOTE_GLYPH[s.remote.kind] + " ",
+      style: { fg: remoteStateFg(s.remote.state), bold: true },
+    }]
     : [];
   const proj = editor.pathBasename(projectKeyOf(s));
   const projEntries: Entry[] = [
@@ -2622,7 +2705,10 @@ function renderPendingPillSpec(s: AgentSession): WidgetSpec {
   const actionable = pendingActionable(p);
   const msgFg = pendingMsgFg(p);
   const remoteGlyph: Entry[] = s.remote
-    ? [{ text: REMOTE_GLYPH[s.remote.kind] + " ", style: { fg: msgFg, bold: true } }]
+    ? [{
+      text: REMOTE_GLYPH[s.remote.kind] + " ",
+      style: { fg: msgFg, bold: true },
+    }]
     : [];
   const nameEntry: Entry = { text: s.label, style: { bold: true } };
   const proj = editor.pathBasename(projectKeyOf(s));
@@ -2641,50 +2727,51 @@ function renderPendingPillSpec(s: AgentSession): WidgetSpec {
 
   const children: WidgetSpec[] = [
     flexLine([stateGlyphEntry(s), ...remoteGlyph, nameEntry], projEntries),
-    raw([styledRow([{ text: p.message, style: { fg: msgFg, italic: actionable } }])]),
+    raw([
+      styledRow([{
+        text: p.message,
+        style: { fg: msgFg, italic: actionable },
+      }]),
+    ]),
   ];
   const hint: Entry[] = actionable
-    ? [{ text: pendingHintText(p), style: { fg: "ui.menu_disabled_fg", italic: true } }]
+    ? [{
+      text: pendingHintText(p),
+      style: { fg: "ui.menu_disabled_fg", italic: true },
+    }]
     : [{ text: " " }];
   children.push(raw([styledRow(hint as Parameters<typeof styledRow>[0])]));
   return labeledSection({ label: "", child: col(...children) });
 }
 
-// Preview-pane content for the currently selected session.
-// Plain info for Phase 1; later phases append pgid/pids + the
-// last terminal lines.
-function buildPreviewEntries(
-  s: AgentSession | undefined,
-): TextPropertyEntry[] {
+// Preview metadata for the currently selected session. OMP contributes only
+// Fresh-validated, allowlisted fields; its native terminal remains the UI for
+// conversation, tool output, and approvals.
+function buildPreviewEntries(s: AgentSession | undefined): TextPropertyEntry[] {
   if (!s) {
-    return [
-      styledRow([
-        {
-          text: editor.t("preview.no_workspace_selected"),
-          style: { fg: "editor.whitespace_indicator_fg", italic: true },
-        },
-      ]),
-    ];
+    return [styledRow([{
+      text: editor.t("preview.no_workspace_selected"),
+      style: { fg: "editor.whitespace_indicator_fg", italic: true },
+    }])];
   }
-  // A being-created placeholder: show its status (creating/connecting or
-  // the failure reason) rather than live-session detail it doesn't have.
   if (s.pending) {
     const p = s.pending;
     return [
       styledRow([{ text: s.label, style: { bold: true } }]),
-      styledRow([{ text: p.message, style: { fg: pendingMsgFg(p), italic: true } }]),
-      styledRow([
-        { text: pendingHintText(p), style: { fg: "ui.menu_disabled_fg", italic: true } },
-      ]),
+      styledRow([{
+        text: p.message,
+        style: { fg: pendingMsgFg(p), italic: true },
+      }]),
+      styledRow([{
+        text: pendingHintText(p),
+        style: { fg: "ui.menu_disabled_fg", italic: true },
+      }]),
     ];
   }
-  const activeId = editor.activeWindow();
-  const isActive = s.id === activeId;
-  // The focused window is labelled "active"; everything else shows its
-  // live working/idle activity (recomputed from the output timestamp).
+  const isActive = s.id === editor.activeWindow();
   const stateText = isActive
     ? editor.t("preview.state_active")
-    : sessionState(s) === "working"
+    : ompCompanion.activityState(s, IDLE_AFTER_MS) === "working"
     ? editor.t("preview.state_working")
     : editor.t("preview.state_idle");
   const headerEntries: { text: string; style?: Record<string, unknown> }[] = [
@@ -2698,20 +2785,20 @@ function buildPreviewEntries(
     { text: ageString(s.createdAt), style: { fg: "ui.menu_disabled_fg" } },
   ];
   if (!s.discovered && !ownsWorktree(s)) {
-    // In-place / launch session: runs inside a real checkout, owns no
-    // dedicated worktree. Surfaced so the user knows Archive doesn't
-    // apply (Delete just forgets it, leaving the directory untouched).
     headerEntries.push(
       { text: "  " },
-      { text: editor.t("preview.in_place"), style: { fg: "ui.menu_disabled_fg", italic: true } },
+      {
+        text: editor.t("preview.in_place"),
+        style: { fg: "ui.menu_disabled_fg", italic: true },
+      },
     );
   }
-  return [
+  const entries: TextPropertyEntry[] = [
     styledRow(headerEntries as Parameters<typeof styledRow>[0]),
-    styledRow([
-      { text: s.root, style: { fg: "ui.menu_disabled_fg" } },
-    ]),
+    styledRow([{ text: s.root, style: { fg: "ui.menu_disabled_fg" } }]),
   ];
+  entries.push(...ompCompanion.previewEntries(s));
+  return entries;
 }
 
 // A session "owns" a removable git worktree when it was created as a
@@ -2843,6 +2930,7 @@ function modalSessionColWidth(): number {
   return Math.max(dockContentCols(DOCK_MIN_WIDTH_COLS), sectionW - 4);
 }
 
+
 // Compose the right-hand preview pane. Normally it shows info
 // + action buttons (Stop, Archive, Delete); when a destructive
 // action is pending confirmation it swaps to a "Confirm
@@ -2869,7 +2957,11 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
           entries: [
             styledRow([
               {
-                text: editor.t("preview.inflight_row", { label, id: String(s.id), name: s.label }),
+                text: editor.t("preview.inflight_row", {
+                  label,
+                  id: String(s.id),
+                  name: s.label,
+                }),
                 style: { bold: true, fg: "ui.menu_disabled_fg" },
               },
             ]),
@@ -2908,10 +3000,10 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   // accounts for that.
   const totalEmbedBase = (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 5;
   const detailsOn = openDialog?.showDetails ?? false;
-  const _DETAILS_CHROME_ROWS = 3; // 2 info rows + 1 spacer
+  const detailsEntries = detailsOn ? buildPreviewEntries(s) : [];
   const embedRows = Math.max(
     3,
-    totalEmbedBase - (detailsOn ? _DETAILS_CHROME_ROWS : 0),
+    totalEmbedBase - (detailsOn ? detailsEntries.length + 1 : 0),
   );
   // Gate the action buttons on having a session to act on. When
   // the filter matches nothing (or no session is highlighted) the
@@ -2938,7 +3030,9 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   // labels with the *target* state — pressing `[ Details ]`
   // turns details on, pressing `[ Preview ]` turns them off
   // (back to compact).
-  const detailsToggleLabel = detailsOn ? editor.t("preview.toggle_preview") : editor.t("preview.toggle_details");
+  const detailsToggleLabel = detailsOn
+    ? editor.t("preview.toggle_preview")
+    : editor.t("preview.toggle_details");
   // Discovered worktree: no live window to embed, so there's
   // nothing to Stop / Archive / Delete yet. Offer only "Open"
   // (Visit attaches a fresh session to the worktree) and describe
@@ -2951,17 +3045,33 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
       flexSpacer(),
       button(editor.t("preview.btn_stop"), { key: "stop", disabled: true }),
       spacer(2),
-      button(editor.t("preview.btn_archive"), { key: "archive", disabled: true }),
+      button(editor.t("preview.btn_archive"), {
+        key: "archive",
+        disabled: true,
+      }),
       spacer(2),
-      button(editor.t("preview.btn_delete"), { intent: "danger", key: "delete", disabled: true }),
+      button(editor.t("preview.btn_delete"), {
+        intent: "danger",
+        key: "delete",
+        disabled: true,
+      }),
     );
     const info: TextPropertyEntry[] = [
       styledRow([
-        { text: editor.t("preview.on_disk_not_open"), style: { fg: "ui.menu_disabled_fg", bold: true } },
+        {
+          text: editor.t("preview.on_disk_not_open"),
+          style: { fg: "ui.menu_disabled_fg", bold: true },
+        },
       ]),
       styledRow([{ text: "" }]),
-      styledRow([{ text: editor.t("preview.field_branch"), style: { fg: "ui.menu_disabled_fg" } }, { text: s.branch || editor.t("pill.branch_detached") }]),
-      styledRow([{ text: editor.t("preview.field_path"), style: { fg: "ui.menu_disabled_fg" } }, { text: s.root }]),
+      styledRow([{
+        text: editor.t("preview.field_branch"),
+        style: { fg: "ui.menu_disabled_fg" },
+      }, { text: s.branch || editor.t("pill.branch_detached") }]),
+      styledRow([{
+        text: editor.t("preview.field_path"),
+        style: { fg: "ui.menu_disabled_fg" },
+      }, { text: s.root }]),
       styledRow([{ text: "" }]),
       styledRow([
         {
@@ -2977,7 +3087,11 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
         spacer(0),
         { kind: "raw", entries: info },
         spacer(0),
-        windowEmbed({ windowId: 0, rows: Math.max(3, embedRows - 6), key: "live-preview" }),
+        windowEmbed({
+          windowId: 0,
+          rows: Math.max(3, embedRows - 6),
+          key: "live-preview",
+        }),
       ),
     });
   }
@@ -3009,10 +3123,17 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
     button(editor.t("preview.btn_visit"), { intent: "primary", key: "visit" }),
     spacer(4),
     button(detailsToggleLabel, { key: "toggle-details" }),
+    ...ompCompanion.previewActions(s),
     spacer(2),
-    button(editor.t("preview.btn_stop"), { key: "stop", disabled: stopDisabled }),
+    button(editor.t("preview.btn_stop"), {
+      key: "stop",
+      disabled: stopDisabled,
+    }),
     spacer(2),
-    button(editor.t("preview.btn_archive"), { key: "archive", disabled: archiveDisabled }),
+    button(editor.t("preview.btn_archive"), {
+      key: "archive",
+      disabled: archiveDisabled,
+    }),
     spacer(2),
     button(editor.t("preview.btn_delete"), {
       intent: "danger",
@@ -3027,12 +3148,12 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   });
   const body = detailsOn
     ? col(
-        buttonRow,
-        spacer(0),
-        { kind: "raw", entries: buildPreviewEntries(s) },
-        spacer(0),
-        embedWidget,
-      )
+      buttonRow,
+      spacer(0),
+      { kind: "raw", entries: detailsEntries },
+      spacer(0),
+      embedWidget,
+    )
     : col(buttonRow, spacer(0), embedWidget);
   // Surface the launch session in the preview label so it's always
   // visible (the list-row badge gets truncated at 25% column width).
@@ -3116,12 +3237,20 @@ function buildConfirmPane(
   const existing = ids.filter((id) => orchestratorSessions.has(id));
   const bulk = existing.length > 1;
   const diskNote = (id: number): string =>
-    orchestratorSessions.get(id)?.discovered ? editor.t("confirm.disk_note") : "";
+    orchestratorSessions.get(id)?.discovered
+      ? editor.t("confirm.disk_note")
+      : "";
   const entries: TextPropertyEntry[] = [];
   if (bulk) {
     entries.push(
       styledRow([
-        { text: editor.t("confirm.bulk_header", { cap, count: String(existing.length) }), style: { bold: true } },
+        {
+          text: editor.t("confirm.bulk_header", {
+            cap,
+            count: String(existing.length),
+          }),
+          style: { bold: true },
+        },
       ]),
       styledRow([{ text: "" }]),
     );
@@ -3130,7 +3259,10 @@ function buildConfirmPane(
       entries.push(
         styledRow([
           { text: `  ${ss.label}` },
-          { text: diskNote(id), style: { fg: "ui.menu_disabled_fg", italic: true } },
+          {
+            text: diskNote(id),
+            style: { fg: "ui.menu_disabled_fg", italic: true },
+          },
         ]),
       );
     }
@@ -3138,7 +3270,9 @@ function buildConfirmPane(
       entries.push(
         styledRow([
           {
-            text: editor.t("confirm.and_more", { count: String(existing.length - 8) }),
+            text: editor.t("confirm.and_more", {
+              count: String(existing.length - 8),
+            }),
             style: { fg: "ui.menu_disabled_fg", italic: true },
           },
         ]),
@@ -3149,13 +3283,21 @@ function buildConfirmPane(
     const ss = id !== undefined ? orchestratorSessions.get(id) : undefined;
     entries.push(
       styledRow([
-        { text: editor.t("confirm.single_header", { cap, name: ss?.label ?? "" }), style: { bold: true } },
+        {
+          text: editor.t("confirm.single_header", {
+            cap,
+            name: ss?.label ?? "",
+          }),
+          style: { bold: true },
+        },
       ]),
     );
   }
   entries.push(
     styledRow([{ text: "" }]),
-    styledRow([{ text: bulk ? editor.t("confirm.for_each") : editor.t("confirm.this_will") }]),
+    styledRow([{
+      text: bulk ? editor.t("confirm.for_each") : editor.t("confirm.this_will"),
+    }]),
   );
   for (const line of confirmActionLines(action)) {
     entries.push(styledRow([{ text: line }]));
@@ -3185,7 +3327,10 @@ function buildConfirmPane(
       wrappingRow(
         button(editor.t("confirm.btn_cancel"), { key: "confirm-cancel" }),
         spacer(2),
-        button(editor.t("confirm.btn_confirm", { cap }), { intent: "danger", key: `confirm-${action}` }),
+        button(editor.t("confirm.btn_confirm", { cap }), {
+          intent: "danger",
+          key: `confirm-${action}`,
+        }),
       ),
     ),
   });
@@ -3208,45 +3353,51 @@ function buildBulkPane(): WidgetSpec {
   const inflight = openDialog?.bulkInFlight ?? null;
   const actionRow = inflight
     ? row(
+      {
+        kind: "raw",
+        entries: [
+          styledRow([
+            {
+              text: editor.t("confirm.bulk_progress", {
+                verb: gerundAction(inflight.action),
+                done: String(inflight.done),
+                total: String(inflight.total),
+              }),
+              style: { fg: "ui.menu_disabled_fg", italic: true },
+            },
+          ]),
+        ],
+      },
+      flexSpacer(),
+    )
+    // wrappingRow (not row): on a narrow pane the action buttons
+    // reflow onto extra lines instead of the right-most ones being
+    // clipped off-screen. The wrap path ignores flex spacers, so a
+    // fixed `spacer(4)` (rather than `flexSpacer()`) keeps a visible
+    // gap between the destructive actions and the non-destructive
+    // "Clear" while still wrapping cleanly.
+    : wrappingRow(
+      button(editor.t("confirm.bulk_btn_stop", { count: String(stopN) }), {
+        key: "bulk-stop",
+        disabled: stopN === 0,
+      }),
+      spacer(2),
+      button(
+        editor.t("confirm.bulk_btn_archive", { count: String(archiveN) }),
         {
-          kind: "raw",
-          entries: [
-            styledRow([
-              {
-                text: editor.t("confirm.bulk_progress", {
-                  verb: gerundAction(inflight.action),
-                  done: String(inflight.done),
-                  total: String(inflight.total),
-                }),
-                style: { fg: "ui.menu_disabled_fg", italic: true },
-              },
-            ]),
-          ],
-        },
-        flexSpacer(),
-      )
-    : // wrappingRow (not row): on a narrow pane the action buttons
-      // reflow onto extra lines instead of the right-most ones being
-      // clipped off-screen. The wrap path ignores flex spacers, so a
-      // fixed `spacer(4)` (rather than `flexSpacer()`) keeps a visible
-      // gap between the destructive actions and the non-destructive
-      // "Clear" while still wrapping cleanly.
-      wrappingRow(
-        button(editor.t("confirm.bulk_btn_stop", { count: String(stopN) }), { key: "bulk-stop", disabled: stopN === 0 }),
-        spacer(2),
-        button(editor.t("confirm.bulk_btn_archive", { count: String(archiveN) }), {
           key: "bulk-archive",
           disabled: archiveN === 0,
-        }),
-        spacer(2),
-        button(editor.t("confirm.bulk_btn_delete", { count: String(deleteN) }), {
-          intent: "danger",
-          key: "bulk-delete",
-          disabled: deleteN === 0,
-        }),
-        spacer(4),
-        button(editor.t("confirm.bulk_btn_clear"), { key: "bulk-clear" }),
-      );
+        },
+      ),
+      spacer(2),
+      button(editor.t("confirm.bulk_btn_delete", { count: String(deleteN) }), {
+        intent: "danger",
+        key: "bulk-delete",
+        disabled: deleteN === 0,
+      }),
+      spacer(4),
+      button(editor.t("confirm.bulk_btn_clear"), { key: "bulk-clear" }),
+    );
 
   // Affected-sessions list. Flag the rows a destructive action will
   // skip so the count discrepancy explains itself.
@@ -3271,7 +3422,10 @@ function buildBulkPane(): WidgetSpec {
   // spacer (1) + list, and the embed pane reserves `listVisibleRows
   // + 4` for its body — so the list takes that height and the two
   // panes' bottom borders line up.
-  const listRows = Math.max(3, (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 4);
+  const listRows = Math.max(
+    3,
+    (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 4,
+  );
 
   return labeledSection({
     label: editor.t("confirm.bulk_label", { count: String(sel.length) }),
@@ -3332,7 +3486,9 @@ function buildOpenSpec(): WidgetSpec {
     "orchestrator_open_new_from_picker",
     OPEN_MODE,
   );
-  const newLabel = newKey ? editor.t("list.new_btn_key", { key: newKey }) : editor.t("list.new_btn");
+  const newLabel = newKey
+    ? editor.t("list.new_btn_key", { key: newKey })
+    : editor.t("list.new_btn");
   const inConfirm = openDialog.pendingConfirm !== null;
   // While a confirmation prompt is up the filter is rendered
   // without a `key`. The host's `collect_tabbable` only adds
@@ -3352,20 +3508,20 @@ function buildOpenSpec(): WidgetSpec {
   });
   const errorBanner: WidgetSpec | null = openDialog.lastError
     ? {
-        kind: "raw",
-        entries: [
-          styledRow([
-            {
-              text: editor.t("list.warn_prefix"),
-              style: { fg: "ui.status_error_indicator_fg", bold: true },
-            },
-            {
-              text: openDialog.lastError,
-              style: { fg: "ui.status_error_indicator_fg" },
-            },
-          ]),
-        ],
-      }
+      kind: "raw",
+      entries: [
+        styledRow([
+          {
+            text: editor.t("list.warn_prefix"),
+            style: { fg: "ui.status_error_indicator_fg", bold: true },
+          },
+          {
+            text: openDialog.lastError,
+            style: { fg: "ui.status_error_indicator_fg" },
+          },
+        ]),
+      ],
+    }
     : null;
 
   // Scope chrome. The `Project:` control below is the clickable scope
@@ -3373,13 +3529,18 @@ function buildOpenSpec(): WidgetSpec {
   // title suffix (the dialog title is native modal-frame chrome).
   const scope = openDialog.scope;
   const curKey = currentProjectKey();
-  const scopeKey = editor.getKeybindingLabel("orchestrator_toggle_scope", OPEN_MODE);
+  const scopeKey = editor.getKeybindingLabel(
+    "orchestrator_toggle_scope",
+    OPEN_MODE,
+  );
   const sectionLabel = editor.t("list.section_label");
   // `Project:` control — a visible, clickable scope switch with the
   // Alt+P hint baked into the button label. Shows the current
   // project's name when scoped, "All" when showing every project.
   // Inert while a confirm prompt is up so it can't steal focus.
-  const scopeWord = scope === "current" ? editor.pathBasename(curKey) : editor.t("list.scope_all");
+  const scopeWord = scope === "current"
+    ? editor.pathBasename(curKey)
+    : editor.t("list.scope_all");
   const scopeButtonLabel = scopeKey
     ? editor.t("list.scope_btn_key", { word: scopeWord, key: scopeKey })
     : editor.t("list.scope_btn", { word: scopeWord });
@@ -3390,7 +3551,10 @@ function buildOpenSpec(): WidgetSpec {
     {
       kind: "raw",
       entries: [
-        styledRow([{ text: editor.t("list.project_prefix"), style: { fg: "ui.menu_disabled_fg" } }]),
+        styledRow([{
+          text: editor.t("list.project_prefix"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
       ],
     },
     scopeButton,
@@ -3518,13 +3682,18 @@ function buildOpenSpec(): WidgetSpec {
         { keys: "↑↓", label: editor.t("hint.nav") },
         { keys: "Enter", label: editor.t("hint.dive") },
         {
-          keys: editor.getKeybindingLabel("orchestrator_toggle_select", OPEN_MODE) ||
+          keys: editor.getKeybindingLabel(
+            "orchestrator_toggle_select",
+            OPEN_MODE,
+          ) ||
             "Space",
           label: editor.t("hint.select"),
         },
         {
           keys: scopeKey || "⌥P",
-          label: scope === "current" ? editor.t("hint.all_projects") : editor.t("hint.current_only"),
+          label: scope === "current"
+            ? editor.t("hint.all_projects")
+            : editor.t("hint.current_only"),
         },
         { keys: "Tab", label: editor.t("hint.focus") },
         { keys: "Esc", label: editor.t("hint.close") },
@@ -3716,13 +3885,19 @@ function rollupCounts(
 async function probePr(s: AgentSession): Promise<void> {
   if (prProbesInFlight.has(s.id)) return;
   const now = Date.now();
-  if (s.pr && s.pr.status !== "loading" && now - s.pr.fetchedAt < PR_PROBE_TTL_MS) {
+  if (
+    s.pr && s.pr.status !== "loading" && now - s.pr.fetchedAt < PR_PROBE_TTL_MS
+  ) {
     return;
   }
   prProbesInFlight.add(s.id);
   // Keep any prior info visible while re-checking (avoids a flicker
   // back to the branch fallback on refresh).
-  s.pr = { status: "loading", fetchedAt: s.pr?.fetchedAt ?? 0, info: s.pr?.info };
+  s.pr = {
+    status: "loading",
+    fetchedAt: s.pr?.fetchedAt ?? 0,
+    info: s.pr?.info,
+  };
   try {
     const branch = await sessionBranch(s);
     if (!branch) {
@@ -3817,7 +3992,9 @@ function drainGitProbes(): void {
 async function probeGit(s: AgentSession): Promise<void> {
   if (gitProbesInFlight.has(s.id)) return;
   const now = Date.now();
-  if (s.git && s.git.status === "ok" && now - s.git.fetchedAt < GIT_PROBE_TTL_MS) {
+  if (
+    s.git && s.git.status === "ok" && now - s.git.fetchedAt < GIT_PROBE_TTL_MS
+  ) {
     return;
   }
   // Bound concurrent git spawns (see MAX_CONCURRENT_GIT_PROBES). Check this
@@ -3826,7 +4003,11 @@ async function probeGit(s: AgentSession): Promise<void> {
   // refills the slot this holds as soon as the probe finishes.
   if (gitProbesInFlight.size >= MAX_CONCURRENT_GIT_PROBES) return;
   gitProbesInFlight.add(s.id);
-  s.git = { status: "loading", fetchedAt: s.git?.fetchedAt ?? 0, info: s.git?.info };
+  s.git = {
+    status: "loading",
+    fetchedAt: s.git?.fetchedAt ?? 0,
+    info: s.git?.info,
+  };
   try {
     const st = await spawnCollect(
       "git",
@@ -3845,7 +4026,11 @@ async function probeGit(s: AgentSession): Promise<void> {
     const info = parsePorcelainV2(st.stdout || "");
     if (info.branch && !s.branch) s.branch = info.branch;
     // Uncommitted line churn vs HEAD (staged + unstaged).
-    const diff = await spawnCollect("git", ["diff", "--shortstat", "HEAD"], s.root);
+    const diff = await spawnCollect(
+      "git",
+      ["diff", "--shortstat", "HEAD"],
+      s.root,
+    );
     if (diff.exit_code === 0) {
       const ins = (diff.stdout || "").match(/(\d+) insertion/);
       const del = (diff.stdout || "").match(/(\d+) deletion/);
@@ -4265,7 +4450,9 @@ function dockProjectMenu(): WidgetSpec {
   const cursor = clampMenuIndex(openDialog?.projectMenuIndex ?? 0, keys.length);
   const rows: WidgetSpec[] = keys.map((key, i) => {
     const applied = key === "" ? cur === null : key === cur;
-    const label = key === "" ? editor.t("dock.all_projects") : projectLabel(key);
+    const label = key === ""
+      ? editor.t("dock.all_projects")
+      : projectLabel(key);
     return row(
       button((applied ? "● " : "  ") + label, {
         key: projectPickKey(key),
@@ -4274,7 +4461,9 @@ function dockProjectMenu(): WidgetSpec {
       flexSpacer(),
     );
   });
-  return overlay(labeledSection({ label: editor.t("dock.menu_label"), child: col(...rows) }));
+  return overlay(
+    labeledSection({ label: editor.t("dock.menu_label"), child: col(...rows) }),
+  );
 }
 
 // Clamp a menu cursor into `[0, len)`, tolerating an empty list.
@@ -4327,7 +4516,8 @@ function moveProjectMenu(delta: number): void {
 function acceptProjectMenu(): void {
   if (!openDialog || !openDialog.projectMenuOpen) return;
   const keys = projectMenuKeys();
-  const key = keys[clampMenuIndex(openDialog.projectMenuIndex, keys.length)] ?? "";
+  const key = keys[clampMenuIndex(openDialog.projectMenuIndex, keys.length)] ??
+    "";
   pickProject(key);
 }
 
@@ -4374,7 +4564,9 @@ function buildDockSpec(): WidgetSpec {
   openDialog.dockKeys = dockTree.keys;
   // Keep the highlighted node key pointing at something real: default to
   // the active session's node, else the first node.
-  if (!openDialog.dockSelKey || !dockTree.keys.includes(openDialog.dockSelKey)) {
+  if (
+    !openDialog.dockSelKey || !dockTree.keys.includes(openDialog.dockSelKey)
+  ) {
     const activeKey = sessionNodeKey(activeId);
     openDialog.dockSelKey = dockTree.keys.includes(activeKey)
       ? activeKey
@@ -4416,24 +4608,22 @@ function buildDockSpec(): WidgetSpec {
   // instead of a mouse-only secret.
   const centered = (entries: Parameters<typeof hintBar>[0]): WidgetSpec =>
     row(flexSpacer(), hintBar(entries), flexSpacer());
-  const bottom: WidgetSpec[] = !showHints
-    ? []
-    : menuOpen
-      ? [centered([
-          { keys: "↑↓", label: editor.t("dock.hint_choose") },
-          { keys: "Enter", label: editor.t("dock.hint_select") },
-          { keys: "Esc", label: editor.t("dock.hint_cancel") },
-        ])]
-      : [
-        centered([
-          { keys: "↑↓", label: editor.t("dock.hint_switch") },
-          { keys: "→←", label: editor.t("dock.hint_fold") },
-        ]),
-        centered([
-          { keys: "Enter", label: editor.t("dock.hint_edit") },
-          { keys: "F2", label: editor.t("dock.hint_menu") },
-        ]),
-      ];
+  const bottom: WidgetSpec[] = !showHints ? [] : menuOpen
+    ? [centered([
+      { keys: "↑↓", label: editor.t("dock.hint_choose") },
+      { keys: "Enter", label: editor.t("dock.hint_select") },
+      { keys: "Esc", label: editor.t("dock.hint_cancel") },
+    ])]
+    : [
+      centered([
+        { keys: "↑↓", label: editor.t("dock.hint_switch") },
+        { keys: "→←", label: editor.t("dock.hint_fold") },
+      ]),
+      centered([
+        { keys: "Enter", label: editor.t("dock.hint_edit") },
+        { keys: "F2", label: editor.t("dock.hint_menu") },
+      ]),
+    ];
   const bottomRows = bottom.length;
 
   // The collapsible Filters section: a header toggle plus, when open,
@@ -4446,14 +4636,20 @@ function buildDockSpec(): WidgetSpec {
   const filterBody: WidgetSpec[] = openDialog.filtersExpanded
     ? [
       row(
-        button(editor.t("dock.view_btn", { view: dockView }), { key: "view-toggle" }),
+        button(editor.t("dock.view_btn", { view: dockView }), {
+          key: "view-toggle",
+        }),
         flexSpacer(),
-        button(editor.t("dock.project_btn", { word: projWord }), { key: "project-menu" }),
+        button(editor.t("dock.project_btn", { word: projWord }), {
+          key: "project-menu",
+        }),
       ),
       // The project dropdown floats just under its toolbar button.
       ...(openDialog.projectMenuOpen ? [dockProjectMenu()] : []),
       row(
-        toggle(openDialog.showWorktrees, worktreeLabel, { key: "worktree-show" }),
+        toggle(openDialog.showWorktrees, worktreeLabel, {
+          key: "worktree-show",
+        }),
         flexSpacer(),
       ),
       row(
@@ -4491,7 +4687,10 @@ function buildDockSpec(): WidgetSpec {
   // the visible tree content occupies and fill the gap with blank,
   // non-interactive rows so `bottom` always lands on the dock's last
   // rows. Zero when the tree fills or overflows its budget.
-  const treeRows = Math.min(listRows, dockTreeContentRows(dockTree, expandedSeed));
+  const treeRows = Math.min(
+    listRows,
+    dockTreeContentRows(dockTree, expandedSeed),
+  );
   const padRows = bottomRows > 0 ? Math.max(0, listRows - treeRows) : 0;
   const bottomPad: WidgetSpec[] = padRows > 0
     ? [raw(Array.from({ length: padRows }, () => ({ text: "" })))]
@@ -4614,7 +4813,11 @@ function dockNewOptions(): MenuOption[] {
 function dockMoveOptions(sessionId: number): MenuOption[] {
   const cur = folderOfSession(sessionId);
   const opts: MenuOption[] = [
-    { key: "move:root", label: editor.t("dock.move_root"), marked: cur === null },
+    {
+      key: "move:root",
+      label: editor.t("dock.move_root"),
+      marked: cur === null,
+    },
   ];
   const walk = (parent: string | null, depth: number): void => {
     for (const f of childFoldersOf(parent)) {
@@ -4637,7 +4840,11 @@ function dockMenuOptions(): MenuOption[] {
   return m.kind === "new" ? dockNewOptions() : dockMoveOptions(m.sessionId);
 }
 
-function dockDropdownOverlay(label: string, opts: MenuOption[], cursor: number): WidgetSpec {
+function dockDropdownOverlay(
+  label: string,
+  opts: MenuOption[],
+  cursor: number,
+): WidgetSpec {
   const rows: WidgetSpec[] = opts.map((o, i) =>
     row(
       button((o.marked ? "● " : "  ") + o.label, {
@@ -4655,7 +4862,11 @@ function dockNewMenu(): WidgetSpec {
     openDialog?.dockMenu?.kind === "new" ? openDialog.dockMenu.index : 0,
     dockNewOptions().length,
   );
-  return dockDropdownOverlay(editor.t("dock.menu_new_label"), dockNewOptions(), cursor);
+  return dockDropdownOverlay(
+    editor.t("dock.menu_new_label"),
+    dockNewOptions(),
+    cursor,
+  );
 }
 
 function dockMoveMenu(): WidgetSpec {
@@ -4849,8 +5060,8 @@ function mountFolderDialog(): void {
   const title = d0.renameSessionId !== null
     ? editor.t("dock.rename_workspace_dialog_title")
     : d0.renameId !== null
-      ? editor.t("dock.rename_folder_dialog_title")
-      : editor.t("dock.new_folder_dialog_title");
+    ? editor.t("dock.rename_folder_dialog_title")
+    : editor.t("dock.new_folder_dialog_title");
   createFolderPanel = new FloatingWidgetPanel();
   createFolderPanel.mount(buildCreateFolderSpec(), {
     widthPct: 50,
@@ -4877,7 +5088,9 @@ function buildCreateFolderSpec(): WidgetSpec {
   const d = createFolderDialog!;
   const renamingSession = d.renameSessionId !== null;
   const renaming = d.renameId !== null || renamingSession;
-  const sess = d.sessionId != null ? orchestratorSessions.get(d.sessionId) : undefined;
+  const sess = d.sessionId != null
+    ? orchestratorSessions.get(d.sessionId)
+    : undefined;
   const promptLabel = renamingSession
     ? editor.t("dock.rename_workspace_prompt")
     : editor.t("dock.new_folder_prompt");
@@ -4901,14 +5114,21 @@ function buildCreateFolderSpec(): WidgetSpec {
   ];
   if (sess) {
     children.push(
-      toggle(d.organizeCurrent, editor.t("dock.new_folder_organize", { name: sess.label }), {
-        key: "folder-organize",
-      }),
+      toggle(
+        d.organizeCurrent,
+        editor.t("dock.new_folder_organize", { name: sess.label }),
+        {
+          key: "folder-organize",
+        },
+      ),
     );
   }
   children.push(
     wrappingRow(
-      button(editor.t("dock.new_folder_btn_cancel"), { intent: "danger", key: "folder-cancel" }),
+      button(editor.t("dock.new_folder_btn_cancel"), {
+        intent: "danger",
+        key: "folder-cancel",
+      }),
       spacer(2),
       button(
         renaming
@@ -5054,15 +5274,33 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
     const f = folderById(state.target.id);
     const label = f?.name ?? `[${state.target.id}]`;
     return col(
-      { kind: "raw", entries: [
-        styledRow([{ text: FOLDER_GLYPH + " " + label, style: { bold: true } }]),
-      ] },
-      button(editor.t("dock.ctx_rename"), { intent: "primary", key: "ctx-rename" }),
+      {
+        kind: "raw",
+        entries: [
+          styledRow([{
+            text: FOLDER_GLYPH + " " + label,
+            style: { bold: true },
+          }]),
+        ],
+      },
+      button(editor.t("dock.ctx_rename"), {
+        intent: "primary",
+        key: "ctx-rename",
+      }),
       button(editor.t("dock.ctx_new_subfolder"), { key: "ctx-new-subfolder" }),
-      button(editor.t("dock.ctx_delete_folder"), { intent: "danger", key: "ctx-delete-folder" }),
-      { kind: "raw", entries: [
-        styledRow([{ text: editor.t("dock.ctx_esc_close"), style: { fg: "ui.menu_disabled_fg" } }]),
-      ] },
+      button(editor.t("dock.ctx_delete_folder"), {
+        intent: "danger",
+        key: "ctx-delete-folder",
+      }),
+      {
+        kind: "raw",
+        entries: [
+          styledRow([{
+            text: editor.t("dock.ctx_esc_close"),
+            style: { fg: "ui.menu_disabled_fg" },
+          }]),
+        ],
+      },
     );
   }
   const sid = state.target.id;
@@ -5072,15 +5310,33 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
   // Archive. It offers Retry (when failed or paused) and Dismiss.
   if (s?.pending) {
     const items: WidgetSpec[] = [
-      { kind: "raw", entries: [styledRow([{ text: `${label}`, style: { bold: true } }])] },
+      {
+        kind: "raw",
+        entries: [styledRow([{ text: `${label}`, style: { bold: true } }])],
+      },
     ];
     if (pendingActionable(s.pending)) {
-      items.push(button(editor.t("dock.ctx_retry"), { intent: "primary", key: "ctx-retry" }));
+      items.push(
+        button(editor.t("dock.ctx_retry"), {
+          intent: "primary",
+          key: "ctx-retry",
+        }),
+      );
     }
-    items.push(button(editor.t("dock.ctx_dismiss"), { intent: "danger", key: "ctx-dismiss" }));
+    items.push(
+      button(editor.t("dock.ctx_dismiss"), {
+        intent: "danger",
+        key: "ctx-dismiss",
+      }),
+    );
     items.push({
       kind: "raw",
-      entries: [styledRow([{ text: editor.t("dock.ctx_esc_close"), style: { fg: "ui.menu_disabled_fg" } }])],
+      entries: [
+        styledRow([{
+          text: editor.t("dock.ctx_esc_close"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
+      ],
     });
     return col(...items);
   }
@@ -5092,17 +5348,33 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
   // host frames the box (its border) and sizes it to the widest of these
   // rows, so the popup hugs its items like a real context menu.
   return col(
-    { kind: "raw", entries: [
-      styledRow([{ text: `${label}`, style: { bold: true } }]),
-    ] },
+    {
+      kind: "raw",
+      entries: [
+        styledRow([{ text: `${label}`, style: { bold: true } }]),
+      ],
+    },
     button(editor.t("dock.ctx_visit"), { intent: "primary", key: "ctx-visit" }),
     button(editor.t("dock.ctx_rename"), { key: "ctx-rename-session" }),
     button(editor.t("dock.ctx_move"), { key: "ctx-move" }),
-    button(editor.t("dock.ctx_archive"), { key: "ctx-archive", disabled: !canArchive }),
-    button(editor.t("dock.ctx_delete"), { intent: "danger", key: "ctx-delete", disabled: !canDelete }),
-    { kind: "raw", entries: [
-      styledRow([{ text: editor.t("dock.ctx_esc_close"), style: { fg: "ui.menu_disabled_fg" } }]),
-    ] },
+    button(editor.t("dock.ctx_archive"), {
+      key: "ctx-archive",
+      disabled: !canArchive,
+    }),
+    button(editor.t("dock.ctx_delete"), {
+      intent: "danger",
+      key: "ctx-delete",
+      disabled: !canDelete,
+    }),
+    {
+      kind: "raw",
+      entries: [
+        styledRow([{
+          text: editor.t("dock.ctx_esc_close"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
+      ],
+    },
   );
 }
 
@@ -5609,7 +5881,11 @@ async function archiveOne(id: number): Promise<LifecycleResult> {
     );
     const parent = editor.pathDirname(archivedRoot);
     if (!editor.createDir(editor.localPath(parent))) {
-      return { ok: false, err: editor.t("err.could_not_create", { path: parent }), repoRoot };
+      return {
+        ok: false,
+        err: editor.t("err.could_not_create", { path: parent }),
+        repoRoot,
+      };
     }
     const moveRes = await spawnCollect(
       "git",
@@ -5619,7 +5895,8 @@ async function archiveOne(id: number): Promise<LifecycleResult> {
     if (moveRes.exit_code !== 0) {
       return {
         ok: false,
-        err: lastNonEmptyLine(moveRes.stderr) || editor.t("err.worktree_move_failed"),
+        err: lastNonEmptyLine(moveRes.stderr) ||
+          editor.t("err.worktree_move_failed"),
         repoRoot,
       };
     }
@@ -5714,7 +5991,11 @@ function envEmailLocalPart(): string | null {
 }
 
 function syncWorkspacePath(): string {
-  return editor.pathJoin(editor.getDataDir(), "orchestrator", ".sync-workspace");
+  return editor.pathJoin(
+    editor.getDataDir(),
+    "orchestrator",
+    ".sync-workspace",
+  );
 }
 
 // Fire-and-forget sync. Never blocks the caller; updates
@@ -5805,7 +6086,12 @@ async function syncSessions(repoRoot: string): Promise<SyncResult> {
   // lives at the root of the sync branch.
   const snapshot = await buildSyncSnapshot(repoRoot);
   const sessionsPath = editor.pathJoin(wt, "sessions.json");
-  if (!editor.writeFile(editor.localPath(sessionsPath), JSON.stringify(snapshot, null, 2))) {
+  if (
+    !editor.writeFile(
+      editor.localPath(sessionsPath),
+      JSON.stringify(snapshot, null, 2),
+    )
+  ) {
     return { ok: false, err: "writeFile sessions.json failed" };
   }
 
@@ -5832,7 +6118,9 @@ async function syncSessions(repoRoot: string): Promise<SyncResult> {
     ],
     wt,
   );
-  if (commitRes.exit_code !== 0 && !commitRes.stdout.includes("nothing to commit")) {
+  if (
+    commitRes.exit_code !== 0 && !commitRes.stdout.includes("nothing to commit")
+  ) {
     // Permissive: stderr "nothing to commit" / "working tree clean"
     // means there was nothing new to push. Skip the push and
     // report success.
@@ -5917,7 +6205,8 @@ async function deleteOne(id: number): Promise<LifecycleResult> {
     if (removeRes.exit_code !== 0) {
       return {
         ok: false,
-        err: lastNonEmptyLine(removeRes.stderr) || editor.t("err.worktree_remove_failed"),
+        err: lastNonEmptyLine(removeRes.stderr) ||
+          editor.t("err.worktree_remove_failed"),
         repoRoot,
       };
     }
@@ -5994,7 +6283,9 @@ async function runConfirmedAction(
   let lastErr = "";
   for (let i = 0; i < targets.length; i++) {
     const id = targets[i];
-    const res = action === "archive" ? await archiveOne(id) : await deleteOne(id);
+    const res = action === "archive"
+      ? await archiveOne(id)
+      : await deleteOne(id);
     if (res.ok) {
       okCount += 1;
       if (res.repoRoot) touchedRepos.add(res.repoRoot);
@@ -6010,20 +6301,38 @@ async function runConfirmedAction(
     openDialog.bulkInFlight = null;
   }
 
-  const verb = action === "archive" ? editor.t("status.verb_archived") : editor.t("status.verb_deleted");
+  const verb = action === "archive"
+    ? editor.t("status.verb_archived")
+    : editor.t("status.verb_deleted");
   if (okCount === 0) {
-    setDialogError(editor.t("err.action_failed", { action, error: lastErr || editor.t("err.unknown_error") }));
+    setDialogError(
+      editor.t("err.action_failed", {
+        action,
+        error: lastErr || editor.t("err.unknown_error"),
+      }),
+    );
   } else if (lastErr) {
-    setDialogError(editor.t("err.partial_done", { verb, ok: String(okCount), total: String(targets.length), error: lastErr }));
+    setDialogError(
+      editor.t("err.partial_done", {
+        verb,
+        ok: String(okCount),
+        total: String(targets.length),
+        error: lastErr,
+      }),
+    );
   } else {
-    editor.setStatus(editor.t("status.bulk_done", { verb, count: String(okCount) }));
+    editor.setStatus(
+      editor.t("status.bulk_done", { verb, count: String(okCount) }),
+    );
   }
   for (const repo of touchedRepos) triggerSyncAsync(repo);
   refreshOpenDialog();
   // The batch emptied the selection, so the pane is back in
   // single-preview mode — restore focus to Visit (the bulk buttons
   // it may have been on are gone).
-  if (openPanel && selectedSessions().length < 2 && !openDialog.pendingConfirm) {
+  if (
+    openPanel && selectedSessions().length < 2 && !openDialog.pendingConfirm
+  ) {
     openPanel.setFocusKey("visit");
   }
 }
@@ -6173,7 +6482,9 @@ function toggleScope(): void {
   // active filter just widens/narrows the global-search base.
   const prevId = openDialog.filteredIds[openDialog.selectedIndex];
   openDialog.filteredIds = filterSessions(openDialog.filter.value);
-  const nextIdx = prevId !== undefined ? openDialog.filteredIds.indexOf(prevId) : -1;
+  const nextIdx = prevId !== undefined
+    ? openDialog.filteredIds.indexOf(prevId)
+    : -1;
   openDialog.selectedIndex = nextIdx >= 0 ? nextIdx : 0;
   refreshOpenDialog();
 }
@@ -6198,7 +6509,9 @@ function toggleShowWorktrees(): void {
   }
   const prevId = openDialog.filteredIds[openDialog.selectedIndex];
   openDialog.filteredIds = filterSessions(openDialog.filter.value);
-  const nextIdx = prevId !== undefined ? openDialog.filteredIds.indexOf(prevId) : -1;
+  const nextIdx = prevId !== undefined
+    ? openDialog.filteredIds.indexOf(prevId)
+    : -1;
   openDialog.selectedIndex = nextIdx >= 0 ? nextIdx : 0;
   refreshOpenDialog();
   // Turning "Show all worktrees" ON re-scans *now* so the rows reflect every
@@ -6232,7 +6545,9 @@ function toggleHideTrivial(): void {
       if (!visible.has(id)) openDialog.selectedIds.delete(id);
     }
   }
-  const nextIdx = prevId !== undefined ? openDialog.filteredIds.indexOf(prevId) : -1;
+  const nextIdx = prevId !== undefined
+    ? openDialog.filteredIds.indexOf(prevId)
+    : -1;
   openDialog.selectedIndex = nextIdx >= 0 ? nextIdx : 0;
   refreshOpenDialog();
 }
@@ -6261,7 +6576,12 @@ function slugify(p: string): string {
 // =============================================================================
 
 type HistoryField = "project_path" | "name" | "cmd" | "branch";
-const HISTORY_FIELDS: HistoryField[] = ["project_path", "name", "cmd", "branch"];
+const HISTORY_FIELDS: HistoryField[] = [
+  "project_path",
+  "name",
+  "cmd",
+  "branch",
+];
 const HISTORY_CAP = 100;
 
 /// Plugin-side focus tracker for the new-session form. The host
@@ -6348,7 +6668,14 @@ function rebuildFormFocusCycle(): void {
   } else if (form.backend === "devcontainer") {
     cycle.push("project_path", "name", "cmd");
   } else if (form.backend === "ssh") {
-    cycle.push("ssh_host", "ssh_path", "ssh_identity", "ssh_options", "name", "cmd");
+    cycle.push(
+      "ssh_host",
+      "ssh_path",
+      "ssh_identity",
+      "ssh_options",
+      "name",
+      "cmd",
+    );
   } else if (form.backend === "kubernetes") {
     cycle.push("k8s_target");
     if (form.k8sTarget.value.trim().length === 0) {
@@ -6373,8 +6700,8 @@ function formFocusedKey(): string {
 
 function advanceFormFocus(delta: 1 | -1): void {
   if (formFocusCycle.length === 0) return;
-  formFocusIndex =
-    (formFocusIndex + delta + formFocusCycle.length) % formFocusCycle.length;
+  formFocusIndex = (formFocusIndex + delta + formFocusCycle.length) %
+    formFocusCycle.length;
 }
 
 function snapFormFocusTo(key: string): void {
@@ -6464,13 +6791,19 @@ function walkHistory(field: HistoryField, delta: -1 | 1): void {
   renderForm();
 }
 
-function formSlot(field: HistoryField): { value: string; cursor: number } | null {
+function formSlot(
+  field: HistoryField,
+): { value: string; cursor: number } | null {
   if (!form) return null;
   switch (field) {
-    case "project_path": return form.projectPath;
-    case "name": return form.name;
-    case "cmd": return form.cmd;
-    case "branch": return form.branch;
+    case "project_path":
+      return form.projectPath;
+    case "name":
+      return form.name;
+    case "cmd":
+      return form.cmd;
+    case "branch":
+      return form.branch;
   }
 }
 
@@ -6579,8 +6912,11 @@ interface AgentEntry {
   // enables "Teach Fresh CLI". Absent ⇒ the agent has no autonomous shell to
   // drive the editor (aider), so the checkbox stays hidden for it.
   systemPrompt?: AgentSystemPrompt;
+  // The companion marker is passed only through the seeded terminal creation
+  // path; ordinary `createTerminal` launches intentionally stay unmarked.
+  companion?: "omp";
 }
-// The four launcher-priority agents come first (claude, codex, opencode), then
+// The launcher-priority agents come first (claude, codex, opencode, omp), then
 // the long-standing aider entry. Order here drives the preset-row order.
 const AGENT_REGISTRY: AgentEntry[] = [
   {
@@ -6635,6 +6971,15 @@ const AGENT_REGISTRY: AgentEntry[] = [
     spec: { continue: { resumeArgs: ["--continue"] } },
     prompt: { style: "flag", flag: "--prompt" },
     systemPrompt: { via: "file", path: "AGENTS.md" },
+  },
+  {
+    id: "omp",
+    label: "omp",
+    match: /^omp$/,
+    spec: { continue: { resumeArgs: ["--continue"] } },
+    prompt: { style: "positional" },
+    systemPrompt: { via: "file", path: "AGENTS.md" },
+    companion: "omp",
   },
   {
     // aider keeps its conversation in the repo and reloads it with
@@ -6740,12 +7085,15 @@ const FRESH_CLI_BLOCK_END = "<!-- fresh-cli:end -->";
 // (`AGENTS.md`). If the file already exists, append a clearly-marked block
 // rather than overwriting the user's content; otherwise create it fresh.
 function writeFreshCliPromptFile(path: string): void {
-  const block = `${FRESH_CLI_BLOCK_START}\n${FRESH_CLI_SYSTEM_PROMPT}\n${FRESH_CLI_BLOCK_END}\n`;
+  const block =
+    `${FRESH_CLI_BLOCK_START}\n${FRESH_CLI_SYSTEM_PROMPT}\n${FRESH_CLI_BLOCK_END}\n`;
   if (editor.fileExists(editor.localPath(path))) {
     const existing = editor.readFile(editor.localPath(path)) ?? "";
     // Idempotent on retry / restart-recovery: never stack duplicate blocks.
     if (existing.includes(FRESH_CLI_BLOCK_START)) return;
-    const sep = existing.length === 0 || existing.endsWith("\n") ? "\n" : "\n\n";
+    const sep = existing.length === 0 || existing.endsWith("\n")
+      ? "\n"
+      : "\n\n";
     editor.writeFile(editor.localPath(path), existing + sep + block);
   } else {
     editor.writeFile(editor.localPath(path), block);
@@ -6786,7 +7134,12 @@ interface AgentPreset {
 }
 function agentPresets(): AgentPreset[] {
   const presets: AgentPreset[] = [
-    { label: editor.t("form.agent_terminal"), cmd: "", key: "agent-preset-terminal", resumes: false },
+    {
+      label: editor.t("form.agent_terminal"),
+      cmd: "",
+      key: "agent-preset-terminal",
+      resumes: false,
+    },
   ];
   for (const e of AGENT_REGISTRY) {
     presets.push({
@@ -6865,7 +7218,7 @@ function agentSessionUuid(): string {
 function resolveAgentLaunch(
   argv: string[],
   opts?: { auto?: boolean; prompt?: string; systemPrompt?: string },
-): { launch: string[]; resume?: string[] } {
+): { launch: string[]; resume?: string[]; companion?: "omp" } {
   if (argv.length === 0) return { launch: argv };
   const argv0 = argv[0];
   const base = editor.pathBasename(argv0) || argv0;
@@ -6900,16 +7253,22 @@ function resolveAgentLaunch(
     const { idFlag, resumeArgs } = entry.spec.provision;
     return {
       launch: [...withAuto, idFlag, id, ...promptArgs],
-      resume: [argv0, ...resumeArgs.map((a) => a.replace("{id}", id)), ...autoArgs],
+      resume: [
+        argv0,
+        ...resumeArgs.map((a) => a.replace("{id}", id)),
+        ...autoArgs,
+      ],
+      companion: entry.companion,
     };
   }
   if (entry.spec.continue) {
     return {
       launch: [...withAuto, ...promptArgs],
       resume: [argv0, ...entry.spec.continue.resumeArgs, ...autoArgs],
+      companion: entry.companion,
     };
   }
-  return { launch: [...withAuto, ...promptArgs] };
+  return { launch: [...withAuto, ...promptArgs], companion: entry.companion };
 }
 
 async function spawnCollect(
@@ -7043,7 +7402,12 @@ interface WorktreeInfo {
 /// plain directory / shared root).
 async function classifyWorktree(path: string): Promise<WorktreeInfo | null> {
   if (!path) return null;
-  const top = await spawnCollect("git", ["-C", path, "rev-parse", "--show-toplevel"], path);
+  const top = await spawnCollect("git", [
+    "-C",
+    path,
+    "rev-parse",
+    "--show-toplevel",
+  ], path);
   if (top.exit_code !== 0) return null;
   const toplevel = (top.stdout || "").trim();
   if (!toplevel) return null;
@@ -7053,10 +7417,22 @@ async function classifyWorktree(path: string): Promise<WorktreeInfo | null> {
   // worktree (`<common>/worktrees/<id>`). That difference is the
   // canonical "is this a linked worktree?" test.
   const [gitDir, commonDir] = await Promise.all([
-    spawnCollect("git", ["-C", toplevel, "rev-parse", "--path-format=absolute", "--git-dir"], toplevel),
+    spawnCollect("git", [
+      "-C",
+      toplevel,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-dir",
+    ], toplevel),
     spawnCollect(
       "git",
-      ["-C", toplevel, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      [
+        "-C",
+        toplevel,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      ],
       toplevel,
     ),
   ]);
@@ -7093,7 +7469,11 @@ function parseWorktreePorcelain(stdout: string): ParsedWorktree[] {
     const line = raw.trimEnd();
     if (line.startsWith("worktree ")) {
       if (cur) out.push(cur);
-      cur = { path: line.slice("worktree ".length), branch: "", detached: false };
+      cur = {
+        path: line.slice("worktree ".length),
+        branch: "",
+        detached: false,
+      };
     } else if (cur && line.startsWith("branch ")) {
       const ref = line.slice("branch ".length);
       cur.branch = ref.replace(/^refs\/heads\//, "");
@@ -7164,9 +7544,10 @@ async function nextAutoSessionName(
   // increment normally.
   const persist = options?.persist === true;
   const base = sessionNameBaseFor(repoRoot);
-  const counterBefore = (editor.getGlobalState("orchestrator.session_counter") as
-    | number
-    | undefined) ?? 0;
+  const counterBefore =
+    (editor.getGlobalState("orchestrator.session_counter") as
+      | number
+      | undefined) ?? 0;
   let next = counterBefore + 1;
 
   // Collect existing branch names that look like `<project>-N` so we
@@ -7175,7 +7556,13 @@ async function nextAutoSessionName(
   // regex-special char the slug can contain, so escape it.
   const refs = await spawnCollect(
     "git",
-    ["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    [
+      "-C",
+      repoRoot,
+      "for-each-ref",
+      "--format=%(refname:short)",
+      "refs/heads/",
+    ],
     repoRoot,
   );
   const taken = new Set<number>();
@@ -7258,7 +7645,12 @@ function backendTabsRow(): WidgetSpec {
   const parts: WidgetSpec[] = [
     {
       kind: "raw",
-      entries: [styledRow([{ text: editor.t("form.run_in"), style: { fg: "ui.menu_disabled_fg" } }])],
+      entries: [
+        styledRow([{
+          text: editor.t("form.run_in"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
+      ],
     },
   ];
   for (const b of SESSION_BACKENDS) {
@@ -7275,7 +7667,12 @@ function backendTabsRow(): WidgetSpec {
   parts.push(flexSpacer());
   parts.push({
     kind: "raw",
-    entries: [styledRow([{ text: editor.t("form.switch_type"), style: { fg: "ui.menu_disabled_fg", italic: true } }])],
+    entries: [
+      styledRow([{
+        text: editor.t("form.switch_type"),
+        style: { fg: "ui.menu_disabled_fg", italic: true },
+      }]),
+    ],
   });
   return row(...parts);
 }
@@ -7292,7 +7689,10 @@ function backendTabsRow(): WidgetSpec {
 function agentPresetRow(): WidgetSpec {
   const presets = agentPresets();
   const activeKey = activeAgentPresetKey();
-  const selectedIndex = Math.max(0, presets.findIndex((p) => p.key === activeKey));
+  const selectedIndex = Math.max(
+    0,
+    presets.findIndex((p) => p.key === activeKey),
+  );
   return dropdown(presets.map((p) => p.label), {
     selectedIndex,
     // Strip the trailing colon from the shared "Agent:" label — the dropdown
@@ -7378,7 +7778,9 @@ function localBodyFields(): WidgetSpec[] {
         // rendered dim-italic, but that's invisible in a plain
         // capture). Submitting with the field empty uses this path.
         placeholder: form.defaultProjectPath
-          ? editor.t("form.project_path_default", { path: form.defaultProjectPath })
+          ? editor.t("form.project_path_default", {
+            path: form.defaultProjectPath,
+          })
           : editor.t("form.detecting_project_root"),
         fullWidth: true,
         key: "project_path",
@@ -7444,23 +7846,23 @@ function advancedSection(): WidgetSpec[] {
   fields.push(
     worktreeEnabled
       ? toggle(effectiveCreateWorktree, editor.t("form.create_worktree"), {
-          key: "worktree",
-        })
+        key: "worktree",
+      })
       : {
-          kind: "raw",
-          entries: [
-            styledRow([
-              {
-                text: editor.t("form.create_worktree_disabled"),
-                style: { fg: "editor.whitespace_indicator_fg" },
-              },
-              {
-                text: editor.t("form.disabled_non_git"),
-                style: { fg: "editor.whitespace_indicator_fg", italic: true },
-              },
-            ]),
-          ],
-        },
+        kind: "raw",
+        entries: [
+          styledRow([
+            {
+              text: editor.t("form.create_worktree_disabled"),
+              style: { fg: "editor.whitespace_indicator_fg" },
+            },
+            {
+              text: editor.t("form.disabled_non_git"),
+              style: { fg: "editor.whitespace_indicator_fg", italic: true },
+            },
+          ]),
+        ],
+      },
   );
 
   // "Checkout branch" — an existing branch to check out. Editable for ANY git
@@ -7525,7 +7927,9 @@ function devcontainerBodyFields(): WidgetSpec[] {
         value: form.projectPath.value,
         cursorByte: form.projectPath.cursor,
         placeholder: form.defaultProjectPath
-          ? editor.t("form.project_path_default", { path: form.defaultProjectPath })
+          ? editor.t("form.project_path_default", {
+            path: form.defaultProjectPath,
+          })
           : editor.t("form.devcontainer_path_placeholder"),
         fullWidth: true,
         key: "project_path",
@@ -7694,7 +8098,10 @@ function buildConnectingView(): WidgetSpec {
     kind: "raw",
     entries: [
       styledRow([
-        { text: `${label}: `, style: { fg: "ui.menu_disabled_fg", bold: true } },
+        {
+          text: `${label}: `,
+          style: { fg: "ui.menu_disabled_fg", bold: true },
+        },
         { text: value || "—", style: { fg: "ui.menu_disabled_fg" } },
       ]),
     ],
@@ -7703,15 +8110,38 @@ function buildConnectingView(): WidgetSpec {
   if (form.backend === "ssh") {
     rows.push(roRow(editor.t("form.ro_run_in"), editor.t("backend.ssh")));
     rows.push(roRow(editor.t("form.ro_host"), form.sshHost.value.trim()));
-    if (form.sshPath.value.trim()) rows.push(roRow(editor.t("form.ro_remote_path"), form.sshPath.value.trim()));
+    if (form.sshPath.value.trim()) {
+      rows.push(
+        roRow(editor.t("form.ro_remote_path"), form.sshPath.value.trim()),
+      );
+    }
   } else if (form.backend === "kubernetes") {
-    rows.push(roRow(editor.t("form.ro_run_in"), editor.t("backend.kubernetes")));
+    rows.push(
+      roRow(editor.t("form.ro_run_in"), editor.t("backend.kubernetes")),
+    );
     const ns = form.k8sNamespace.value.trim();
     const pod = form.k8sPod.value.trim();
-    rows.push(roRow(editor.t("form.ro_pod"), form.k8sTarget.value.trim() || `${ns}/${pod}`));
+    rows.push(
+      roRow(
+        editor.t("form.ro_pod"),
+        form.k8sTarget.value.trim() || `${ns}/${pod}`,
+      ),
+    );
   } else {
-    rows.push(roRow(editor.t("form.ro_run_in"), form.backend === "devcontainer" ? editor.t("backend.devcontainer") : editor.t("backend.local")));
-    rows.push(roRow(editor.t("form.ro_project"), form.projectPath.value.trim() || form.defaultProjectPath));
+    rows.push(
+      roRow(
+        editor.t("form.ro_run_in"),
+        form.backend === "devcontainer"
+          ? editor.t("backend.devcontainer")
+          : editor.t("backend.local"),
+      ),
+    );
+    rows.push(
+      roRow(
+        editor.t("form.ro_project"),
+        form.projectPath.value.trim() || form.defaultProjectPath,
+      ),
+    );
   }
   const name = form.name.value.trim();
   if (name) rows.push(roRow(editor.t("form.ro_workspace"), name));
@@ -7728,7 +8158,9 @@ function buildConnectingView(): WidgetSpec {
       entries: [
         styledRow([
           {
-            text: remote ? editor.t("form.connecting") : editor.t("form.creating_workspace"),
+            text: remote
+              ? editor.t("form.connecting")
+              : editor.t("form.creating_workspace"),
             style: { fg: "ui.menu_disabled_fg", bold: true, italic: true },
           },
           {
@@ -7742,7 +8174,11 @@ function buildConnectingView(): WidgetSpec {
     wrappingRow(
       button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
       spacer(2),
-      button(editor.t("form.btn_create"), { intent: "primary", key: "create", disabled: true }),
+      button(editor.t("form.btn_create"), {
+        intent: "primary",
+        key: "create",
+        disabled: true,
+      }),
     ),
   );
 }
@@ -7929,7 +8365,6 @@ function deriveProjectLabel(): string {
   return base || cwd;
 }
 
-
 function renderForm(): void {
   if (!form || !formPanel) return;
   // Keep the focus mirror in step with the spec's tabbable set
@@ -7943,7 +8378,8 @@ function renderForm(): void {
 
 function openForm(options?: { fromPicker?: boolean; target?: RunAgentTarget }): void {
   const lastCmd =
-    (editor.getGlobalState("orchestrator.last_cmd") as string | undefined) ?? "";
+    (editor.getGlobalState("orchestrator.last_cmd") as string | undefined) ??
+      "";
   form = {
     // Defaults to creating a workspace; "Run Agent…" opens the same form
     // pre-switched to the current one.
@@ -7992,7 +8428,13 @@ function openForm(options?: { fromPicker?: boolean; target?: RunAgentTarget }): 
     probeToken: 0,
     historyCursor: { project_path: -1, name: -1, cmd: -1, branch: -1 },
     historyDraft: { project_path: "", name: "", cmd: "", branch: "" },
-    completion: { field: null, items: [], selectedIndex: 0, anchor: "", token: 0 },
+    completion: {
+      field: null,
+      items: [],
+      selectedIndex: 0,
+      anchor: "",
+      token: 0,
+    },
   };
   formPanel = new FloatingWidgetPanel();
   mountFormPanel();
@@ -8075,7 +8517,8 @@ function localProjectDefault(): string {
   // authority; corroborate with the orchestrator's own per-session remote
   // facet (set for the active SSH / k8s row). Either signal ⇒ cwd is remote.
   const active = orchestratorSessions.get(editor.activeWindow());
-  const activeIsRemote = editor.getAuthorityLabel().length > 0 || !!active?.remote;
+  const activeIsRemote = editor.getAuthorityLabel().length > 0 ||
+    !!active?.remote;
   if (!activeIsRemote) return cwd;
   // Active window is remote: pick the lowest-id local (non-remote, non-
   // discovered) session's root — in practice the launch/base window. If there
@@ -8204,7 +8647,8 @@ function scheduleCompletionRefresh(
   field: "project_path" | "branch",
 ): void {
   if (!form) return;
-  const anchor = form[field === "project_path" ? "projectPath" : "branch"].value;
+  const anchor =
+    form[field === "project_path" ? "projectPath" : "branch"].value;
   const token = ++form.completion.token;
   form.completion.field = field;
   form.completion.anchor = anchor;
@@ -8391,8 +8835,16 @@ async function fetchBranchCompletions(typed: string): Promise<string[]> {
   // Stable order: exact-match-first, then prefix-match, then
   // substring; ties broken by length so shorter names surface.
   filtered.sort((a, b) => {
-    const ascore = a.toLowerCase() === needle ? 0 : a.toLowerCase().startsWith(needle) ? 1 : 2;
-    const bscore = b.toLowerCase() === needle ? 0 : b.toLowerCase().startsWith(needle) ? 1 : 2;
+    const ascore = a.toLowerCase() === needle
+      ? 0
+      : a.toLowerCase().startsWith(needle)
+      ? 1
+      : 2;
+    const bscore = b.toLowerCase() === needle
+      ? 0
+      : b.toLowerCase().startsWith(needle)
+      ? 1
+      : 2;
     if (ascore !== bscore) return ascore - bscore;
     return a.length - b.length || a.localeCompare(b);
   });
@@ -8501,7 +8953,10 @@ function cancelForm(): void {
 // on the `ready` hook.
 // =============================================================================
 
-type CaptureResult = { ok: true; spec: CreateSpec } | { ok: false; error: string };
+type CaptureResult = { ok: true; spec: CreateSpec } | {
+  ok: false;
+  error: string;
+};
 
 // Resolve the (about-to-close) form into a `CreateSpec`, or return the
 // validation error that keeps the form open. Reads field values only — no
@@ -8534,7 +8989,9 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
         // that supports them, so a bare terminal / custom command never gets
         // stray flags or a prompt appended.
         auto: !!agentEntryForCmd(cmd)?.auto && f.autoMode,
-        startPrompt: agentEntryForCmd(cmd)?.prompt ? f.startPrompt.value.trim() : "",
+        startPrompt: agentEntryForCmd(cmd)?.prompt
+          ? f.startPrompt.value.trim()
+          : "",
         teachFreshCli: !!agentEntryForCmd(cmd)?.systemPrompt && f.teachFreshCli,
         branch: f.branch.value.trim(),
         newBranch: f.newBranch.value.trim(),
@@ -8549,8 +9006,12 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
     const target = f.k8sTarget.value.trim();
     const namespace = f.k8sNamespace.value.trim();
     const pod = f.k8sPod.value.trim();
-    if (target && !pod) return { ok: false, error: editor.t("err.k8s_named_target") };
-    if (!namespace || !pod) return { ok: false, error: editor.t("err.k8s_ns_pod_required") };
+    if (target && !pod) {
+      return { ok: false, error: editor.t("err.k8s_named_target") };
+    }
+    if (!namespace || !pod) {
+      return { ok: false, error: editor.t("err.k8s_ns_pod_required") };
+    }
     const agentArgv = splitAgentCmd(cmd);
     const detail = `${namespace}/${pod}`;
     const label = sessionName || `k8s:${namespace}/${pod}`;
@@ -8657,8 +9118,9 @@ function startPendingWorkspace(
 ): number {
   const id = allocPendingId();
   const restored = opts?.restored === true;
-  const remoteFacet: RemoteFacet | undefined =
-    spec.backend === "local" ? undefined : { ...spec.facet };
+  const remoteFacet: RemoteFacet | undefined = spec.backend === "local"
+    ? undefined
+    : { ...spec.facet };
   orchestratorSessions.set(id, {
     id,
     // A restored row keeps the name it last showed (the resolved / relabelled
@@ -8678,7 +9140,9 @@ function startPendingWorkspace(
     remote: remoteFacet,
     pending: {
       phase: restored ? "paused" : "creating",
-      message: restored ? editor.t("dock.pending_interrupted") : pendingCreatingMessage(spec),
+      message: restored
+        ? editor.t("dock.pending_interrupted")
+        : pendingCreatingMessage(spec),
       spec,
       // A restored/resumed row never yanks focus on relaunch.
       visit: !restored && opts?.visit === true,
@@ -8854,7 +9318,10 @@ function dismissPending(id: number): void {
 // the branch + directory with nothing tracking it. `--force` since the tree is
 // freshly created; any failure is swallowed — there's nothing else to do from
 // a cancellation path.
-async function discardCreatedWorktree(repoRoot: string, root: string): Promise<void> {
+async function discardCreatedWorktree(
+  repoRoot: string,
+  root: string,
+): Promise<void> {
   await spawnCollect(
     "git",
     ["-C", repoRoot, "worktree", "remove", "--force", root],
@@ -8906,12 +9373,18 @@ async function runLocalCreate(id: number): Promise<void> {
   relabelPending(id, sessionName);
 
   const root = createWorktree
-    ? editor.pathJoin(editor.getDataDir(), "orchestrator", slugify(repoRoot), sessionName)
+    ? editor.pathJoin(
+      editor.getDataDir(),
+      "orchestrator",
+      slugify(repoRoot),
+      sessionName,
+    )
     : projectPath;
 
   // Recovery idempotency: a worktree left on disk by an interrupted run is
   // reused rather than re-added (a re-add would fail and error the row).
-  const rootExists = createWorktree && editor.fileExists(editor.localPath(root));
+  const rootExists = createWorktree &&
+    editor.fileExists(editor.localPath(root));
   // Whether *this* run put the worktree on disk (vs. reusing an existing one),
   // so a mid-flight dismissal can remove exactly what it created.
   let addedWorktree = false;
@@ -8941,7 +9414,8 @@ async function runLocalCreate(id: number): Promise<void> {
         } else {
           failPending(
             id,
-            lastNonEmptyLine(addRes.stderr) || editor.t("err.worktree_add_failed"),
+            lastNonEmptyLine(addRes.stderr) ||
+              editor.t("err.worktree_add_failed"),
           );
         }
         return;
@@ -8957,7 +9431,8 @@ async function runLocalCreate(id: number): Promise<void> {
       if (addRes.exit_code !== 0) {
         failPending(
           id,
-          lastNonEmptyLine(addRes.stderr) || editor.t("err.worktree_add_failed"),
+          lastNonEmptyLine(addRes.stderr) ||
+            editor.t("err.worktree_add_failed"),
         );
         return;
       }
@@ -8967,7 +9442,16 @@ async function runLocalCreate(id: number): Promise<void> {
       // that name (only for this default case).
       let addRes = await spawnCollect(
         "git",
-        ["-C", repoRoot, "worktree", "add", root, "-b", sessionName, defaultBranch],
+        [
+          "-C",
+          repoRoot,
+          "worktree",
+          "add",
+          root,
+          "-b",
+          sessionName,
+          defaultBranch,
+        ],
         repoRoot,
       );
       if (addRes.exit_code !== 0) {
@@ -9009,7 +9493,14 @@ async function runLocalCreate(id: number): Promise<void> {
     }
     const upstreamRes = await spawnCollect(
       "git",
-      ["-C", projectPath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+      [
+        "-C",
+        projectPath,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{u}",
+      ],
       projectPath,
     );
     if (upstreamRes.exit_code !== 0) {
@@ -9052,7 +9543,9 @@ async function runLocalCreate(id: number): Promise<void> {
   // (a linked worktree the user pointed at directly).
   const attachInfo = !createWorktree ? await classifyWorktree(root) : null;
   const isLinkedAttach = attachInfo?.isLinked === true;
-  const effectiveProjectPath = isLinkedAttach ? attachInfo!.mainRoot : projectPath;
+  const effectiveProjectPath = isLinkedAttach
+    ? attachInfo!.mainRoot
+    : projectPath;
   const reportedBranch = createWorktree
     ? (newBranch || checkoutBranch || sessionName)
     : (checkoutBranch || (isLinkedAttach ? attachInfo!.branch : ""));
@@ -9072,11 +9565,12 @@ async function runLocalCreate(id: number): Promise<void> {
   }
 
   const argv = splitAgentCmd(cmd);
-  const { launch: launchArgv, resume: resumeArgv } = resolveAgentLaunch(argv, {
-    auto: spec.auto,
-    prompt: spec.startPrompt,
-    systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
-  });
+  const { launch: launchArgv, resume: resumeArgv, companion } =
+    resolveAgentLaunch(argv, {
+      auto: spec.auto,
+      prompt: spec.startPrompt,
+      systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
+    });
   const sharedWorktree = !createWorktree && !isLinkedAttach;
 
   // Capture the user's current window so focus can return to it after
@@ -9093,6 +9587,7 @@ async function runLocalCreate(id: number): Promise<void> {
       command: launchArgv.length > 0 ? launchArgv : undefined,
       title: launchArgv.length > 0 ? launchArgv[0] : undefined,
       resume: resumeArgv,
+      companion,
       // Always mint the capability token bound to this window so
       // `fresh --cmd script ...` from inside the workspace is authorised —
       // whether or not the agent was taught about it. `teach` only gates the
@@ -9212,7 +9707,8 @@ async function runRemoteCreate(id: number): Promise<void> {
   const s = orchestratorSessions.get(id);
   if (
     !s || !s.pending ||
-    (s.pending.spec.backend !== "ssh" && s.pending.spec.backend !== "kubernetes")
+    (s.pending.spec.backend !== "ssh" &&
+      s.pending.spec.backend !== "kubernetes")
   ) {
     return;
   }
@@ -9236,7 +9732,9 @@ async function runRemoteCreate(id: number): Promise<void> {
     // hook adopted the facet). Drop the placeholder.
     orchestratorSessions.delete(id);
     savePendingSpecs();
-    if (spec.persistCmd) editor.setGlobalState("orchestrator.last_cmd", spec.persistCmd);
+    if (spec.persistCmd) {
+      editor.setGlobalState("orchestrator.last_cmd", spec.persistCmd);
+    }
     if (visit) {
       // Create & Visit: the attach already made the born window active; hand
       // it the keyboard so the user lands in the connected session.
@@ -9282,7 +9780,10 @@ const PENDING_KEY = "orchestrator.pending";
 function savePendingSpecs(): void {
   const out: { spec: CreateSpec; label: string }[] = [];
   for (const s of orchestratorSessions.values()) {
-    if (s.pending && s.pending.phase !== "error" && s.pending.spec.backend === "local") {
+    if (
+      s.pending && s.pending.phase !== "error" &&
+      s.pending.spec.backend === "local"
+    ) {
       out.push({ spec: s.pending.spec, label: s.label });
     }
   }
@@ -9303,7 +9804,9 @@ function recoverPendingWorkspaces(): void {
     // Restore the name the row last showed (persisted by `savePendingSpecs`),
     // not the generic capture-time default it would otherwise re-derive.
     const savedLabel = (e as Record<string, unknown>).label;
-    const label = typeof savedLabel === "string" && savedLabel ? savedLabel : undefined;
+    const label = typeof savedLabel === "string" && savedLabel
+      ? savedLabel
+      : undefined;
     startPendingWorkspace(spec, { restored: true, label });
     restored++;
   }
@@ -9485,17 +9988,21 @@ async function launchAgentInCurrentWorkspace(
       cwd,
       command: launch.length > 0 ? launch : undefined,
       resume,
-      title: launch.length > 0 ? editor.pathBasename(launch[0]) || launch[0] : undefined,
-      // Always mint the capability token bound to THIS window + allowlist, so
-      // `fresh --cmd ...` from inside the terminal is authorised — matching the
-      // dialogue, where the token is always present and only the prompt is
-      // gated by "Teach Fresh CLI".
+      title: launch.length > 0
+        ? editor.pathBasename(launch[0]) || launch[0]
+        : undefined,
+      // Always mint the script capability bound to THIS window, so
+      // `fresh --cmd ...` inside the terminal is authorised — matching the
+      // dialogue, where the capability is always present and only the prompt
+      // is gated by "Teach Fresh CLI".
       allowScript: FRESH_CLI_ALLOW_SCRIPT,
       focus: true,
     });
   } catch (e) {
     editor.setStatus(
-      editor.t("status.prefix", { msg: e instanceof Error ? e.message : String(e) }),
+      editor.t("status.prefix", {
+        msg: e instanceof Error ? e.message : String(e),
+      }),
     );
   }
 }
@@ -9952,7 +10459,10 @@ registerHandler(
   "orchestrator_form_key_backspace",
   () => dispatchFormKey("Backspace"),
 );
-registerHandler("orchestrator_form_key_delete", () => dispatchFormKey("Delete"));
+registerHandler(
+  "orchestrator_form_key_delete",
+  () => dispatchFormKey("Delete"),
+);
 registerHandler("orchestrator_form_key_home", () => dispatchFormKey("Home"));
 registerHandler("orchestrator_form_key_end", () => dispatchFormKey("End"));
 // When a "Run in:" type tab is focused, ←/→ moves between tabs (switching the
@@ -9961,7 +10471,8 @@ function switchTabIfFocused(delta: 1 | -1): boolean {
   if (!form) return false;
   const idx = SESSION_BACKENDS.findIndex((b) => b.key === formFocusedKey());
   if (idx < 0) return false;
-  const next = (idx + delta + SESSION_BACKENDS.length) % SESSION_BACKENDS.length;
+  const next = (idx + delta + SESSION_BACKENDS.length) %
+    SESSION_BACKENDS.length;
   selectBackend(SESSION_BACKENDS[next].id);
   return true;
 }
@@ -10105,7 +10616,10 @@ editor.on("widget_event", (e) => {
   // ---------------------------------------------------------------------
   // "New Folder" dialog: name field, organize checkbox, Cancel / Create.
   // ---------------------------------------------------------------------
-  if (createFolderPanel && createFolderDialog && e.panel_id === createFolderPanel.id()) {
+  if (
+    createFolderPanel && createFolderDialog &&
+    e.panel_id === createFolderPanel.id()
+  ) {
     const d = createFolderDialog;
     if (e.event_type === "cancel") {
       // Esc / click-outside: the host already unmounted the panel, so
@@ -10133,7 +10647,9 @@ editor.on("widget_event", (e) => {
     if (e.event_type === "change" && e.widget_key === "folder-name") {
       const payload = (e.payload ?? {}) as Record<string, unknown>;
       if (typeof payload.value === "string") d.name.value = payload.value;
-      if (typeof payload.cursorByte === "number") d.name.cursor = payload.cursorByte;
+      if (typeof payload.cursorByte === "number") {
+        d.name.cursor = payload.cursorByte;
+      }
       // Typing lands in the name field even if focus drifted; the host
       // routes printable chars to the focused TextInput only, so a
       // change event implies the field is focused again.
@@ -10142,7 +10658,9 @@ editor.on("widget_event", (e) => {
     }
     if (e.event_type === "toggle" && e.widget_key === "folder-organize") {
       const checked = (e.payload as { checked?: unknown })?.checked;
-      d.organizeCurrent = typeof checked === "boolean" ? checked : !d.organizeCurrent;
+      d.organizeCurrent = typeof checked === "boolean"
+        ? checked
+        : !d.organizeCurrent;
       createFolderPanel.update(buildCreateFolderSpec());
       return;
     }
@@ -10160,6 +10678,7 @@ editor.on("widget_event", (e) => {
   // "Run Agent…" dialog: agent picker, target picker, Auto toggle,
   // Start-prompt field, Cancel / Run.
   // ---------------------------------------------------------------------
+
   // ---------------------------------------------------------------------
   // Dock session context menu (right-click): Visit / Archive / Delete.
   // ---------------------------------------------------------------------
@@ -10259,8 +10778,12 @@ editor.on("widget_event", (e) => {
         anchorDockMenu();
         return;
       }
-      if (e.widget_key === "confirm-archive" || e.widget_key === "confirm-delete") {
-        const action = e.widget_key === "confirm-archive" ? "archive" : "delete";
+      if (
+        e.widget_key === "confirm-archive" || e.widget_key === "confirm-delete"
+      ) {
+        const action = e.widget_key === "confirm-archive"
+          ? "archive"
+          : "delete";
         closeDockContextMenuAndRestoreDock();
         void runConfirmedAction(action, [id]);
         return;
@@ -10625,7 +11148,9 @@ editor.on("widget_event", (e) => {
         return;
       }
       const id = dockSelectedSessionId();
-      const sel = typeof id === "number" ? orchestratorSessions.get(id) : undefined;
+      const sel = typeof id === "number"
+        ? orchestratorSessions.get(id)
+        : undefined;
       // Enter on a being-created placeholder: resume a paused/failed one
       // (retry), or do nothing while it is still creating (there is no
       // window to dive into). Never blur to the editor — that would drop
@@ -10805,7 +11330,11 @@ editor.on("widget_event", (e) => {
             if (payload.via === "click") toggleDockFolderExpansion(key!);
             return;
           }
-          const fromEdge = idx > prevIdx ? "bottom" : idx < prevIdx ? "top" : null;
+          const fromEdge = idx > prevIdx
+            ? "bottom"
+            : idx < prevIdx
+            ? "top"
+            : null;
           if (payload.via === "click") diveDockSelectionFromClick(fromEdge);
           else scheduleDockSwitch(fromEdge);
           return;
@@ -10858,7 +11387,9 @@ editor.on("widget_event", (e) => {
       (e.widget_key === "sessions" || e.widget_key === "visit")
     ) {
       const id = openDialog.filteredIds[openDialog.selectedIndex];
-      const sel = typeof id === "number" ? orchestratorSessions.get(id) : undefined;
+      const sel = typeof id === "number"
+        ? orchestratorSessions.get(id)
+        : undefined;
       if (sel && sel.discovered) {
         // Discovered worktree: there's no window to switch to —
         // open one by attaching a fresh session to the worktree.
@@ -11006,6 +11537,16 @@ editor.on("widget_event", (e) => {
       toggleHideTrivial();
       return;
     }
+    const companionSelectedId = openDialog.filteredIds[openDialog.selectedIndex];
+    if (
+      ompCompanion.handleWidgetEvent(
+        e,
+        typeof companionSelectedId === "number"
+          ? orchestratorSessions.get(companionSelectedId)
+          : undefined,
+      )
+    ) return;
+
     if (e.event_type === "activate" && e.widget_key === "stop") {
       enterConfirm("stop");
       return;
@@ -11100,7 +11641,8 @@ function killSelected(): void {
     editor.setStatus(editor.t("status.kill_no_selected"));
     return;
   }
-  const id = ids[Math.max(0, Math.min(openDialog.selectedIndex, ids.length - 1))];
+  const id =
+    ids[Math.max(0, Math.min(openDialog.selectedIndex, ids.length - 1))];
   if (id <= 0) {
     editor.setStatus(editor.t("status.kill_select_row"));
     return;
@@ -11134,10 +11676,10 @@ editor.on("window_created", () => {
 });
 
 editor.on("window_closed", (e) => {
-  // The host has confirmed this window is gone, so drop any tombstone for
-  // it (reconcile won't re-add it now that it's out of `listWindows()` —
-  // this just keeps the set from growing).
-  if (e && typeof e.id === "number") closingWindowIds.delete(e.id);
+  if (e && typeof e.id === "number") {
+    closingWindowIds.delete(e.id);
+    ompCompanion.handleWindowClosed(e.id);
+  }
   refreshOpenDialog();
 });
 
@@ -11198,21 +11740,28 @@ editor.on("resize", () => {
     // lets a user-dragged width win. buildOpenSpec/buildDockSpec also
     // refit `listVisibleRows` + content width on the refresh below.
     if (dockMode) {
-      editor.floatingPanelControl(openPanel.id(), "dock_width", dockDefaultWidth());
+      editor.floatingPanelControl(
+        openPanel.id(),
+        "dock_width",
+        dockDefaultWidth(),
+      );
     }
     refreshOpenDialog();
   }
 });
 
+editor.on("omp_companion_snapshot", (payload) => {
+  ompCompanion.handleSnapshot(payload);
+});
 // =============================================================================
-// Agent activity tracking from terminal output / exit
-//
-// We only claim what the terminal can prove: a session is "working" while
-// it's actively printing, "idle" once it goes quiet. The signal is the
-// timestamp of the last output; `sessionState` buckets it against
-// IDLE_AFTER_MS at render time. We don't poll the process, so this tracks
-// *output*, not liveness — a wedged agent reads idle, same as a finished
-// one, which is the honest limit of what we can see from here.
+// Outside a live structured companion snapshot, we only claim what terminal
+// signals can prove: a session is "working" while its command is marked active
+// or it is printing, and "idle" once it goes quiet. The output signal is the
+// timestamp of the last output; the companion controller buckets it against
+// IDLE_AFTER_MS when no live structured/OSC state is available. We don't poll
+// the process, so this tracks *output*, not liveness — a wedged agent reads
+// idle, same as a finished one, which is the honest limit of what we can see
+// from here.
 //
 // Keyed by `window_id`, not the one terminal id Orchestrator spawned: a
 // session is its editor window (its id == the session id), so output from
@@ -11222,8 +11771,8 @@ editor.on("resize", () => {
 // progress bars, not just newline-terminated lines.
 // =============================================================================
 
-// `sessionState` buckets `working`/`idle` from `lastOutputAt` at render
-// time, but a re-render only happens on *new* output. So when a session
+// The companion controller buckets `working`/`idle` from `lastOutputAt` at
+// render time, but a re-render only happens on *new* output. So when a session
 // goes quiet nothing repaints it, and the row freezes on `working` until
 // some unrelated event forces a redraw. This schedules one refresh just
 // past the idle window so the working→idle flip happens on its own. The
@@ -11245,10 +11794,13 @@ editor.on("terminal_output", (payload) => {
     // Ignore the redraw burst a terminal emits right after its window
     // becomes active — that's not the agent working, and counting it
     // would flash the card to `working` on every selection.
-    if (s.activatedAt !== undefined && Date.now() - s.activatedAt < ACTIVATION_GRACE_MS) {
+    if (
+      s.activatedAt !== undefined &&
+      Date.now() - s.activatedAt < ACTIVATION_GRACE_MS
+    ) {
       return;
     }
-    // Stamp the moment of output. `sessionState` turns this into
+    // Stamp the moment of output. The companion controller turns this into
     // working/idle; the cached `state` is updated so persistence and
     // any non-render reader see a fresh value too.
     s.lastOutputAt = Date.now();
@@ -11289,6 +11841,7 @@ editor.on("terminal_output", (payload) => {
 });
 
 editor.on("terminal_exit", (payload) => {
+  ompCompanion.handleTerminalExit(payload);
   const s = orchestratorSessions.get(payload.window_id);
   if (s) {
     // A terminal in this session ended — it can't be the source of work

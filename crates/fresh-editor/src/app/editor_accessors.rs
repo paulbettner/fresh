@@ -1308,13 +1308,12 @@ impl Editor {
     /// (window, buffer) so the indicator can switch back to it.
     pub fn begin_self_update(
         &mut self,
-        terminal: fresh_core::TerminalId,
-        window: fresh_core::WindowId,
+        terminal: fresh_core::WindowTerminalId,
         buffer: fresh_core::BufferId,
     ) {
         self.self_update_phase = crate::services::release_checker::SelfUpdatePhase::Running;
         self.self_update_terminal = Some(terminal);
-        self.self_update_output = Some((window, buffer));
+        self.self_update_output = Some((terminal.window, buffer));
     }
 
     /// Move the update indicator to its terminal state when the update terminal
@@ -1339,7 +1338,7 @@ impl Editor {
                 .get(&window)
                 .is_some_and(|w| w.buffers.get(&buffer).is_some());
             if exists {
-                self.active_window = window;
+                self.set_active_window(window);
                 self.active_window_mut().set_active_buffer(buffer);
                 return;
             }

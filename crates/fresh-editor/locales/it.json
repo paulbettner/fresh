@@ -1554,6 +1554,7 @@
   "whitespace.already_has_newline": "Il file termina già con una nuova riga",
   "workspace.extract_no_file_path": "Impossibile estrarre: il buffer non ha un percorso file",
   "workspace.extract_terminal_dormant": "Impossibile estrarre: il terminale non ha una sessione attiva",
+  "workspace.extract_terminal_companion": "Impossibile estrarre: i terminali companion OMP devono restare nel proprio spazio di lavoro",
   "workspace.extract_already_rooted": "Già in uno spazio di lavoro con radice %{root}",
   "workspace.extracted_tab": "%{name} estratto nello spazio %{label}",
   "whitespace.newline_added": "Nuova riga finale aggiunta",

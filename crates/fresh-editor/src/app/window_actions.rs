@@ -349,6 +349,7 @@ impl crate::app::Editor {
         resume: Option<Vec<String>>,
         env: Option<HashMap<String, String>>,
         allow_script: bool,
+        companion: Option<fresh_core::api::TerminalCompanion>,
     ) -> Result<(WindowId, fresh_core::TerminalId, fresh_core::BufferId), String> {
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
@@ -414,12 +415,11 @@ impl crate::app::Editor {
         let restore_command = command.clone().unwrap_or_default();
 
         // Assemble the extra env injected into the seeded terminal's child:
-        // `FRESH_BIN` always, plus (when `allow_script` is present) a
-        // capability token bound to *this* new window + that allowlist, so a
-        // client in the terminal can drive exactly those commands against this
-        // window and no other. Minting happens here — after the window id is
-        // known, before the PTY spawns — so the token is live by the time the
-        // child reads its env. See `terminal::agent_command_env`.
+        // `FRESH_BIN` always, plus (when `allow_script` is set) a capability
+        // token bound to this new window, so a client in the terminal can drive
+        // the editor but no other window. Minting happens here — after the
+        // window id is known, before the PTY spawns — so the token is live by
+        // the time the child reads its env. See `terminal::agent_command_env`.
         let terminal_env = crate::app::terminal::agent_command_env(id, env, allow_script);
 
         let spawn_result = {
@@ -436,6 +436,7 @@ impl crate::app::Editor {
                 command,
                 title: title.filter(|t| !t.is_empty()),
                 env: terminal_env.clone(),
+                companion,
             })
         };
 
@@ -943,6 +944,21 @@ impl crate::app::Editor {
     pub fn extract_tab_to_new_workspace(&mut self, buffer_id: fresh_core::BufferId) {
         use rust_i18n::t;
 
+        let companion_terminal = self
+            .active_window()
+            .terminal_buffers
+            .get(&buffer_id)
+            .map(|binding| binding.terminal_id)
+            .is_some_and(|terminal_id| {
+                self.active_window()
+                    .terminal_companions
+                    .contains_key(&terminal_id)
+            });
+        if companion_terminal {
+            self.set_status_message(t!("workspace.extract_terminal_companion").to_string());
+            return;
+        }
+
         if self.active_window().is_terminal_buffer(buffer_id) {
             self.extract_terminal_tab_to_new_workspace(buffer_id);
             return;
@@ -1347,10 +1363,27 @@ impl crate::app::Editor {
             );
             return false;
         }
-        if self.windows.remove(&id).is_none() {
+        let Some(window) = self.windows.get(&id) else {
             tracing::warn!("close_window: unknown session id {id}");
             return false;
+        };
+        let terminal_ids: std::collections::HashSet<_> = window
+            .terminal_manager
+            .terminal_ids()
+            .into_iter()
+            .chain(window.terminal_companions.keys().copied())
+            .collect();
+        for terminal_id in terminal_ids {
+            self.purge_omp_companion_terminal(fresh_core::WindowTerminalId::new(id, terminal_id));
         }
+        if self
+            .self_update_terminal
+            .is_some_and(|terminal| terminal.window == id)
+        {
+            self.finish_self_update(false);
+            self.self_update_terminal = None;
+        }
+        self.windows.remove(&id);
         // Closing a dormant session's disconnected shell drops the whole
         // session: the descriptor must leave the dock with the window.
         self.dormant_remote.remove(&id);
@@ -1403,6 +1436,7 @@ impl crate::app::Editor {
             None,
             None,
             false,
+            None,
         ) {
             Ok((window_id, _terminal, _buffer)) => {
                 self.session_keepalives.insert(window_id, keepalive);

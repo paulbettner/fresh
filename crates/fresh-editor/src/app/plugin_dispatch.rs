@@ -790,8 +790,8 @@ impl Editor {
             PluginCommand::RefreshAllLines => {
                 self.handle_refresh_all_lines();
             }
-            PluginCommand::HookCompleted { .. } => {
-                // Sentinel processed in render loop; no-op if encountered elsewhere.
+            PluginCommand::HookCompleted { hook_name } => {
+                self.complete_omp_companion_hook(&hook_name);
             }
             PluginCommand::SetLineIndicator {
                 buffer_id,
@@ -992,6 +992,7 @@ impl Editor {
                 title,
                 resume,
                 env,
+                companion,
                 allow_script,
                 request_id,
             } => {
@@ -1004,9 +1005,27 @@ impl Editor {
                     resume,
                     env,
                     allow_script,
+                    companion,
                     request_id,
                 );
             }
+            PluginCommand::SendOmpCompanionCommand {
+                window_id,
+                terminal_id,
+                command_type,
+                request_id,
+            } => self.handle_send_omp_companion_command(
+                window_id,
+                terminal_id,
+                command_type,
+                request_id,
+            ),
+            PluginCommand::SetTerminalResume {
+                window_id,
+                terminal_id,
+                argv,
+                request_id,
+            } => self.handle_set_terminal_resume(window_id, terminal_id, argv, request_id),
             PluginCommand::SetActiveWindow { id } => {
                 // Diving into a dormant remote session starts its backend
                 // connect AND commits the switch immediately: the dive lands
@@ -4179,6 +4198,93 @@ impl Editor {
         self.refresh_lsp_status_popup_if_open();
     }
 
+    fn handle_send_omp_companion_command(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        terminal_id: fresh_core::TerminalId,
+        command_type: fresh_core::api::OmpCompanionCommandType,
+        request_id: u64,
+    ) {
+        let sent = self.windows.get(&window_id).is_some_and(|window| {
+            window.terminal_companions.get(&terminal_id)
+                == Some(&fresh_core::api::TerminalCompanion::Omp)
+                && window
+                    .terminal_manager
+                    .get(terminal_id)
+                    .is_some_and(|handle| {
+                        handle.is_alive()
+                            && handle.companion_kind()
+                                == Some(fresh_core::api::TerminalCompanion::Omp)
+                            && handle.enqueue_omp_companion_command(command_type)
+                    })
+        });
+        self.resolve_json_callback(request_id, sent);
+    }
+
+    fn handle_set_terminal_resume(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        terminal_id: fresh_core::TerminalId,
+        argv: Vec<String>,
+        request_id: u64,
+    ) {
+        let callback_id = JsCallbackId::from(request_id);
+        if argv.is_empty() {
+            self.plugin_manager.read().unwrap().reject_callback(
+                callback_id,
+                "setTerminalResume: argv must be non-empty".to_string(),
+            );
+            return;
+        }
+
+        let valid = self.windows.get(&window_id).is_some_and(|window| {
+            window.terminal_companions.get(&terminal_id)
+                == Some(&fresh_core::api::TerminalCompanion::Omp)
+                && window
+                    .terminal_buffers
+                    .values()
+                    .any(|binding| binding.terminal_id == terminal_id)
+                && window
+                    .terminal_manager
+                    .get(terminal_id)
+                    .is_some_and(|handle| handle.is_alive())
+        });
+        if !valid {
+            self.resolve_json_callback(request_id, false);
+            return;
+        }
+
+        let previous = self
+            .windows
+            .get_mut(&window_id)
+            .expect("validated window exists")
+            .terminal_resume_commands
+            .insert(terminal_id, argv);
+
+        match self.save_workspace_for(window_id) {
+            Ok(()) => self.resolve_json_callback(request_id, true),
+            Err(error) => {
+                let resumes = &mut self
+                    .windows
+                    .get_mut(&window_id)
+                    .expect("validated window remains present")
+                    .terminal_resume_commands;
+                match previous {
+                    Some(argv) => {
+                        resumes.insert(terminal_id, argv);
+                    }
+                    None => {
+                        resumes.remove(&terminal_id);
+                    }
+                }
+                self.plugin_manager.read().unwrap().reject_callback(
+                    callback_id,
+                    format!("setTerminalResume: workspace checkpoint failed: {error}"),
+                );
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_create_window_with_terminal(
         &mut self,
@@ -4190,6 +4296,7 @@ impl Editor {
         resume: Option<Vec<String>>,
         env: Option<std::collections::HashMap<String, String>>,
         allow_script: bool,
+        companion: Option<fresh_core::api::TerminalCompanion>,
         request_id: u64,
     ) {
         let callback_id = JsCallbackId::from(request_id);
@@ -4224,6 +4331,7 @@ impl Editor {
             resume,
             env,
             allow_script,
+            companion,
         ) {
             Ok((window_id, terminal_id, buffer_id)) => {
                 let api_result = fresh_core::api::SessionWithTerminalResult {
@@ -4254,7 +4362,6 @@ impl Editor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn handle_create_terminal(
         &mut self,
@@ -4302,11 +4409,10 @@ impl Editor {
         };
 
         // Assemble the extra env injected into the spawned terminal's child:
-        // `FRESH_BIN` plus, when `allow_script` is given, a capability
-        // token bound to the TARGET window + that allowlist (with
-        // `FRESH_SESSION`). This is what lets an agent spawned into an
-        // *existing* window drive the editor exactly like one born via
-        // `createWindowWithTerminal` — both paths share the same helper.
+        // `FRESH_BIN` plus, when `allow_script` is set, a capability token
+        // bound to the TARGET window (with `FRESH_SESSION`). This lets an agent
+        // spawned into an existing window drive the editor exactly like one
+        // born via `createWindowWithTerminal`; both paths share the helper.
         let terminal_env = crate::app::terminal::agent_command_env(target_id, env, allow_script);
 
         let result = {
@@ -4323,6 +4429,7 @@ impl Editor {
                 command: command.clone(),
                 title: title.filter(|t| !t.is_empty()),
                 env: terminal_env.clone(),
+                companion: None,
             };
             let spawned = target.create_plugin_terminal(spec);
             // Record the launch/resume argv exactly as `create_window_with_terminal`
@@ -6030,6 +6137,11 @@ impl Editor {
             }
             tracing::info!("Plugin closed terminal {:?}", terminal_id);
         } else {
+            let terminal = fresh_core::WindowTerminalId::new(self.active_window, terminal_id);
+            self.purge_omp_companion_terminal(terminal);
+            self.active_window_mut()
+                .terminal_companions
+                .remove(&terminal_id);
             self.active_window_mut().terminal_manager.close(terminal_id);
             tracing::info!("Plugin closed terminal {:?} (no buffer found)", terminal_id);
         }

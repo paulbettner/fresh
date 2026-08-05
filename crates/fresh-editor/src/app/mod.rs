@@ -51,6 +51,7 @@ mod menu_actions;
 mod menu_context;
 mod mouse_input;
 mod navigation;
+mod omp_companion;
 mod on_save_actions;
 mod orchestrator_persistence;
 mod overlay;
@@ -102,6 +103,8 @@ pub mod window;
 mod window_actions;
 pub mod window_resources;
 pub mod workspace;
+
+pub(crate) use omp_companion::OmpCompanionHookDelivery;
 
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
@@ -869,6 +872,9 @@ pub struct Editor {
     /// test_inject_command) take a write lock.
     plugin_manager: std::rc::Rc<RwLock<PluginManager>>,
 
+    /// Fair, latest-only delivery state for `omp_companion_snapshot`.
+    omp_companion_delivery: OmpCompanionHookDelivery,
+
     // `plugin_dev_workspaces` moved onto `Window` — keyed by `BufferId`,
     // and buffers are per-window, so the workspace map follows.
     /// Registry of status-bar tokens contributed by plugins.
@@ -1090,7 +1096,7 @@ pub struct Editor {
     /// The local terminal running an interactive self-update, if one is in
     /// flight — matched against `TerminalExited` to move the indicator to its
     /// terminal state. `None` once reaped.
-    self_update_terminal: Option<fresh_core::TerminalId>,
+    self_update_terminal: Option<fresh_core::WindowTerminalId>,
 
     /// The (window, buffer) of the update terminal, so the indicator can switch
     /// back to it on click. The update always runs locally, so this is a local

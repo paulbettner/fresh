@@ -424,6 +424,9 @@ impl Editor {
                 AsyncMessage::TerminalOutput { terminal } => {
                     self.handle_terminal_output(terminal);
                 }
+                AsyncMessage::OmpCompanionSnapshotReady { terminal } => {
+                    self.handle_omp_companion_snapshot_ready(terminal);
+                }
                 AsyncMessage::PathChanged { handle, path, kind } => {
                     self.handle_path_changed(handle, path, kind);
                 }
@@ -434,7 +437,7 @@ impl Editor {
                     // If this is the interactive self-update terminal, move the
                     // status-bar indicator to its terminal state. The exit code
                     // distinguishes all three: installed, action-required, failed.
-                    if self.self_update_terminal == Some(terminal.terminal) {
+                    if self.self_update_terminal == Some(terminal) {
                         self.finish_self_update(exit_code);
                         self.self_update_terminal = None;
                     }
@@ -844,6 +847,7 @@ impl Editor {
         // attribute output to the wrong session).
         let terminal_id = terminal.terminal;
         let owner = terminal.window;
+        let owner_is_active = owner == self.active_window;
         // Terminal output received - check if we should auto-jump back to terminal mode
         tracing::trace!("Terminal output received for {}", terminal);
 
@@ -858,7 +862,7 @@ impl Editor {
         // arrived — the exact case drag-to-select exists for. Output keeps
         // streaming underneath; the auto-jump resumes once the selection is
         // gone (Ctrl+Space, typing, or a click that collapses it).
-        let selection_active = {
+        let selection_active = owner_is_active && {
             let win = self.active_window();
             win.mouse_state.dragging_text_selection
                 || win.mouse_state.terminal_drag_pending.is_some()
@@ -872,7 +876,8 @@ impl Editor {
                     })
                     .unwrap_or(false)
         };
-        if self.config.terminal.jump_to_end_on_output
+        if owner_is_active
+            && self.config.terminal.jump_to_end_on_output
             && !self.active_window().focused_terminal_live()
             && !selection_active
         {
@@ -1198,187 +1203,44 @@ impl Editor {
         self.reattach_window(window_id);
     }
 
-    /// Snapshot a just-exited terminal into the record `restart_terminal_buffer`
-    /// replays from. Reads the live handle for geometry/cwd (valid only until
-    /// `terminal_manager.close`) and the terminal-id-keyed maps for the
-    /// scrollback files and launch/resume argv.
-    fn exited_terminal_record(
-        &self,
-        terminal_id: crate::services::terminal::TerminalId,
-        exit_code: Option<i32>,
-    ) -> crate::app::window::ExitedTerminal {
-        let window = self.active_window();
-        let handle = window.terminal_manager.get(terminal_id);
-        let (cols, rows) = handle
-            .map(|h| h.size())
-            .unwrap_or_else(|| window.get_terminal_dimensions());
-        crate::app::window::ExitedTerminal {
-            terminal_id,
-            exit_code,
-            cols,
-            rows,
-            cwd: handle.and_then(|h| h.cwd()),
-            backing_path: window.terminal_backing_files.get(&terminal_id).cloned(),
-            log_path: window.terminal_log_files.get(&terminal_id).cloned(),
-            command: window
-                .terminal_commands
-                .get(&terminal_id)
-                .filter(|argv| !argv.is_empty())
-                .cloned(),
-            resume: window
-                .terminal_resume_commands
-                .get(&terminal_id)
-                .filter(|argv| !argv.is_empty())
-                .cloned(),
-            ephemeral: window.ephemeral_terminals.contains(&terminal_id),
-            script_access: window.terminal_has_script_access(terminal_id),
-            title: None,
-        }
-    }
-
     fn handle_terminal_exited(
         &mut self,
         terminal: fresh_core::WindowTerminalId,
         exit_code: Option<i32>,
     ) {
-        // The message is tagged with its owning window, so the
-        // plugin hook is attributed correctly even for a
-        // background session's terminal.
-        let terminal_id = terminal.terminal;
-        let exited_window_id = terminal.window;
         tracing::info!("Terminal {} exited", terminal);
-        // A remote window whose carrier just dropped: its embedded PTY (a
-        // separate `ssh -t` / `kubectl exec` from the agent channel) died with
-        // the link, not because the user exited the shell. Keep the
-        // buffer↔terminal binding (and the backing/command maps, which this
-        // handler already leaves intact) so a reconnect can respawn it in
-        // place (`respawn_terminals_through_authority`, driven on the automatic
-        // path by `detect_remote_terminal_reconnects`). Removing it here would
-        // strand the buffer as a dead read-only tab with no way back.
-        //
-        // The signal is the *live authority*: a remote filesystem that is
-        // currently disconnected. Gating on `authority_spec` instead would
-        // miss a plain `fresh ssh://…` launch, whose spec stays `Local`. A
-        // normal exit (remote still connected, or any local terminal) falls
-        // through to the usual permanent teardown.
-        let preserve_for_reconnect = {
-            let fs = &self.active_window().authority().filesystem;
-            fs.remote_connection_info().is_some() && !fs.is_remote_connected()
+
+        // Revoke and purge before any terminal-exit hook can be queued. The
+        // companion delegate retains a tombstone only for an already in-flight
+        // hook, whose delayed name-only completion must not acknowledge a peer.
+        self.purge_omp_companion_terminal(terminal);
+
+        let owner_is_active = terminal.window == self.active_window;
+        let Some(window) = self.windows.get_mut(&terminal.window) else {
+            return;
         };
-        // Find the buffer associated with this terminal
-        if let Some((&buffer_id, _)) = self
-            .active_window()
-            .terminal_buffers
-            .iter()
-            .find(|(_, tb)| tb.terminal_id == terminal_id)
-        {
-            // A genuinely exited terminal has no PTY left to drive, so EVERY
-            // split showing it becomes read-only scrollback (not just the
-            // focused one) — otherwise an unfocused split would keep rendering a
-            // "live" grid of a dead terminal. A terminal preserved for remote
-            // reconnect keeps its per-split live state so it comes back live
-            // when the carrier respawns it.
-            if !preserve_for_reconnect {
-                let dead_splits: Vec<crate::model::event::LeafId> = self
-                    .active_window()
-                    .buffers
-                    .splits()
-                    .map(|(_, vs_map)| {
-                        vs_map
-                            .iter()
-                            .filter(|(_, svs)| svs.active_buffer == buffer_id)
-                            .map(|(leaf, _)| *leaf)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for leaf in dead_splits {
-                    self.active_window_mut()
-                        .set_split_terminal_scrollback(leaf, buffer_id, true);
-                }
-            }
+        let filesystem = &window.authority().filesystem;
+        let preserve_for_reconnect =
+            filesystem.remote_connection_info().is_some() && !filesystem.is_remote_connected();
 
-            // If the focused split was driving this now-dead terminal, leave the
-            // Terminal key context (its derived live state is already false).
-            if self.active_buffer() == buffer_id
-                && self.active_window().key_context
-                    == crate::input::keybindings::KeyContext::Terminal
-            {
-                self.active_window_mut().key_context =
-                    crate::input::keybindings::KeyContext::Normal;
-            }
-
-            // Sync terminal content to buffer (final screen state). This pins
-            // the viewport to the start of the visible screen, so the dead
-            // terminal is pixel-identical to its last live frame.
-            //
-            // Nothing is appended after it, deliberately. This used to write a
-            // "[Terminal process exited]" line into the backing file and then
-            // scroll past the pin to reveal it — which pushed the top of the
-            // screen out of view, and the first line of an agent's last answer
-            // is often the part you wanted. The exit is reported on the tab
-            // title and by the status-bar restart indicator instead, neither of
-            // which costs a row of output.
-            self.active_window_mut().sync_terminal_to_buffer(buffer_id);
-
-            // Ensure buffer remains read-only with no line numbers
-            if let Some(state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .map(|w| &mut w.buffers)
-                .expect("active window present")
-                .get_mut(&buffer_id)
-            {
-                state.editing_disabled = true;
-                state.margins.configure_for_line_numbers(false);
-                state.buffer.set_modified(false);
-            }
-
-            // Remove from terminal_buffers so it's no longer treated
-            // as a terminal — unless we're holding it for a remote
-            // reconnect to respawn in place (see above).
-            if !preserve_for_reconnect {
-                self.active_window_mut().terminal_buffers.remove(&buffer_id);
-                // Snapshot everything a restart needs *before* the handle is
-                // closed below, so the buffer can be brought back live in
-                // place (palette command / status-bar indicator) with the
-                // same argv precedence a workspace restore would use. The
-                // reconnect path doesn't need this: it keeps the binding and
-                // respawns from the still-intact terminal-id-keyed maps.
-                let mut record = self.exited_terminal_record(terminal_id, exit_code);
-                // Report the exit on the tab instead of in the output. An
-                // explicitly-titled tab (an agent, a named plugin terminal)
-                // keeps its name with a marker appended; an auto-named one has
-                // no live process left to read a name from, so it gets the
-                // marker on its current name and stops being auto-updated
-                // (`sync_terminal_titles` only walks live `terminal_buffers`).
-                let window = self.active_window_mut();
-                record.title = window
-                    .terminal_explicit_titles
-                    .contains(&buffer_id)
-                    .then(|| window.buffer_metadata.get(&buffer_id))
-                    .flatten()
-                    .map(|meta| meta.display_name.clone());
-                if let Some(meta) = window.buffer_metadata.get_mut(&buffer_id) {
-                    meta.display_name =
-                        t!("terminal.tab_exited", name = meta.display_name).to_string();
-                }
-                window.exited_terminals.insert(buffer_id, record);
-            }
-
-            self.set_status_message(t!("terminal.exited", id = terminal_id.0).to_string());
+        let finalized = window.finalize_terminal_exit_buffer(
+            terminal.terminal,
+            exit_code,
+            preserve_for_reconnect,
+        );
+        if !preserve_for_reconnect {
+            window.terminal_companions.remove(&terminal.terminal);
         }
-        self.active_window_mut().terminal_manager.close(terminal_id);
+        if owner_is_active && finalized.is_some() {
+            window.set_status_message(t!("terminal.exited", id = terminal.terminal.0).to_string());
+        }
+        window.terminal_manager.close(terminal.terminal);
 
-        // Notify plugins after the editor's own exit handling
-        // is complete. Orchestrator's state machine reads this
-        // to transition agents to READY (code 0) or ERRORED.
-        // `exit_code` is currently always `None` here; full
-        // wait-status capture is a follow-up commit.
         self.plugin_manager.read().unwrap().run_hook(
             "terminal_exit",
             crate::services::plugins::hooks::HookArgs::TerminalExited {
-                terminal_id: terminal_id.0 as u64,
-                window_id: exited_window_id.0,
+                terminal_id: terminal.terminal.0 as u64,
+                window_id: terminal.window.0,
                 exit_code,
             },
         );
@@ -1704,6 +1566,101 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn same_numeric_terminal_exit_routes_buffer_status_and_self_update_by_window() {
+        let mut editor = test_editor();
+        let active = editor.active_window;
+        let second_root = tempfile::tempdir().unwrap();
+        let second =
+            editor.create_window_at(second_root.path().to_path_buf(), "second".to_string());
+        std::mem::forget(second_root);
+
+        let terminal_id = fresh_core::TerminalId(0);
+        let active_buffer = editor
+            .windows
+            .get_mut(&active)
+            .unwrap()
+            .create_terminal_buffer_detached(terminal_id);
+        let second_buffer = editor
+            .windows
+            .get_mut(&second)
+            .unwrap()
+            .create_terminal_buffer_detached(terminal_id);
+        let active_terminal = fresh_core::WindowTerminalId::new(active, terminal_id);
+        let second_terminal = fresh_core::WindowTerminalId::new(second, terminal_id);
+
+        editor.begin_self_update(active_terminal, active_buffer);
+        let active_status = editor.windows.get(&active).unwrap().status_message.clone();
+        editor
+            .async_bridge
+            .as_ref()
+            .unwrap()
+            .sender()
+            .send(AsyncMessage::TerminalExited {
+                terminal: second_terminal,
+                exit_code: Some(0),
+            })
+            .unwrap();
+        editor.process_async_messages();
+        assert_eq!(editor.active_window, active);
+
+        assert_eq!(editor.self_update_terminal, Some(active_terminal));
+        assert_eq!(
+            editor.self_update_phase,
+            crate::services::release_checker::SelfUpdatePhase::Running
+        );
+        assert!(editor
+            .windows
+            .get(&active)
+            .unwrap()
+            .terminal_buffers
+            .contains_key(&active_buffer));
+        assert!(!editor
+            .windows
+            .get(&second)
+            .unwrap()
+            .terminal_buffers
+            .contains_key(&second_buffer));
+        assert_eq!(
+            editor.windows.get(&active).unwrap().status_message,
+            active_status
+        );
+        assert!(editor
+            .windows
+            .get(&second)
+            .unwrap()
+            .status_message
+            .is_some());
+        assert!(!editor.omp_companion_delivery.is_tombstoned(active_terminal));
+        assert!(!editor.omp_companion_delivery.is_tombstoned(second_terminal));
+
+        editor
+            .async_bridge
+            .as_ref()
+            .unwrap()
+            .sender()
+            .send(AsyncMessage::TerminalExited {
+                terminal: active_terminal,
+                exit_code: Some(0),
+            })
+            .unwrap();
+        editor.process_async_messages();
+
+        assert_eq!(editor.self_update_terminal, None);
+        assert_eq!(
+            editor.self_update_phase,
+            crate::services::release_checker::SelfUpdatePhase::Succeeded
+        );
+        assert!(!editor.omp_companion_delivery.is_tombstoned(active_terminal));
+        assert!(!editor.omp_companion_delivery.is_tombstoned(second_terminal));
+        assert!(!editor
+            .windows
+            .get(&active)
+            .unwrap()
+            .terminal_buffers
+            .contains_key(&active_buffer));
     }
 
     #[test]

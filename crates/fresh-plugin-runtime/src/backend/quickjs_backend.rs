@@ -7607,10 +7607,62 @@ impl JsEditorApi {
                 title: opts.title,
                 resume: opts.resume,
                 env: opts.env,
+                companion: opts.companion,
                 allow_script: opts.allow_script.unwrap_or(false),
                 request_id: id,
             });
         Ok(id)
+    }
+    /// Send a closed-set command to an exact live OMP companion terminal.
+    #[plugin_api(
+        async_promise,
+        js_name = "sendOmpCompanionCommand",
+        ts_return = "boolean"
+    )]
+    #[qjs(rename = "_sendOmpCompanionCommandStart")]
+    pub fn send_omp_companion_command_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        window_id: u64,
+        terminal_id: u64,
+        type_: fresh_core::api::OmpCompanionCommandType,
+    ) -> rquickjs::Result<u64> {
+        let request_id = self.alloc_request_id();
+        self.command_sender
+            .send(PluginCommand::SendOmpCompanionCommand {
+                window_id: fresh_core::WindowId(window_id),
+                terminal_id: fresh_core::TerminalId(terminal_id as usize),
+                command_type: type_,
+                request_id,
+            })
+            .map_err(|error| {
+                rquickjs::Error::new_from_js_message("channel", "editor", &error.to_string())
+            })?;
+        Ok(request_id)
+    }
+
+    /// Persist an exact argv for restoring the specified terminal.
+    #[plugin_api(async_promise, js_name = "setTerminalResume", ts_return = "boolean")]
+    #[qjs(rename = "_setTerminalResumeStart")]
+    pub fn set_terminal_resume_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        window_id: u64,
+        terminal_id: u64,
+        argv: Vec<String>,
+    ) -> rquickjs::Result<u64> {
+        let request_id = self.alloc_request_id();
+        self.command_sender
+            .send(PluginCommand::SetTerminalResume {
+                window_id: fresh_core::WindowId(window_id),
+                terminal_id: fresh_core::TerminalId(terminal_id as usize),
+                argv,
+                request_id,
+            })
+            .map_err(|error| {
+                rquickjs::Error::new_from_js_message("channel", "editor", &error.to_string())
+            })?;
+        Ok(request_id)
     }
 
     /// Send input data to a terminal
@@ -8134,6 +8186,8 @@ const EDITOR_PROMISE_BOOTSTRAP: &str = r#"
                 editor.getLineEndPosition = _wrapAsync("_getLineEndPositionStart", "getLineEndPosition");
                 editor.createTerminal = _wrapAsync("_createTerminalStart", "createTerminal");
                 editor.createWindowWithTerminal = _wrapAsync("_createWindowWithTerminalStart", "createWindowWithTerminal");
+                editor.sendOmpCompanionCommand = _wrapAsync("_sendOmpCompanionCommandStart", "sendOmpCompanionCommand");
+                editor.setTerminalResume = _wrapAsync("_setTerminalResumeStart", "setTerminalResume");
                 editor.reloadGrammars = _wrapAsync("_reloadGrammarsStart", "reloadGrammars");
 
                 // Everything else that follows the `_<name>Start` convention
@@ -12135,6 +12189,55 @@ mod tests {
                 assert_eq!(action_name, "move_cursor_up");
             }
             _ => panic!("Expected ExecuteAction, got {:?}", cmd),
+        }
+    }
+
+    #[test]
+    fn omp_companion_async_apis_send_commands() {
+        let (mut backend, rx) = create_test_backend();
+
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis._commandPromise = editor.sendOmpCompanionCommand(7, 11, "cancel");
+            globalThis._resumePromise = editor.setTerminalResume(7, 11, ["omp", "--resume", "session-1"]);
+        "#,
+                "test.js",
+            )
+            .unwrap();
+
+        match rx.try_recv().unwrap() {
+            PluginCommand::SendOmpCompanionCommand {
+                window_id,
+                terminal_id,
+                command_type,
+                request_id,
+            } => {
+                assert_eq!(window_id, fresh_core::WindowId(7));
+                assert_eq!(terminal_id, fresh_core::TerminalId(11));
+                assert_eq!(
+                    command_type,
+                    fresh_core::api::OmpCompanionCommandType::Cancel
+                );
+                assert!(request_id > 0);
+            }
+            command => panic!("Expected SendOmpCompanionCommand, got {command:?}"),
+        }
+
+        match rx.try_recv().unwrap() {
+            PluginCommand::SetTerminalResume {
+                window_id,
+                terminal_id,
+                argv,
+                request_id,
+            } => {
+                assert_eq!(window_id, fresh_core::WindowId(7));
+                assert_eq!(terminal_id, fresh_core::TerminalId(11));
+                assert_eq!(argv, ["omp", "--resume", "session-1"]);
+                assert!(request_id > 0);
+            }
+            command => panic!("Expected SetTerminalResume, got {command:?}"),
         }
     }
 

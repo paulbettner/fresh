@@ -1070,6 +1070,11 @@ type CreateWindowWithTerminalOptions = {
 	*/
 	env?: { [key in string] : string };
 	/**
+	* Opt in to the native OMP TUI companion for a supported local,
+	* direct `omp` launch. Unsupported launches remain ordinary terminals.
+	*/
+	companion?: TerminalCompanion;
+	/**
 	* When set, the host mints an unforgeable capability token bound
 	* to the NEW window and injects it into the spawned terminal as
 	* `FRESH_CMD_TOKEN`. A client presenting that token over the
@@ -1202,6 +1207,8 @@ type CreateTerminalOptions = {
 	*/
 	allowScript?: boolean;
 };
+type TerminalCompanion = "omp";
+type OmpCompanionCommandType = "cancel" | "request_snapshot";
 type CursorInfo = {
 	/**
 	* Byte position of the cursor
@@ -4681,6 +4688,14 @@ interface EditorAPI {
 	*/
 	createWindowWithTerminal(opts: CreateWindowWithTerminalOptions): Promise<SessionWithTerminalResult>;
 	/**
+	* Send a closed-set command to an exact live OMP companion terminal.
+	*/
+	sendOmpCompanionCommand(windowId: number, terminalId: number, type: OmpCompanionCommandType): Promise<boolean>;
+	/**
+	* Persist an exact argv for restoring the specified terminal.
+	*/
+	setTerminalResume(windowId: number, terminalId: number, argv: string[]): Promise<boolean>;
+	/**
 	* Send input data to a terminal
 	*/
 	sendTerminalInput(terminalId: number, data: string): boolean;
@@ -4810,6 +4825,52 @@ interface EditorAPI {
 		description?: string;
 	}): E;
 	getPluginConfig<T = unknown>(): T;
+}
+interface OmpCompanionSnapshotV1 {
+	version: 1;
+	incarnation: string;
+	sequence: number;
+	sessionGeneration: number;
+	timestampMs: number;
+	ompVersion: string;
+	processId: number;
+	sessionId: string;
+	sessionName?: string;
+	cwd: string;
+	state: "idle" | "working" | "awaiting_approval" | "retrying" | "compacting" | "stopped" | "error";
+	model?: {
+		provider: string;
+		id: string;
+	};
+	thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	runningTools: number;
+	currentTool?: {
+		name: string;
+		intent?: string;
+	};
+	goal?: {
+		objective: string;
+		status: "active" | "paused" | "budget-limited" | "complete" | "dropped";
+	};
+	todos?: {
+		pending: number;
+		inProgress: number;
+		blocked: number;
+		completed: number;
+		abandoned: number;
+		current?: string;
+	};
+	context?: {
+		tokens: number;
+		contextWindow: number;
+		percentBps: number;
+	};
+	pendingApprovals: number;
+	asyncJobs?: {
+		running: number;
+		recentFailures: number;
+		pendingDelivery: number;
+	};
 }
 /**
 * Maps every hook event name to its payload type.
@@ -5103,6 +5164,15 @@ interface HookEventMap {
 		terminal_id: number;
 		window_id: number;
 		last_line: string;
+		terminal_title: string;
+		osc_activity: boolean | null;
+	};
+	omp_companion_snapshot: {
+		window_id: number;
+		terminal_id: number;
+		received_at_ms: number;
+		launch_executable: string;
+		snapshot: OmpCompanionSnapshotV1;
 	};
 	terminal_exit: {
 		terminal_id: number;

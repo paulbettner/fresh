@@ -30,6 +30,7 @@ use crate::services::authority::TerminalWrapper;
 use crate::services::terminal::TerminalId;
 use crate::state::EditorState;
 use crate::view::split::SplitViewState;
+use base64::Engine as _;
 use rust_i18n::t;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -101,6 +102,7 @@ pub struct PluginTerminalSpec {
     /// process, on top of the inherited + activated env. Applied after
     /// the control vars (`TERM`, `FRESH_SESSION`). Empty adds nothing.
     pub env: HashMap<String, String>,
+    pub companion: Option<fresh_core::api::TerminalCompanion>,
 }
 
 /// Assemble the extra env for a terminal that hosts an agent which may drive
@@ -160,6 +162,214 @@ pub(crate) fn agent_command_env(
         env.insert("FRESH_CMD_TOKEN".to_string(), token);
     }
     env
+}
+const OMP_COMPANION_ENV: &str = "FRESH_OMP_COMPANION";
+const OMP_COMPANION_TOKEN_ENV: &str = "FRESH_OMP_COMPANION_TOKEN";
+
+fn env_key_matches(key: &str, expected: &str, windows: bool) -> bool {
+    if windows {
+        key.eq_ignore_ascii_case(expected)
+    } else {
+        key == expected
+    }
+}
+
+fn is_reserved_omp_companion_key(key: &str, windows: bool) -> bool {
+    env_key_matches(key, OMP_COMPANION_ENV, windows)
+        || env_key_matches(key, OMP_COMPANION_TOKEN_ENV, windows)
+}
+fn reject_reserved_omp_companion_env(
+    extra_env: &HashMap<String, String>,
+    windows: bool,
+) -> Result<(), String> {
+    if extra_env
+        .keys()
+        .any(|key| is_reserved_omp_companion_key(key, windows))
+    {
+        Err("reserved OMP companion environment key".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// The result of attempting to attach the optional OMP capability to a
+/// terminal spawn. `Unsupported` is intentionally distinct from an entropy
+/// failure: the former retains a descriptive workspace marker so the next
+/// authoritative spawn can retry, whereas the latter must not persist one.
+pub(crate) enum OmpCompanionPreparation {
+    Active(crate::services::terminal::manager::OmpCompanionSpawn),
+    Unsupported,
+    EntropyUnavailable,
+}
+
+impl OmpCompanionPreparation {
+    pub(crate) fn preserves_marker(&self) -> bool {
+        matches!(self, Self::Active(_) | Self::Unsupported)
+    }
+
+    pub(crate) fn into_spawn(
+        self,
+    ) -> Option<crate::services::terminal::manager::OmpCompanionSpawn> {
+        match self {
+            Self::Active(spawn) => Some(spawn),
+            Self::Unsupported | Self::EntropyUnavailable => None,
+        }
+    }
+}
+
+/// Commit the persisted companion disposition for a successfully spawned
+/// initial terminal. A descriptive OMP marker is independent of whether this
+/// PTY got a live companion: `Unsupported` deliberately has no live protocol
+/// state but must remain eligible for a later authoritative retry.
+fn persist_initial_companion_marker(
+    terminal_companions: &mut HashMap<TerminalId, fresh_core::api::TerminalCompanion>,
+    terminal_id: TerminalId,
+    companion: Option<fresh_core::api::TerminalCompanion>,
+    preserves_marker: bool,
+) {
+    let Some(companion) = companion else {
+        return;
+    };
+    if preserves_marker {
+        terminal_companions.insert(terminal_id, companion);
+    } else {
+        terminal_companions.remove(&terminal_id);
+    }
+}
+
+/// Mint the live companion capability after eligibility and reserved-key
+/// policy have been resolved. Entropy backs only the optional capability: a
+/// failure leaves the PTY launch as an ordinary terminal.
+fn mint_omp_companion_spawn<E>(
+    kind: fresh_core::api::TerminalCompanion,
+    extra_env: &mut HashMap<String, String>,
+    fill_entropy: impl FnOnce(&mut [u8; 32]) -> Result<(), E>,
+) -> Result<crate::services::terminal::manager::OmpCompanionSpawn, ()> {
+    let mut spawn = crate::services::terminal::manager::OmpCompanionSpawn {
+        kind,
+        secret: [0u8; 32],
+    };
+    if fill_entropy(&mut spawn.secret).is_err() {
+        tracing::warn!("OMP companion unavailable: entropy source failed");
+        return Err(());
+    }
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&spawn.secret);
+    extra_env.insert(OMP_COMPANION_ENV.to_string(), "1".to_string());
+    extra_env.insert(OMP_COMPANION_TOKEN_ENV.to_string(), token);
+    Ok(spawn)
+}
+
+fn preparation_after_mint(
+    minted: Result<crate::services::terminal::manager::OmpCompanionSpawn, ()>,
+) -> OmpCompanionPreparation {
+    match minted {
+        Ok(spawn) => OmpCompanionPreparation::Active(spawn),
+        Err(()) => OmpCompanionPreparation::EntropyUnavailable,
+    }
+}
+
+fn omp_companion_supported(
+    direct_local: bool,
+    multiplexer_active: bool,
+    command: Option<&[String]>,
+    windows: bool,
+) -> bool {
+    direct_local
+        && !multiplexer_active
+        && command.is_some_and(|argv| direct_omp_argv(argv, windows))
+}
+
+fn direct_omp_argv(argv: &[String], windows: bool) -> bool {
+    let Some(executable) = argv.first() else {
+        return false;
+    };
+    let basename = if windows {
+        executable
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(executable.as_str())
+    } else {
+        executable.rsplit('/').next().unwrap_or(executable.as_str())
+    };
+    let executable_matches = if windows {
+        basename.eq_ignore_ascii_case("omp") || basename.eq_ignore_ascii_case("omp.exe")
+    } else {
+        basename == "omp" || basename == "omp.exe"
+    };
+    executable_matches && !argv.iter().skip(1).any(|arg| arg == "--no-session")
+}
+
+fn effective_env_non_empty(
+    name: &str,
+    inherited: &[(String, String)],
+    env_delta: &crate::services::env_provider::EnvDelta,
+    plugin_env: &HashMap<String, String>,
+    windows: bool,
+) -> bool {
+    let mut non_empty = inherited
+        .iter()
+        .filter(|(key, _)| env_key_matches(key, name, windows))
+        .any(|(_, value)| !value.is_empty());
+
+    let mut delta_seen = false;
+    let mut delta_non_empty = false;
+    for (key, value) in &env_delta.set {
+        if env_key_matches(key, name, windows) {
+            delta_seen = true;
+            delta_non_empty |= !value.is_empty();
+        }
+    }
+    if delta_seen {
+        non_empty = delta_non_empty;
+    }
+    if env_delta
+        .unset
+        .iter()
+        .any(|key| env_key_matches(key, name, windows))
+    {
+        non_empty = false;
+    }
+
+    let mut plugin_seen = false;
+    let mut plugin_non_empty = false;
+    for (key, value) in plugin_env {
+        if env_key_matches(key, name, windows) {
+            plugin_seen = true;
+            plugin_non_empty |= !value.is_empty();
+        }
+    }
+    if plugin_seen {
+        non_empty = plugin_non_empty;
+    }
+    non_empty
+}
+
+fn remove_reserved_omp_companion_env(
+    inherited: &[(String, String)],
+    env_delta: &mut crate::services::env_provider::EnvDelta,
+    windows: bool,
+) {
+    let (set, unset) = (&mut env_delta.set, &mut env_delta.unset);
+    for key in inherited.iter().map(|(key, _)| key) {
+        if is_reserved_omp_companion_key(key, windows)
+            && !unset.iter().any(|existing| existing == key)
+        {
+            unset.push(key.clone());
+        }
+    }
+    for (key, _) in set.iter() {
+        if is_reserved_omp_companion_key(key, windows)
+            && !unset.iter().any(|existing| existing == key)
+        {
+            unset.push(key.clone());
+        }
+    }
+    set.retain(|(key, _)| !is_reserved_omp_companion_key(key, windows));
+    for key in [OMP_COMPANION_ENV, OMP_COMPANION_TOKEN_ENV] {
+        if !unset.iter().any(|existing| existing == key) {
+            unset.push(key.to_string());
+        }
+    }
 }
 
 impl Window {
@@ -316,6 +526,44 @@ impl Window {
         }
         wrapper
     }
+    pub(crate) fn prepare_omp_companion_spawn(
+        &self,
+        kind: fresh_core::api::TerminalCompanion,
+        command: Option<&[String]>,
+        env_delta: &mut crate::services::env_provider::EnvDelta,
+        extra_env: &mut HashMap<String, String>,
+    ) -> Result<OmpCompanionPreparation, String> {
+        let windows = cfg!(windows);
+        reject_reserved_omp_companion_env(extra_env, windows)?;
+
+        let inherited: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(key, value)| {
+                let key = key.into_string().ok()?;
+                (env_key_matches(&key, "TMUX", windows)
+                    || env_key_matches(&key, "STY", windows)
+                    || is_reserved_omp_companion_key(&key, windows))
+                .then(|| (key, value.to_string_lossy().into_owned()))
+            })
+            .collect();
+        let multiplexer_active =
+            effective_env_non_empty("TMUX", &inherited, env_delta, extra_env, windows)
+                || effective_env_non_empty("STY", &inherited, env_delta, extra_env, windows);
+        remove_reserved_omp_companion_env(&inherited, env_delta, windows);
+
+        let direct_local = matches!(
+            &self.authority().command_wrap,
+            crate::services::authority::CommandWrap::Direct
+        );
+        if !omp_companion_supported(direct_local, multiplexer_active, command, windows) {
+            return Ok(OmpCompanionPreparation::Unsupported);
+        }
+
+        Ok(preparation_after_mint(mint_omp_companion_spawn(
+            kind,
+            extra_env,
+            |secret| getrandom::fill(secret),
+        )))
+    }
 
     /// Get terminal dimensions appropriate for spawning a PTY in this
     /// window. Derived from the window's cached screen size minus a
@@ -350,7 +598,7 @@ impl Window {
         command_override: Option<Vec<String>>,
         extra_env: HashMap<String, String>,
     ) -> Option<TerminalId> {
-        self.spawn_terminal_session_impl(cwd, persistent, command_override, extra_env, false)
+        self.spawn_terminal_session_impl(cwd, persistent, command_override, extra_env, false, None)
     }
 
     /// Like [`Self::spawn_terminal_session`] but builds the command wrapper from
@@ -365,7 +613,7 @@ impl Window {
         command_override: Option<Vec<String>>,
         extra_env: HashMap<String, String>,
     ) -> Option<TerminalId> {
-        self.spawn_terminal_session_impl(cwd, persistent, command_override, extra_env, true)
+        self.spawn_terminal_session_impl(cwd, persistent, command_override, extra_env, true, None)
     }
 
     /// Pick the `fresh-terminal-…` file stem for a new persistent terminal in
@@ -415,8 +663,9 @@ impl Window {
         cwd: Option<PathBuf>,
         persistent: bool,
         command_override: Option<Vec<String>>,
-        extra_env: HashMap<String, String>,
+        mut extra_env: HashMap<String, String>,
         force_local: bool,
+        companion: Option<fresh_core::api::TerminalCompanion>,
     ) -> Option<TerminalId> {
         let (cols, rows) = self.get_terminal_dimensions();
 
@@ -459,22 +708,42 @@ impl Window {
         // Empty argv falls back to the interactive shell.
         //
         // `force_local` bypasses the window's authority so the command runs on
-        // this host regardless of any remote backend (see `local_direct_wrapper`).
-        let wrapper = match command_override {
-            Some(argv) if !argv.is_empty() && force_local => local_direct_wrapper(&argv),
-            Some(argv) if !argv.is_empty() => self.authority().terminal_command(&argv),
+        let wrapper = match command_override.as_deref() {
+            Some(argv) if !argv.is_empty() && force_local => local_direct_wrapper(argv),
+            Some(argv) if !argv.is_empty() => self.authority().terminal_command(argv),
             _ => self.resolved_terminal_wrapper(),
         };
         // A forced-local command must not inherit a remote authority's activated
         // env (venv/direnv living on another host); it runs on this host and
-        // inherits this editor process's real environment instead.
-        let (wrapper, env_delta) = if force_local {
+        let (wrapper, mut env_delta) = if force_local {
             (wrapper, crate::services::env_provider::EnvDelta::default())
         } else {
             let wrapper = self.apply_remote_terminal_env(wrapper);
             let env_delta = self.terminal_env_delta(&wrapper);
             (wrapper, env_delta)
         };
+        let companion_preparation = match companion {
+            Some(kind) => match self.prepare_omp_companion_spawn(
+                kind,
+                command_override.as_deref(),
+                &mut env_delta,
+                &mut extra_env,
+            ) {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    self.set_status_message(
+                        t!("terminal.failed_to_open", error = error.clone()).to_string(),
+                    );
+                    tracing::warn!("OMP companion terminal launch rejected: {error}");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let preserves_companion_marker = companion_preparation
+            .as_ref()
+            .is_some_and(OmpCompanionPreparation::preserves_marker);
+        let companion_spawn = companion_preparation.and_then(OmpCompanionPreparation::into_spawn);
         match self.terminal_manager.spawn(
             cols,
             rows,
@@ -487,8 +756,15 @@ impl Window {
             wrapper,
             env_delta,
             extra_env,
+            companion_spawn,
         ) {
             Ok(terminal_id) => {
+                persist_initial_companion_marker(
+                    &mut self.terminal_companions,
+                    terminal_id,
+                    companion,
+                    preserves_companion_marker,
+                );
                 self.terminal_log_files.insert(terminal_id, log_path);
                 // If the actual terminal id differs from the predicted one,
                 // re-key the backing entry onto the real id — keeping the
@@ -637,7 +913,11 @@ impl Window {
             command,
             title,
             env,
+            companion,
         } = spec;
+        if companion.is_some() {
+            reject_reserved_omp_companion_env(&env, cfg!(windows))?;
+        }
         // Derive the auto-title from the command's executable name
         // (basename of argv[0]). The host writes this into the
         // terminal buffer's `BufferMetadata::name` so the tab reads
@@ -654,7 +934,7 @@ impl Window {
         });
         let resolved_title = title.or(auto_title);
         let terminal_id = self
-            .spawn_terminal_session(cwd, persistent, command, env)
+            .spawn_terminal_session_impl(cwd, persistent, command, env, false, companion)
             .ok_or_else(|| "Failed to spawn terminal".to_string())?;
 
         // Register the leader pid with this window's process_groups
@@ -1160,7 +1440,12 @@ impl Window {
             let resume_argv = self
                 .terminal_resume_commands
                 .get(&old_id)
-                .filter(|argv| !argv.is_empty() && self.resources.config.terminal.resume_agents)
+                .filter(|argv| {
+                    !argv.is_empty()
+                        && (self.terminal_companions.get(&old_id)
+                            == Some(&fresh_core::api::TerminalCompanion::Omp)
+                            || self.resources.config.terminal.resume_agents)
+                })
                 .cloned();
             let launch_argv = self
                 .terminal_commands
@@ -1181,6 +1466,7 @@ impl Window {
                 launch_argv,
                 ephemeral,
                 script_access,
+                companion: self.terminal_companions.get(&old_id).copied(),
             };
             match self.respawn_terminal_pty(buffer_id, spawn) {
                 Some(_) => revived += 1,
@@ -1222,16 +1508,35 @@ impl Window {
             None => self.resolved_terminal_wrapper(),
         };
         let wrapper = self.apply_remote_terminal_env(wrapper);
-        let env_delta = self.terminal_env_delta(&wrapper);
+        let mut env_delta = self.terminal_env_delta(&wrapper);
 
         // An agent that was granted editor control keeps it across the
         // respawn: the reborn child gets a freshly-minted token bound to this
         // window, since the one its predecessor carried died with that PTY.
-        let extra_env = if spec.script_access {
+        let mut extra_env = if spec.script_access {
             self.remint_terminal_script_env(spec.old_id)
         } else {
             HashMap::new()
         };
+        let companion_preparation = match spec.companion {
+            Some(kind) => match self.prepare_omp_companion_spawn(
+                kind,
+                spawn_argv.map(Vec::as_slice),
+                &mut env_delta,
+                &mut extra_env,
+            ) {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    tracing::warn!("OMP companion terminal respawn rejected: {error}");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let preserves_companion_marker = companion_preparation
+            .as_ref()
+            .is_some_and(OmpCompanionPreparation::preserves_marker);
+        let companion_spawn = companion_preparation.and_then(OmpCompanionPreparation::into_spawn);
 
         let new_id = match self.terminal_manager.spawn(
             spec.cols,
@@ -1245,6 +1550,7 @@ impl Window {
             wrapper,
             env_delta,
             extra_env,
+            companion_spawn,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -1266,6 +1572,13 @@ impl Window {
         // values come from the caller's spec rather than the maps, so this is
         // correct even when the exit path already dropped the old entries.
         self.rekey_terminal_script_token(spec.old_id, new_id);
+        self.terminal_companions.remove(&spec.old_id);
+        persist_initial_companion_marker(
+            &mut self.terminal_companions,
+            new_id,
+            spec.companion,
+            preserves_companion_marker,
+        );
         if new_id != spec.old_id {
             self.terminal_backing_files.remove(&spec.old_id);
             self.terminal_log_files.remove(&spec.old_id);
@@ -1357,8 +1670,8 @@ impl Window {
     /// This is the per-buffer counterpart to what a workspace restore does for
     /// a whole window: same argv precedence (agent-resume → launch command →
     /// plain shell), same authority wrapper, same reuse of the backing/log
-    /// files so the transcript continues below the `[Terminal process exited]`
-    /// marker rather than starting blank.
+    /// files so the transcript continues in the same backing store rather than
+    /// starting blank.
     ///
     /// Returns the new terminal id. `None` when the buffer has no exited
     /// terminal (never was one, still live, or already restarted) or the
@@ -1369,12 +1682,13 @@ impl Window {
         // has no dead terminal left to describe.
         let exited = self.exited_terminals.remove(&buffer_id)?;
 
-        // Same gate as workspace restore: `terminal.resume_agents` off means
-        // re-run the launch command instead of rejoining the conversation.
-        let resume_argv = exited
-            .resume
-            .clone()
-            .filter(|argv| !argv.is_empty() && self.resources.config.terminal.resume_agents);
+        // Same gate as workspace restore: the preference controls generic
+        // agents, while an OMP companion always resumes its exact session.
+        let resume_argv = exited.resume.clone().filter(|argv| {
+            !argv.is_empty()
+                && (exited.companion == Some(fresh_core::api::TerminalCompanion::Omp)
+                    || self.resources.config.terminal.resume_agents)
+        });
         let launch_argv = exited.command.clone().filter(|argv| !argv.is_empty());
 
         let spec = RespawnSpec {
@@ -1388,6 +1702,7 @@ impl Window {
             launch_argv,
             ephemeral: exited.ephemeral,
             script_access: exited.script_access,
+            companion: exited.companion,
         };
         let Some(new_id) = self.respawn_terminal_pty(buffer_id, spec) else {
             // Put the record back so the user can retry the restart.
@@ -1441,6 +1756,9 @@ struct RespawnSpec {
     /// [`Window::remint_terminal_script_env`]) rather than inheriting the dead
     /// one's, which it could not see anyway.
     script_access: bool,
+    /// Descriptive companion marker to reactivate when the replacement PTY is
+    /// eligible for the native protocol.
+    companion: Option<fresh_core::api::TerminalCompanion>,
 }
 
 impl Editor {
@@ -1525,7 +1843,10 @@ impl Editor {
             self.finish_self_update(None);
             return;
         };
-        self.begin_self_update(terminal_id, window, buffer_id);
+        self.begin_self_update(
+            fresh_core::WindowTerminalId::new(window, terminal_id),
+            buffer_id,
+        );
 
         // Editor-wide: refresh the plugin-state snapshot and fire
         // `buffer_activated`, matching `open_terminal`.
@@ -1702,6 +2023,11 @@ impl Editor {
         let buffer_id = self.active_buffer();
 
         if let Some(terminal_id) = self.active_window().get_terminal_id(buffer_id) {
+            let terminal = fresh_core::WindowTerminalId::new(self.active_window, terminal_id);
+            self.purge_omp_companion_terminal(terminal);
+            self.active_window_mut()
+                .terminal_companions
+                .remove(&terminal_id);
             // Close the terminal
             self.active_window_mut().terminal_manager.close(terminal_id);
             self.active_window_mut().terminal_buffers.remove(&buffer_id);
@@ -2534,6 +2860,103 @@ impl Window {
         }
     }
 
+    /// Convert one exited PTY into its final read-only backing buffer without
+    /// consulting editor focus. The caller owns cross-window status reporting
+    /// and closes the terminal handle after this snapshots restart metadata.
+    pub(crate) fn finalize_terminal_exit_buffer(
+        &mut self,
+        terminal_id: TerminalId,
+        exit_code: Option<i32>,
+        preserve_for_reconnect: bool,
+    ) -> Option<BufferId> {
+        let buffer_id = self.terminal_buffers.iter().find_map(|(buffer, binding)| {
+            (binding.terminal_id == terminal_id).then_some(*buffer)
+        })?;
+
+        if !preserve_for_reconnect {
+            let dead_splits: Vec<LeafId> = self
+                .buffers
+                .splits()
+                .map(|(_, view_states)| {
+                    view_states
+                        .iter()
+                        .filter_map(|(leaf, state)| {
+                            (state.active_buffer == buffer_id).then_some(*leaf)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for leaf in dead_splits {
+                self.set_split_terminal_scrollback(leaf, buffer_id, true);
+            }
+        }
+
+        if self.active_buffer() == buffer_id
+            && self.key_context == crate::input::keybindings::KeyContext::Terminal
+        {
+            self.key_context = crate::input::keybindings::KeyContext::Normal;
+        }
+
+        // Preserve the final screen exactly. Exit is reported on the tab and
+        // status bar instead of appending a line that would displace output.
+        self.sync_terminal_to_buffer(buffer_id);
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            state.editing_disabled = true;
+            state.margins.configure_for_line_numbers(false);
+            state.buffer.set_modified(false);
+        }
+
+        if !preserve_for_reconnect {
+            let (cols, rows, cwd) = match self.terminal_manager.get(terminal_id) {
+                Some(handle) => {
+                    let (cols, rows) = handle.size();
+                    (cols, rows, handle.cwd())
+                }
+                None => {
+                    let (cols, rows) = self.get_terminal_dimensions();
+                    (cols, rows, None)
+                }
+            };
+            let mut record = ExitedTerminal {
+                terminal_id,
+                exit_code,
+                cols,
+                rows,
+                cwd,
+                backing_path: self.terminal_backing_files.get(&terminal_id).cloned(),
+                log_path: self.terminal_log_files.get(&terminal_id).cloned(),
+                command: self
+                    .terminal_commands
+                    .get(&terminal_id)
+                    .filter(|argv| !argv.is_empty())
+                    .cloned(),
+                resume: self
+                    .terminal_resume_commands
+                    .get(&terminal_id)
+                    .filter(|argv| !argv.is_empty())
+                    .cloned(),
+                ephemeral: self.ephemeral_terminals.contains(&terminal_id),
+                script_access: self.terminal_has_script_access(terminal_id),
+                companion: self.terminal_companions.get(&terminal_id).copied(),
+                title: None,
+            };
+
+            self.terminal_buffers.remove(&buffer_id);
+            record.title = self
+                .terminal_explicit_titles
+                .contains(&buffer_id)
+                .then(|| self.buffer_metadata.get(&buffer_id))
+                .flatten()
+                .map(|meta| meta.display_name.clone());
+            if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+                meta.display_name = t!("terminal.tab_exited", name = meta.display_name).to_string();
+            }
+            self.exited_terminals.insert(buffer_id, record);
+        }
+
+        Some(buffer_id)
+    }
+
     /// Render terminal content for terminal buffers in this window's
     /// split areas. Overlays the live PTY grid (colors, attributes,
     /// optional cursor) on top of the buffer's regular text content
@@ -2711,6 +3134,331 @@ impl Editor {
     // the picker preview path reaches it via the previewed window
     // directly, so the live PTY grid renders into the preview embed
     // without going through the active-window state.
+}
+
+#[cfg(test)]
+mod omp_companion_activation_tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn executable_rules_are_platform_deterministic() {
+        assert!(direct_omp_argv(&argv(&["/usr/local/bin/omp"]), false));
+        assert!(direct_omp_argv(&argv(&["/opt/omp.exe"]), false));
+        assert!(!direct_omp_argv(&argv(&["/opt/OMP"]), false));
+        assert!(!direct_omp_argv(&argv(&["sh", "-lc", "omp"]), false));
+        assert!(!direct_omp_argv(&argv(&["omp", "--no-session"]), false));
+
+        assert!(direct_omp_argv(&argv(&[r"C:\\Tools\\OMP.EXE"]), true));
+        assert!(direct_omp_argv(&argv(&["OMP"]), true));
+        assert!(!direct_omp_argv(&argv(&["omp.cmd"]), true));
+    }
+
+    #[test]
+    fn reserved_keys_follow_platform_case_rules() {
+        assert!(is_reserved_omp_companion_key(OMP_COMPANION_ENV, false));
+        assert!(!is_reserved_omp_companion_key("fresh_omp_companion", false));
+        assert!(is_reserved_omp_companion_key("fresh_omp_companion", true));
+        assert!(is_reserved_omp_companion_key(
+            "Fresh_Omp_Companion_Token",
+            true,
+        ));
+    }
+
+    #[test]
+    fn effective_multiplexer_environment_uses_final_precedence() {
+        let inherited = vec![("TMUX".to_string(), "inherited".to_string())];
+        let mut delta = crate::services::env_provider::EnvDelta {
+            set: Vec::new(),
+            unset: vec!["TMUX".to_string()],
+        };
+        let mut plugin = HashMap::new();
+        assert!(!effective_env_non_empty(
+            "TMUX", &inherited, &delta, &plugin, false,
+        ));
+        plugin.insert("TMUX".to_string(), String::new());
+        assert!(!effective_env_non_empty(
+            "TMUX", &inherited, &delta, &plugin, false,
+        ));
+
+        plugin.insert("TMUX".to_string(), "plugin".to_string());
+        assert!(effective_env_non_empty(
+            "TMUX", &inherited, &delta, &plugin, false,
+        ));
+
+        delta.unset.clear();
+        delta.set.push(("sty".to_string(), "nested".to_string()));
+        assert!(effective_env_non_empty(
+            "STY",
+            &[],
+            &delta,
+            &HashMap::new(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn reserved_inherited_and_delta_values_are_removed_before_injection() {
+        let inherited = vec![(OMP_COMPANION_ENV.to_string(), "stale".to_string())];
+        let mut delta = crate::services::env_provider::EnvDelta {
+            set: vec![(OMP_COMPANION_TOKEN_ENV.to_string(), "stale".to_string())],
+            unset: Vec::new(),
+        };
+        remove_reserved_omp_companion_env(&inherited, &mut delta, false);
+        assert!(delta.set.is_empty());
+        assert!(delta.unset.iter().any(|key| key == OMP_COMPANION_ENV));
+        assert!(delta.unset.iter().any(|key| key == OMP_COMPANION_TOKEN_ENV));
+
+        let inherited = vec![("fresh_omp_companion".to_string(), "stale".to_string())];
+        let mut delta = crate::services::env_provider::EnvDelta {
+            set: vec![("Fresh_Omp_Companion_Token".to_string(), "stale".to_string())],
+            unset: Vec::new(),
+        };
+        remove_reserved_omp_companion_env(&inherited, &mut delta, true);
+        assert!(delta.set.is_empty());
+        assert!(delta.unset.iter().any(|key| key == "fresh_omp_companion"));
+        assert!(delta
+            .unset
+            .iter()
+            .any(|key| key == "Fresh_Omp_Companion_Token"));
+    }
+
+    #[test]
+    fn generated_capability_tokens_are_canonical_and_fresh() {
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        getrandom::fill(&mut first).expect("secure random capability");
+        getrandom::fill(&mut second).expect("secure random capability");
+        assert_ne!(first, second);
+
+        for secret in [first, second] {
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&secret);
+            assert_eq!(token.len(), 43);
+            assert!(token
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' }));
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&token)
+                .expect("canonical base64url");
+            assert_eq!(decoded, secret);
+            assert_eq!(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded),
+                token
+            );
+        }
+    }
+
+    fn serialized_terminal(
+        companion: Option<fresh_core::api::TerminalCompanion>,
+    ) -> crate::workspace::SerializedTerminalWorkspace {
+        crate::workspace::SerializedTerminalWorkspace {
+            terminal_index: 0,
+            cwd: None,
+            shell: "sh".to_string(),
+            cols: 80,
+            rows: 24,
+            log_path: "terminal.log".into(),
+            backing_path: "terminal.txt".into(),
+            command: Some(argv(&["omp"])),
+            agent_resume: Some(crate::workspace::AgentResume {
+                argv: argv(&["omp", "--resume", "exact-session"]),
+            }),
+            exited: None,
+            title: None,
+            script_access: false,
+            companion,
+        }
+    }
+
+    fn serialized_round_trip_after_preparation(
+        saved: crate::workspace::SerializedTerminalWorkspace,
+        preparation: &OmpCompanionPreparation,
+    ) -> crate::workspace::SerializedTerminalWorkspace {
+        let serialized = serde_json::to_vec(&saved).expect("workspace terminal serializes");
+        let mut restored: crate::workspace::SerializedTerminalWorkspace =
+            serde_json::from_slice(&serialized).expect("workspace terminal restores");
+        restored.companion = preparation
+            .preserves_marker()
+            .then_some(restored.companion)
+            .flatten();
+        let serialized = serde_json::to_vec(&restored).expect("resaved workspace serializes");
+        serde_json::from_slice(&serialized).expect("resaved workspace restores")
+    }
+
+    fn serialized_terminal_after_initial_spawn(
+        preparation: &OmpCompanionPreparation,
+        preexisting_marker: bool,
+    ) -> crate::workspace::SerializedTerminalWorkspace {
+        let terminal_id = TerminalId(73);
+        let mut terminal_companions = HashMap::new();
+        if preexisting_marker {
+            terminal_companions.insert(terminal_id, fresh_core::api::TerminalCompanion::Omp);
+        }
+        persist_initial_companion_marker(
+            &mut terminal_companions,
+            terminal_id,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            preparation.preserves_marker(),
+        );
+
+        let saved = serialized_terminal(terminal_companions.get(&terminal_id).copied());
+        let serialized = serde_json::to_vec(&saved).expect("workspace terminal serializes");
+        serde_json::from_slice(&serialized).expect("workspace terminal restores")
+    }
+
+    #[test]
+    fn initial_companion_spawn_fault_injection_commits_marker_disposition_to_workspace() {
+        let mut active_env = HashMap::new();
+        let active = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            &mut active_env,
+            |secret| {
+                *secret = [7; 32];
+                Ok::<(), ()>(())
+            },
+        ));
+        assert_eq!(
+            serialized_terminal_after_initial_spawn(&active, false).companion,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            "an active initial companion persists its workspace marker",
+        );
+
+        let unsupported = OmpCompanionPreparation::Unsupported;
+        assert_eq!(
+            serialized_terminal_after_initial_spawn(&unsupported, false).companion,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            "an unsupported initial companion retains its descriptive marker without a live handle",
+        );
+
+        // Fault-inject a failed entropy source: the PTY remains ordinary and
+        // its stale marker is cleared before the next workspace capture.
+        let mut entropy_env = HashMap::new();
+        let entropy_unavailable = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            &mut entropy_env,
+            |_| Err::<(), ()>(()),
+        ));
+        assert_eq!(
+            serialized_terminal_after_initial_spawn(&entropy_unavailable, true).companion,
+            None,
+            "an entropy-unavailable initial companion must serialize as an ordinary terminal",
+        );
+        assert!(entropy_env.is_empty());
+    }
+
+    #[test]
+    fn unsupported_restore_and_reconnect_preserve_marker_and_exact_resume_across_saves() {
+        let initial = serialized_terminal(Some(fresh_core::api::TerminalCompanion::Omp));
+        let after_restore =
+            serialized_round_trip_after_preparation(initial, &OmpCompanionPreparation::Unsupported);
+        let after_reconnect = serialized_round_trip_after_preparation(
+            after_restore,
+            &OmpCompanionPreparation::Unsupported,
+        );
+        assert_eq!(
+            after_reconnect.companion,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            "a temporary multiplexer or wrapper fallback must retain the descriptive marker",
+        );
+        assert_eq!(
+            after_reconnect
+                .agent_resume
+                .as_ref()
+                .expect("resume persists")
+                .argv,
+            argv(&["omp", "--resume", "exact-session"]),
+            "the retained marker keeps exact OMP resume ahead of the generic resume preference",
+        );
+
+        let direct_omp = argv(&["omp", "--resume", "exact-session"]);
+        assert!(
+            !omp_companion_supported(true, true, Some(&direct_omp), false),
+            "TMUX/STY fallback must be explicitly Unsupported, not entropy failure"
+        );
+        assert!(
+            !omp_companion_supported(false, false, Some(&direct_omp), false),
+            "wrapper/remote fallback must be explicitly Unsupported"
+        );
+
+        let mut extra_env = HashMap::new();
+        let active = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            &mut extra_env,
+            |secret| {
+                *secret = [7; 32];
+                Ok::<(), ()>(())
+            },
+        ));
+        let after_supported = serialized_round_trip_after_preparation(after_reconnect, &active);
+        assert_eq!(
+            after_supported.companion,
+            Some(fresh_core::api::TerminalCompanion::Omp)
+        );
+        assert!(active.into_spawn().is_some());
+        assert!(
+            extra_env.contains_key(OMP_COMPANION_TOKEN_ENV),
+            "the next supported restore reactivates the capability"
+        );
+    }
+
+    fn assert_entropy_failure_falls_back_to_ordinary_terminal() {
+        let mut extra_env = HashMap::new();
+        let preparation = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            &mut extra_env,
+            |_| Err::<(), ()>(()),
+        ));
+
+        assert!(!preparation.preserves_marker());
+        assert!(preparation.into_spawn().is_none());
+        assert!(extra_env.is_empty());
+    }
+
+    #[test]
+    fn create_companion_entropy_failure_falls_back_to_an_ordinary_terminal() {
+        assert_entropy_failure_falls_back_to_ordinary_terminal();
+    }
+
+    #[test]
+    fn restore_companion_entropy_failure_falls_back_to_an_ordinary_terminal() {
+        assert_entropy_failure_falls_back_to_ordinary_terminal();
+    }
+
+    #[test]
+    fn reconnect_companion_entropy_failure_falls_back_to_an_ordinary_terminal() {
+        assert_entropy_failure_falls_back_to_ordinary_terminal();
+    }
+
+    #[test]
+    fn entropy_failure_removes_marker_from_the_next_serialized_workspace() {
+        let mut extra_env = HashMap::new();
+        let entropy_unavailable = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            &mut extra_env,
+            |_| Err::<(), ()>(()),
+        ));
+        let after_restore = serialized_round_trip_after_preparation(
+            serialized_terminal(Some(fresh_core::api::TerminalCompanion::Omp)),
+            &entropy_unavailable,
+        );
+
+        assert!(after_restore.companion.is_none());
+        assert!(extra_env.is_empty());
+    }
+
+    #[test]
+    fn reserved_companion_environment_is_a_hard_error() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert(OMP_COMPANION_TOKEN_ENV.to_string(), "untrusted".to_string());
+
+        assert_eq!(
+            reject_reserved_omp_companion_env(&extra_env, false),
+            Err("reserved OMP companion environment key".to_string())
+        );
+    }
 }
 
 /// Terminal rendering utilities

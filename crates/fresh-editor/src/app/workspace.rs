@@ -883,7 +883,11 @@ impl crate::app::window::Window {
             .agent_resume
             .as_ref()
             .map(|r| &r.argv)
-            .filter(|argv| !argv.is_empty() && self.resources.config.terminal.resume_agents);
+            .filter(|argv| {
+                !argv.is_empty()
+                    && (terminal.companion == Some(fresh_core::api::TerminalCompanion::Omp)
+                        || self.resources.config.terminal.resume_agents)
+            });
         let spawn_argv =
             resume_argv.or_else(|| terminal.command.as_ref().filter(|argv| !argv.is_empty()));
         // Run the resume/launch argv through the workspace's backend (local →
@@ -897,16 +901,36 @@ impl crate::app::window::Window {
             None => self.resolved_terminal_wrapper(),
         };
         let wrapper_for_spawn = self.apply_remote_terminal_env(wrapper_for_spawn);
-        let env_delta = self.terminal_env_delta(&wrapper_for_spawn);
+        let mut env_delta = self.terminal_env_delta(&wrapper_for_spawn);
         // A terminal saved with the script grant comes back holding it: mint a
         // token bound to *this* (restored) window and stamp it into the child's
         // environment. The saved workspace records only that the grant existed
         // — the token itself belonged to the editor run that is gone.
-        let extra_env = if terminal.script_access {
+        let mut extra_env = if terminal.script_access {
             self.remint_terminal_script_env(predicted_id)
         } else {
             std::collections::HashMap::new()
         };
+        let companion_preparation = match terminal.companion {
+            Some(kind) => match self.prepare_omp_companion_spawn(
+                kind,
+                spawn_argv.map(Vec::as_slice),
+                &mut env_delta,
+                &mut extra_env,
+            ) {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    tracing::warn!("Failed to prepare restored OMP companion: {error}");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let preserves_companion_marker = companion_preparation
+            .as_ref()
+            .is_some_and(crate::app::terminal::OmpCompanionPreparation::preserves_marker);
+        let companion_spawn = companion_preparation
+            .and_then(crate::app::terminal::OmpCompanionPreparation::into_spawn);
         let terminal_id = match self.terminal_manager.spawn(
             terminal.cols,
             terminal.rows,
@@ -919,6 +943,7 @@ impl crate::app::window::Window {
             wrapper_for_spawn,
             env_delta,
             extra_env,
+            companion_spawn,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -952,6 +977,14 @@ impl crate::app::window::Window {
             if !resume.argv.is_empty() {
                 self.terminal_resume_commands
                     .insert(terminal_id, resume.argv.clone());
+            }
+        }
+        // A marker is durable through a temporary unsupported launch, so the
+        // saved workspace gets another chance to activate on a direct local
+        // spawn. Entropy failure is intentionally not retried or persisted.
+        if preserves_companion_marker {
+            if let Some(kind) = terminal.companion {
+                self.terminal_companions.insert(terminal_id, kind);
             }
         }
 
@@ -1029,6 +1062,7 @@ impl crate::app::window::Window {
                 // Nothing is spawned here, so no token is minted — the grant
                 // is carried so the restart (which does spawn) mints one.
                 script_access: terminal.script_access,
+                companion: terminal.companion,
                 title: terminal.title.clone(),
             },
         );
@@ -2584,6 +2618,7 @@ impl crate::app::window::Window {
                     exited: None,
                     title,
                     script_access: self.terminal_has_script_access(terminal_id),
+                    companion: self.terminal_companions.get(&terminal_id).copied(),
                 });
             }
         }
@@ -2633,6 +2668,7 @@ impl crate::app::window::Window {
                 // showing now — restore re-applies the marker itself.
                 title: exited.title.clone(),
                 script_access: exited.script_access,
+                companion: exited.companion,
             });
         }
 

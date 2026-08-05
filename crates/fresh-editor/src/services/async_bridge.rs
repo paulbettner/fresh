@@ -343,6 +343,13 @@ pub enum AsyncMessage {
         terminal: fresh_core::WindowTerminalId,
     },
 
+    /// A reader-side OMP companion candidate replaced the terminal's single
+    /// latest slot. The editor resolves and authenticates it against this exact
+    /// window-scoped live handle; no frame bytes travel through the channel.
+    OmpCompanionSnapshotReady {
+        terminal: fresh_core::WindowTerminalId,
+    },
+
     /// Result of an asynchronous system-clipboard read. The main loop
     /// blocks input dispatch while a paste is in flight; the matching
     /// `request_id` ensures a late result that arrived after the
@@ -668,6 +675,25 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn omp_companion_snapshot_ready_preserves_full_terminal_identity() {
+        let bridge = AsyncBridge::new();
+        let terminal =
+            fresh_core::WindowTerminalId::new(fresh_core::WindowId(8), fresh_core::TerminalId(3));
+        bridge
+            .sender()
+            .send(AsyncMessage::OmpCompanionSnapshotReady { terminal })
+            .unwrap();
+
+        let messages = bridge.try_recv_all();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            AsyncMessage::OmpCompanionSnapshotReady { terminal: received }
+                if *received == terminal
+        ));
     }
 
     #[test]

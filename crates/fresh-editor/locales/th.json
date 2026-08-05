@@ -1554,6 +1554,7 @@
   "whitespace.already_has_newline": "ไฟล์ลงท้ายด้วยบรรทัดใหม่อยู่แล้ว",
   "workspace.extract_no_file_path": "ไม่สามารถแยกได้: บัฟเฟอร์ไม่มีพาธไฟล์",
   "workspace.extract_terminal_dormant": "ไม่สามารถแยกได้: เทอร์มินัลไม่มีเซสชันที่ใช้งานอยู่",
+  "workspace.extract_terminal_companion": "ไม่สามารถแยกได้: เทอร์มินัลคู่หู OMP ต้องอยู่ในเวิร์กสเปซเดิม",
   "workspace.extract_already_rooted": "อยู่ในเวิร์กสเปซที่มีราก %{root} อยู่แล้ว",
   "workspace.extracted_tab": "แยก %{name} ไปยังเวิร์กสเปซ %{label} แล้ว",
   "whitespace.newline_added": "เพิ่มบรรทัดใหม่ท้ายไฟล์แล้ว",

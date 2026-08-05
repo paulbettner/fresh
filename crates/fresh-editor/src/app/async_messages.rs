@@ -1547,7 +1547,7 @@ impl Editor {
     /// Process TypeScript plugin commands
     ///
     /// Returns true if any visual commands were processed (i.e. a re-render is needed).
-    /// No-op sentinels like `HookCompleted` do not count.
+    /// Non-visual acknowledgements like `HookCompleted` do not count.
     #[cfg(feature = "plugins")]
     pub(super) fn process_plugin_commands(&mut self) -> bool {
         // Backlog first so a burst spread over several frames keeps arrival
@@ -1559,7 +1559,8 @@ impl Editor {
         }
 
         // Classify each command as visual (needs re-render) or not.
-        // `HookCompleted` is a pure ack. `SetStatusBarValue` is treated as
+        // `HookCompleted` advances hook delivery but is non-visual.
+        // `SetStatusBarValue` is treated as
         // visual only when the value actually differs from what's stored —
         // many plugins (e.g. git_statusbar) re-publish the same value on
         // every `render_start` hook, which would otherwise create a

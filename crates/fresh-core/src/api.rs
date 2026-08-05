@@ -3080,10 +3080,29 @@ pub enum PluginCommand {
         /// Extra env for the spawned terminal; see
         /// `CreateWindowWithTerminalOptions::env`.
         env: Option<std::collections::HashMap<String, String>>,
+        /// Descriptive companion marker requested for the seeded terminal.
+        companion: Option<TerminalCompanion>,
         /// When set, the host mints a capability token bound to the new
         /// window and injects it as `FRESH_CMD_TOKEN`; see
         /// `CreateWindowWithTerminalOptions::allow_script`.
         allow_script: bool,
+        request_id: u64,
+    },
+    /// Send one authenticated command to the exact live OMP companion PTY.
+    /// The request promise resolves to whether the writer channel accepted it.
+    SendOmpCompanionCommand {
+        window_id: WindowId,
+        terminal_id: TerminalId,
+        command_type: OmpCompanionCommandType,
+        request_id: u64,
+    },
+
+    /// Replace a terminal's exact restore argv and checkpoint its owning
+    /// workspace before resolving the request promise.
+    SetTerminalResume {
+        window_id: WindowId,
+        terminal_id: TerminalId,
+        argv: Vec<String>,
         request_id: u64,
     },
 
@@ -5984,6 +6003,23 @@ pub struct CreateTerminalOptions {
     pub allow_script: Option<bool>,
 }
 
+/// Descriptive marker for a terminal with a native host companion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum TerminalCompanion {
+    Omp,
+}
+
+/// Closed version-1 Fresh-to-OMP companion command set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum OmpCompanionCommandType {
+    Cancel,
+    RequestSnapshot,
+}
+
 /// Options for `createWindowWithTerminal` — the atomic
 /// "spawn a new editor session that hosts an agent terminal"
 /// entry point used by Orchestrator. Bundles window creation,
@@ -6039,6 +6075,11 @@ pub struct CreateWindowWithTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Opt in to the native OMP TUI companion for a supported local,
+    /// direct `omp` launch. Unsupported launches remain ordinary terminals.
+    #[serde(default)]
+    #[ts(optional)]
+    pub companion: Option<TerminalCompanion>,
     /// When set, the host mints an unforgeable capability token bound
     /// to the NEW window and injects it into the spawned terminal as
     /// `FRESH_CMD_TOKEN`. A client presenting that token over the
@@ -6172,6 +6213,7 @@ mod fromjs_impls {
         ProcessLimitsPackConfig,
         CreateTerminalOptions,
         CreateWindowWithTerminalOptions,
+        OmpCompanionCommandType,
     );
 
     impl<'js> rquickjs::IntoJs<'js> for TextPropertiesAtCursor {
@@ -8093,10 +8135,10 @@ mod tests {
 
 #[cfg(test)]
 mod create_window_with_terminal_options_tests {
-    use super::CreateWindowWithTerminalOptions;
+    use super::{CreateWindowWithTerminalOptions, TerminalCompanion};
 
-    /// Old callers that supply neither `env` nor `allowScript` must still
-    /// deserialize, with both fields defaulting to off.
+    /// Old callers that supply none of the additive fields must still
+    /// deserialize with their defaults.
     #[test]
     fn deserializes_without_new_fields() {
         let opts: CreateWindowWithTerminalOptions =
@@ -8104,15 +8146,17 @@ mod create_window_with_terminal_options_tests {
         assert_eq!(opts.root, "/tmp/x");
         assert!(opts.env.is_none());
         assert!(opts.allow_script.is_none());
+        assert!(opts.companion.is_none());
     }
 
-    /// The two fields round-trip through serde using their camelCase JSON
-    /// names (`env`, `allowScript`).
+    /// Additive fields round-trip through serde using their camelCase JSON
+    /// names and the frozen lowercase companion discriminator.
     #[test]
     fn new_fields_round_trip() {
         let json = r#"{
             "root": "/tmp/proj",
             "env": {"FOO": "bar"},
+            "companion": "omp",
             "allowScript": true
         }"#;
         let opts: CreateWindowWithTerminalOptions =
@@ -8124,6 +8168,7 @@ mod create_window_with_terminal_options_tests {
                 .map(String::as_str),
             Some("bar")
         );
+        assert_eq!(opts.companion, Some(TerminalCompanion::Omp));
         assert_eq!(opts.allow_script, Some(true));
 
         let reencoded = serde_json::to_string(&opts).expect("re-serialize");
@@ -8131,5 +8176,14 @@ mod create_window_with_terminal_options_tests {
             serde_json::from_str(&reencoded).expect("re-decode");
         assert_eq!(back.allow_script, opts.allow_script);
         assert_eq!(back.env, opts.env);
+        assert_eq!(back.companion, opts.companion);
+    }
+
+    #[test]
+    fn unknown_companion_discriminator_is_rejected() {
+        let result = serde_json::from_str::<CreateWindowWithTerminalOptions>(
+            r#"{"root":"/tmp/x","companion":"other"}"#,
+        );
+        assert!(result.is_err());
     }
 }
