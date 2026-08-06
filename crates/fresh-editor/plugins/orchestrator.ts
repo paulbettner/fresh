@@ -1591,6 +1591,10 @@ function sessionNodeEntry(id: number, activeId: number): TextPropertyEntry {
       style: { fg: pendingMsgFg(s.pending), italic: true },
     });
   }
+  const ompStatus = ompCompanion.statusTextEntry(s);
+  if (ompStatus) {
+    segs.push({ text: "  " + ompStatus.text, style: ompStatus.style });
+  }
   return styledRow(segs as Parameters<typeof styledRow>[0]);
 }
 
@@ -1702,8 +1706,8 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
 
 // Card line 2 (the continuation row): what this workspace *is* on the
 // left — its branch when that says something the name doesn't, else the
-// project it belongs to — and its PR badge (or the on-disk tag) flush
-// right.
+// project it belongs to — with live OMP status and its PR badge (or the
+// on-disk tag) flush right.
 function sessionCardExtraLines(id: number): TextPropertyEntry[] {
   const s = orchestratorSessions.get(id);
   if (!s) return [];
@@ -1719,7 +1723,12 @@ function sessionCardExtraLines(id: number): TextPropertyEntry[] {
     ];
   }
   const dim = "ui.menu_disabled_fg";
-  const right = prLineEntries(s);
+  const pr = prLineEntries(s);
+  const status = ompCompanion.statusTextEntry(s);
+  const right: Entry[] = [];
+  if (status) right.push({ text: status.text, style: status.style });
+  if (status && pr.length) right.push({ text: "   " });
+  right.push(...pr);
   // The branch earns the row only when it differs from the workspace
   // name — a worktree's branch is usually named after it, and printing
   // it twice was pure noise. Otherwise the project takes the slot: it's
@@ -2101,7 +2110,6 @@ function ageString(createdAt: number): string {
 // All are single-cell glyphs with theme-key colours. On-disk (discovered) rows
 // have no agent process, so they keep their separate hollow-ring marker.
 // =============================================================================
-
 
 // Width of the left status margin: glyph + trailing space.
 const STATUS_MARGIN_W = 2;
@@ -2604,10 +2612,10 @@ function stateGlyphEntry(s: AgentSession): Entry {
 //   card (default): a rounded `labeledSection` pill —
 //     line 1: <state> NAME (bold)              ▣ project
 //     line 2: ▸ branch        <git: ↑ahead ↓behind +add −del / clean>
-//     line 3: PR #1287 ✓7/8 ●2 approved        (blank spacer when no PR)
+//     line 3: live OMP status (left) + PR badge (right), otherwise PR/blank
 //
 //   compact: a single un-boxed line —
-//     <state> NAME                    <git summary>
+//     <state> NAME                    <OMP status or git summary>
 //
 // The bulk-select checkbox only appears in the modal picker (the dock
 // delegates bulk actions to it via the "manage" button), so dock rows
@@ -2656,12 +2664,16 @@ function renderPillSpec(
     });
   }
   const git = gitLineParts(s);
+  const ompStatus = ompCompanion.statusTextEntry(s);
 
   // Compact: one un-boxed line — glyph + (facet) + name on the left, the
-  // compact git summary right-aligned. Branch, project tag, and PR badge are
-  // dropped (that's the "compact" trade).
+  // live OMP status (or ordinary git summary) right-aligned. Branch, project
+  // tag, and PR badge are dropped (that's the "compact" trade).
   if (dockMode && dockView === "compact") {
-    return flexLine([stateGlyphEntry(s), ...remoteGlyph, nameEntry], git.right);
+    return flexLine(
+      [stateGlyphEntry(s), ...remoteGlyph, nameEntry],
+      ompStatus ? [ompStatus] : git.right,
+    );
   }
 
   // Card line 1, left: state glyph · [facet] · NAME. In the modal picker keep
@@ -2684,13 +2696,13 @@ function renderPillSpec(
     flexLine(left, projEntries),
     flexLine(git.left, git.right),
   ];
-  // Line 3 is the PR badge when there's an actual PR; when `prLineEntries`
-  // returns `[]` we still emit a blank spacer line so every card is a
-  // uniform three lines tall — a 2-line card next to 3-line ones looks
-  // ragged in the dock.
   const prEntries = prLineEntries(s);
-  const prLine: Entry[] = prEntries.length > 0 ? prEntries : [{ text: " " }];
-  children.push(raw([styledRow(prLine as Parameters<typeof styledRow>[0])]));
+  if (ompStatus) {
+    children.push(flexLine([ompStatus], prEntries));
+  } else {
+    const prLine: Entry[] = prEntries.length > 0 ? prEntries : [{ text: " " }];
+    children.push(raw([styledRow(prLine as Parameters<typeof styledRow>[0])]));
+  }
   return labeledSection({ label: "", child: col(...children) });
 }
 
@@ -2929,7 +2941,6 @@ function modalSessionColWidth(): number {
   const sectionW = Math.floor(panelW * 0.34);
   return Math.max(dockContentCols(DOCK_MIN_WIDTH_COLS), sectionW - 4);
 }
-
 
 // Compose the right-hand preview pane. Normally it shows info
 // + action buttons (Stop, Archive, Delete); when a destructive
@@ -11537,7 +11548,8 @@ editor.on("widget_event", (e) => {
       toggleHideTrivial();
       return;
     }
-    const companionSelectedId = openDialog.filteredIds[openDialog.selectedIndex];
+    const companionSelectedId =
+      openDialog.filteredIds[openDialog.selectedIndex];
     if (
       ompCompanion.handleWidgetEvent(
         e,

@@ -325,6 +325,44 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
             })
     });
 
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("Awaiting approval")
+    });
+
+    let mut working = snapshot();
+    working.sequence = 2;
+    working.state = OmpCompanionState::Working;
+    working.pending_approvals = 0;
+    emit_companion_snapshot(&harness, companion_window, terminal_id, working);
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("working… · build project")
+    });
+
+    let mut retrying = snapshot();
+    retrying.sequence = 3;
+    retrying.state = OmpCompanionState::Retrying;
+    retrying.pending_approvals = 0;
+    emit_companion_snapshot(&harness, companion_window, terminal_id, retrying);
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("Retrying…")
+    });
+
+    let mut compacting = snapshot();
+    compacting.sequence = 4;
+    compacting.state = OmpCompanionState::Compacting;
+    compacting.pending_approvals = 0;
+    emit_companion_snapshot(&harness, companion_window, terminal_id, compacting);
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("Compacting context…")
+    });
+
+    let mut awaiting = snapshot();
+    awaiting.sequence = 5;
+    emit_companion_snapshot(&harness, companion_window, terminal_id, awaiting);
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("Awaiting approval")
+    });
+
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();

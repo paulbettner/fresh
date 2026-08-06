@@ -116,6 +116,50 @@ export class OmpCompanionController<
     };
   }
 
+  /** Build the live OMP activity text shown directly in session rows. */
+  statusTextEntry(session: S): OmpCompanionStatusEntry | undefined {
+    const snapshot = liveOmpCompanion(session, this.host.now())?.snapshot;
+    if (!snapshot) return undefined;
+
+    let text: string;
+    let style: Record<string, unknown>;
+    switch (snapshot.state) {
+      case "working":
+        text = `${this.host.t("preview.state_working")}…`;
+        style = { fg: "diagnostic.warning_fg", italic: true };
+        break;
+      case "awaiting_approval":
+        text = this.host.t("pill.omp_awaiting_approval");
+        style = { fg: "diagnostic.warning_fg", bold: true };
+        break;
+      case "retrying":
+        text = this.host.t("pill.omp_retrying");
+        style = { fg: "diagnostic.warning_fg", italic: true };
+        break;
+      case "compacting":
+        text = this.host.t("pill.omp_compacting");
+        style = { fg: "diagnostic.warning_fg", italic: true };
+        break;
+      case "idle":
+        text = this.host.t("preview.state_idle");
+        style = { fg: "ui.menu_disabled_fg", italic: true };
+        break;
+      case "stopped":
+        text = this.host.t("status.verb_stopped");
+        style = { fg: "ui.menu_disabled_fg", italic: true };
+        break;
+      case "error":
+        text = this.host.t("err.failed");
+        style = { fg: "ui.status_error_indicator_fg", bold: true };
+        break;
+    }
+
+    if (snapshot.state === "working" && snapshot.currentTool?.intent) {
+      text += ` · ${snapshot.currentTool.intent}`;
+    }
+    return { text, style };
+  }
+
   /** Build the allowlisted OMP rows appended to Orchestrator preview details. */
   previewEntries(session: S): TextPropertyEntry[] {
     const facet = session.ompCompanion;
@@ -154,7 +198,9 @@ export class OmpCompanionController<
     if (snapshot.model || snapshot.thinkingLevel) {
       entries.push(styledRow([{
         text: `${this.host.t("preview.omp_model")}: ${
-          snapshot.model ? `${snapshot.model.provider}/${snapshot.model.id}` : "—"
+          snapshot.model
+            ? `${snapshot.model.provider}/${snapshot.model.id}`
+            : "—"
         }${snapshot.thinkingLevel ? ` · ${snapshot.thinkingLevel}` : ""}`,
       }]));
     }
@@ -171,7 +217,9 @@ export class OmpCompanionController<
       text: `${this.host.t("preview.omp_tool")}: ${snapshot.runningTools}${
         snapshot.currentTool
           ? ` · ${snapshot.currentTool.name}${
-            snapshot.currentTool.intent ? ` — ${snapshot.currentTool.intent}` : ""
+            snapshot.currentTool.intent
+              ? ` — ${snapshot.currentTool.intent}`
+              : ""
           }`
           : ""
       }`,
