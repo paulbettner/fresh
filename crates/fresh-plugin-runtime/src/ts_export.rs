@@ -545,6 +545,7 @@ interface OmpCompanionSnapshotV1 {
     | "compacting"
     | "stopped"
     | "error";
+  statusText?: string;
   model?: { provider: string; id: string };
   thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   runningTools: number;

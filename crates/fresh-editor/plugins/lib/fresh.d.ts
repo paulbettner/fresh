@@ -4838,6 +4838,7 @@ interface OmpCompanionSnapshotV1 {
 	sessionName?: string;
 	cwd: string;
 	state: "idle" | "working" | "awaiting_approval" | "retrying" | "compacting" | "stopped" | "error";
+	statusText?: string;
 	model?: {
 		provider: string;
 		id: string;

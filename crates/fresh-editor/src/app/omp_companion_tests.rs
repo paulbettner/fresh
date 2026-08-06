@@ -21,6 +21,7 @@ fn valid_omp_companion_envelope() -> serde_json::Value {
             "sessionName": "Companion session",
             "cwd": "/tmp/project",
             "state": "working",
+            "statusText": "Finding top-level files",
             "model": { "provider": "openai", "id": "gpt-5.6" },
             "thinkingLevel": "high",
             "runningTools": 1,
@@ -185,6 +186,14 @@ fn omp_companion_parser_rejects_strict_schema_domain_and_string_violations() {
     let mut forbidden_scalar = valid_omp_companion_envelope();
     forbidden_scalar["snapshot"]["currentTool"]["intent"] = serde_json::json!("Inspect\nfiles");
     cases.push(forbidden_scalar);
+
+    let mut invalid_status_text = valid_omp_companion_envelope();
+    invalid_status_text["snapshot"]["statusText"] = serde_json::json!("Finding\nfiles");
+    cases.push(invalid_status_text);
+
+    let mut oversized_status_text = valid_omp_companion_envelope();
+    oversized_status_text["snapshot"]["statusText"] = serde_json::json!("😀".repeat(241));
+    cases.push(oversized_status_text);
 
     let mut byte_oversize = valid_omp_companion_envelope();
     byte_oversize["snapshot"]["model"]["provider"] = serde_json::json!("🦀".repeat(65));

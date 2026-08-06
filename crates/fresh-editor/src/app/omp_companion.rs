@@ -101,6 +101,7 @@ fn validate_omp_companion_snapshot(snapshot: &fresh_core::hooks::OmpCompanionSna
         session_name,
         cwd,
         state: _,
+        status_text,
         model,
         thinking_level: _,
         running_tools,
@@ -129,6 +130,12 @@ fn validate_omp_companion_snapshot(snapshot: &fresh_core::hooks::OmpCompanionSna
     if session_name
         .as_deref()
         .is_some_and(|value| !is_normalized_companion_string(value, 160, 640))
+    {
+        return false;
+    }
+    if status_text
+        .as_deref()
+        .is_some_and(|value| !is_normalized_companion_string(value, 240, 960))
     {
         return false;
     }

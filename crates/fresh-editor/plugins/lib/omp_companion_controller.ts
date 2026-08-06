@@ -121,42 +121,39 @@ export class OmpCompanionController<
     const snapshot = liveOmpCompanion(session, this.host.now())?.snapshot;
     if (!snapshot) return undefined;
 
-    let text: string;
+    let text = snapshot.statusText;
     let style: Record<string, unknown>;
     switch (snapshot.state) {
       case "working":
-        text = `${this.host.t("preview.state_working")}…`;
+        text ??= "Working…";
         style = { fg: "diagnostic.warning_fg", italic: true };
         break;
       case "awaiting_approval":
-        text = this.host.t("pill.omp_awaiting_approval");
+        text ??= this.host.t("pill.omp_awaiting_approval");
         style = { fg: "diagnostic.warning_fg", bold: true };
         break;
       case "retrying":
-        text = this.host.t("pill.omp_retrying");
+        text ??= this.host.t("pill.omp_retrying");
         style = { fg: "diagnostic.warning_fg", italic: true };
         break;
       case "compacting":
-        text = this.host.t("pill.omp_compacting");
+        text ??= this.host.t("pill.omp_compacting");
         style = { fg: "diagnostic.warning_fg", italic: true };
         break;
       case "idle":
-        text = this.host.t("preview.state_idle");
+        text ??= this.host.t("preview.state_idle");
         style = { fg: "ui.menu_disabled_fg", italic: true };
         break;
       case "stopped":
-        text = this.host.t("status.verb_stopped");
+        text ??= this.host.t("status.verb_stopped");
         style = { fg: "ui.menu_disabled_fg", italic: true };
         break;
       case "error":
-        text = this.host.t("err.failed");
+        text ??= this.host.t("err.failed");
         style = { fg: "ui.status_error_indicator_fg", bold: true };
         break;
     }
 
-    if (snapshot.state === "working" && snapshot.currentTool?.intent) {
-      text += ` · ${snapshot.currentTool.intent}`;
-    }
     return { text, style };
   }
 

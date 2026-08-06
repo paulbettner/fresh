@@ -147,6 +147,7 @@ fn companion_snapshot(
         session_name: Some(session_name.into()),
         cwd: "/workspace".into(),
         state,
+        status_text: None,
         model: None,
         thinking_level: None,
         running_tools: 0,

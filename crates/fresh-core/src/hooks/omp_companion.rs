@@ -28,6 +28,12 @@ pub struct OmpCompanionSnapshotV1 {
         deserialize_with = "deserialize_optional_non_null",
         skip_serializing_if = "Option::is_none"
     )]
+    pub status_text: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<OmpCompanionModel>,
     #[serde(
         default,
@@ -193,6 +199,7 @@ mod tests {
             "sessionId": "123e4567-e89b-12d3-a456-426614174000",
             "cwd": "/tmp/project",
             "state": "working",
+            "statusText": "Finding top-level files",
             "runningTools": 1,
             "pendingApprovals": 0
         }))
@@ -248,6 +255,7 @@ mod tests {
                 "sessionGeneration",
                 "sessionId",
                 "state",
+                "statusText",
                 "timestampMs",
                 "version",
             ]
@@ -260,8 +268,10 @@ mod tests {
 
     #[test]
     fn omp_companion_optional_fields_reject_explicit_null() {
-        let mut snapshot = serde_json::to_value(sample_omp_companion_snapshot()).unwrap();
-        snapshot["sessionName"] = serde_json::Value::Null;
-        assert!(serde_json::from_value::<OmpCompanionSnapshotV1>(snapshot).is_err());
+        for field in ["sessionName", "statusText"] {
+            let mut snapshot = serde_json::to_value(sample_omp_companion_snapshot()).unwrap();
+            snapshot[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<OmpCompanionSnapshotV1>(snapshot).is_err());
+        }
     }
 }

@@ -135,6 +135,7 @@ fn snapshot() -> OmpCompanionSnapshotV1 {
         session_name: Some("companion-session".into()),
         cwd: "/workspace".into(),
         state: OmpCompanionState::AwaitingApproval,
+        status_text: None,
         model: Some(OmpCompanionModel {
             provider: "openai".into(),
             id: "gpt-5".into(),
@@ -333,27 +334,34 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
     working.sequence = 2;
     working.state = OmpCompanionState::Working;
     working.pending_approvals = 0;
+    working.status_text = Some("Finding top-level files".into());
     emit_companion_snapshot(&harness, companion_window, terminal_id, working);
     pump_until(&mut harness, 40, |h| {
-        h.screen_to_string().contains("working… · build project")
+        h.screen_to_string().contains("Finding top-level files")
     });
+    assert!(!harness
+        .screen_to_string()
+        .contains("working… · build project"));
 
     let mut retrying = snapshot();
     retrying.sequence = 3;
     retrying.state = OmpCompanionState::Retrying;
     retrying.pending_approvals = 0;
+    retrying.status_text = Some("Retrying (1/3) in 2s…".into());
     emit_companion_snapshot(&harness, companion_window, terminal_id, retrying);
     pump_until(&mut harness, 40, |h| {
-        h.screen_to_string().contains("Retrying…")
+        h.screen_to_string().contains("Retrying (1/3) in 2s…")
     });
 
     let mut compacting = snapshot();
     compacting.sequence = 4;
     compacting.state = OmpCompanionState::Compacting;
     compacting.pending_approvals = 0;
+    compacting.status_text = Some("Auto context-full maintenance…".into());
     emit_companion_snapshot(&harness, companion_window, terminal_id, compacting);
     pump_until(&mut harness, 40, |h| {
-        h.screen_to_string().contains("Compacting context…")
+        h.screen_to_string()
+            .contains("Auto context-full maintenance…")
     });
 
     let mut awaiting = snapshot();
