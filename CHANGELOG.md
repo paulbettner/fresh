@@ -150,7 +150,7 @@ Keyboard and mouse input is now parsed by our own `fresh-input-parser` crate ins
 * **Orchestrator & dock**
   * Codex "Auto mode" works again (it was passing a flag recent Codex CLI rejects).
   * Dock rows are fully clickable in compact (list) view, ordered by recency, and auto-name themselves from their terminal.
-  * OMP companion rows now mirror the exact live OMP footer status (for example `Working…` or `Finding top-level files`) instead of synthesizing lowercase working text from tool metadata.
+  * OMP companion rows now mirror the exact live OMP footer status (for example `Working…` or `Finding top-level files`) instead of synthesizing lowercase working text from tool metadata. Dock cards use two content rows, indent status under the project name, capitalize `Idle`, and leave branch/git details in the picker.
   * Fixed a crash when navigating to an unreachable remote workspace.
 * **Terminal**
   * Scrollback no longer loses output or gets stuck mid-scroll (#2649, reported by @dmknght).

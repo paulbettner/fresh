@@ -912,7 +912,7 @@ let lastShowWorktrees: boolean | null = null;
 // checkbox (Alt+I) opts back into hiding the throwaway single-file /
 // restored-shell rows.
 let lastHideTrivial: boolean | null = null;
-// Dock card density. "card" (default) shows the three-line rounded pill;
+// Dock card density. "card" (default) shows the two-line rounded pill;
 // "compact" shows one line per session. Read all over the render path,
 // so it stays a plain value rather than a config lookup; the dock
 // re-seeds it from the `defaultView` setting on open unless the user has
@@ -4739,10 +4739,9 @@ function buildDockSpec(): WidgetSpec {
       selectedIndex: selIdx,
       visibleRows: listRows,
       expandedKeys: expandedSeed,
-      // "card" density renders each session as a 3-content-row card
-      // inside a rounded border (the pill look the pre-tree dock had);
-      // "compact" keeps single-line rows. The host keeps
-      // scroll/selection in node units either way.
+      // "card" density renders each session as a 2-content-row card
+      // inside a rounded border; "compact" keeps single-line rows. The
+      // host keeps scroll/selection in node units either way.
       itemHeight: dockView === "card" ? DOCK_CARD_HEIGHT : 1,
       cardBorders: dockView === "card",
       // Focusable in the dock (unlike the modal, where Up/Down forward

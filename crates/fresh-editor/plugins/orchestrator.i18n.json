@@ -59,7 +59,7 @@
     "preview.no_workspace_selected": "No workspace selected",
     "preview.state_active": "active",
     "preview.state_working": "working",
-    "preview.state_idle": "idle",
+    "preview.state_idle": "Idle",
     "pill.omp_awaiting_approval": "Awaiting approval",
     "pill.omp_retrying": "Retrying…",
     "pill.omp_compacting": "Compacting context…",

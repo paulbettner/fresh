@@ -337,11 +337,11 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
     working.status_text = Some("Finding top-level files".into());
     emit_companion_snapshot(&harness, companion_window, terminal_id, working);
     pump_until(&mut harness, 40, |h| {
-        h.screen_to_string().contains("Finding top-level files")
+        h.screen_to_string().contains("│  Finding top-level files")
     });
-    assert!(!harness
-        .screen_to_string()
-        .contains("working… · build project"));
+    let working_screen = harness.screen_to_string();
+    assert!(!working_screen.contains("working… · build project"));
+    assert!(!working_screen.contains("▸ (detached)"));
 
     let mut retrying = snapshot();
     retrying.sequence = 3;
@@ -364,8 +364,18 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
             .contains("Auto context-full maintenance…")
     });
 
+    let mut idle = snapshot();
+    idle.sequence = 5;
+    idle.state = OmpCompanionState::Idle;
+    idle.pending_approvals = 0;
+    emit_companion_snapshot(&harness, companion_window, terminal_id, idle);
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("│  Idle")
+    });
+    assert!(!harness.screen_to_string().contains("│  idle"));
+
     let mut awaiting = snapshot();
-    awaiting.sequence = 5;
+    awaiting.sequence = 6;
     emit_companion_snapshot(&harness, companion_window, terminal_id, awaiting);
     pump_until(&mut harness, 40, |h| {
         h.screen_to_string().contains("Awaiting approval")

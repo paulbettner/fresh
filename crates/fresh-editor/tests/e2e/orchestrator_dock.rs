@@ -526,8 +526,8 @@ fn next_window_cycles_only_dock_visible_sessions() {
 }
 
 /// Rows a dock card occupies below its name row in card view: the
-/// remaining content row (branch/project + PR) plus the bottom border.
-/// Mirrors the plugin's `DOCK_CARD_HEIGHT` (2 content rows).
+/// remaining content row (branch/project + OMP status/PR) plus the bottom
+/// border. Mirrors the plugin's `DOCK_CARD_HEIGHT` (2 content rows).
 const DOCK_CARD_ROWS_BELOW_NAME: u16 = 2;
 
 /// Column of the dock's right-edge divider (the "wall") on the title row.
@@ -2544,7 +2544,7 @@ fn dock_new_folder_dialog_enter_on_cancel_cancels() {
 
 /// The mouse wheel scrolls the dock's session tree in the default card
 /// density. The wheel handler used to compare the *row* budget against
-/// the *node* count, so with 3-row cards `max_scroll` collapsed to 0 and
+/// the *node* count, so with multi-row cards `max_scroll` collapsed to 0 and
 /// the wheel was dead exactly when the card list overflowed.
 #[test]
 fn dock_card_tree_wheel_scrolls_when_overflowing() {
@@ -2553,8 +2553,8 @@ fn dock_card_tree_wheel_scrolls_when_overflowing() {
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
             .unwrap();
-    // Enough sessions that the bordered 5-row cards overflow a 32-row
-    // screen (~5 visible cards): 13 nodes total.
+    // Enough sessions that the bordered 4-row cards overflow a 32-row
+    // screen (~6 visible cards): 13 nodes total.
     for i in 1..=12 {
         h.editor_mut()
             .create_window_at(root.join(format!("wt-bb{i:02}")), format!("bb{i:02}"));
@@ -2569,7 +2569,7 @@ fn dock_card_tree_wheel_scrolls_when_overflowing() {
     h.assert_screen_not_contains("bb12");
 
     // Wheel down one notch: the view scrolls by 3 *rows*, not whole
-    // cards — the top card (aaaproj, 5 rows) is partially clipped, so
+    // cards — the top card (aaaproj, 4 rows) is partially clipped, so
     // its name row leaves the screen while the next card (bb01) is
     // still fully visible. Node-granular scrolling (the old behaviour)
     // would have pushed bb01 and bb02 off together.
@@ -2581,7 +2581,7 @@ fn dock_card_tree_wheel_scrolls_when_overflowing() {
     .unwrap();
 
     // Keep wheeling: the offset clamps at max-scroll (rows), which puts
-    // the last card on screen. 13 nodes × 5 rows = 65 total rows, ~26
+    // the last card on screen. 13 nodes × 4 rows = 52 total rows, ~26
     // visible → well under 20 notches of 3 rows each.
     for _ in 0..20 {
         h.mouse_scroll_down(5, 15).unwrap();
@@ -2647,7 +2647,7 @@ fn dock_menu_key_opens_context_menu_and_arrows_navigate() {
 
 /// Card density draws each session as a rounded bordered card — the
 /// `╭─…─╮` pill look the dock had before the folder-tree redesign, which
-/// the tree rendering dropped (cards were three flat text rows; issue
+/// the tree rendering dropped (cards were two flat text rows; issue
 /// #2703). Compact density stays border-free.
 #[test]
 fn dock_card_view_draws_card_borders() {
@@ -2860,7 +2860,7 @@ fn dock_hint_bar_not_padded_when_tree_overflows() {
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
             .unwrap();
-    // Six extra sessions: seven 5-row cards (35 rows) overflow the
+    // Six extra sessions: seven 4-row cards (28 rows) overflow the
     // ~26-row list budget of a 32-row frame.
     for i in 1..=6 {
         h.editor_mut()
@@ -2914,36 +2914,33 @@ fn dock_hint_bar_stays_pinned_after_folder_collapse() {
     })
     .unwrap();
 
-    // Pre-collapse steady state: the card is visible (git probe landed
-    // its "clean" line) AND the hint bar is pinned to the dock bottom.
-    // A single semantic wait rides out interleaved probe re-renders.
+    // Pre-collapse steady state: the card is visible and the hint bar is
+    // pinned to the dock bottom. A single semantic wait rides out interleaved
+    // probe re-renders.
     let hint_row = |s: &str| s.lines().position(|l| l.contains("F2 menu"));
     h.wait_until(|h| {
-        let s = h.screen_to_string();
-        s.contains("clean") && hint_row(&s) == Some(31)
+        dock_card_name_row(h, "alphaproj").is_some() && hint_row(&h.screen_to_string()) == Some(31)
     })
     .unwrap();
 
     // Click the folder's disclosure glyph (col 0 of its row) to collapse
-    // it — the card disappears, shrinking the tree by 5 rows — and the
+    // it — the card disappears, shrinking the tree by 4 rows — and the
     // hint bar re-pins to the bottom rather than floating up with the
     // shorter tree.
     let folder_row = row_of(&h, "Docs") as u16;
     h.mouse_click(0, folder_row).unwrap();
     h.wait_until(|h| {
-        let s = h.screen_to_string();
-        !s.contains("clean") && hint_row(&s) == Some(31)
+        dock_card_name_row(h, "alphaproj").is_none() && hint_row(&h.screen_to_string()) == Some(31)
     })
     .unwrap();
 }
 
 // ── session-row density content ────────────────────────────────────────────
 
-/// Compact density keeps each session to a lean single line — state
-/// glyph + name — with no branch suffix (the branch lives on the card
-/// density's second line).
+/// Card density uses exactly two content rows. The branch/project stays on the
+/// continuation row and never crowds the name/git row.
 #[test]
-fn dock_compact_rows_drop_branch_name() {
+fn dock_card_keeps_branch_off_name_row() {
     let (_tmp, root) = setup_project("alphaproj");
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
@@ -2951,27 +2948,7 @@ fn dock_compact_rows_drop_branch_name() {
     h.render().unwrap();
     open_dock(&mut h);
 
-    // Wait for the git probe: the card's second line shows the branch
-    // marker + summary ("clean" — fresh repo, no upstream, no HEAD
-    // diff). The same probe caches the session's branch name, which the
-    // compact row used to trail as a "▸<branch>" suffix.
-    h.wait_until(|h| h.screen_to_string().contains("clean"))
-        .unwrap();
-
-    // Flip the density to compact.
-    expand_filters(&mut h);
-    let vrow = row_of(&h, "view: card") as u16;
-    h.mouse_click(3, vrow).unwrap();
-
-    // Final steady state, waited on semantically: compact density active
-    // AND the session row (dock column, left of the wall) carries the
-    // name but no branch marker — even though the git probe has already
-    // cached the branch (the "clean" gate above), which the compact row
-    // used to trail as a "▸<branch>" suffix.
     h.wait_until(|h| {
-        if !h.screen_to_string().contains("view: compact") {
-            return false;
-        }
         let Some(name_row) = dock_card_name_row(h, "alphaproj") else {
             return false;
         };
