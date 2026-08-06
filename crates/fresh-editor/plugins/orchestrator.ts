@@ -84,19 +84,23 @@ interface AgentSession extends OmpCompanionControllerSession {
   // Resolved display name shown in the dock / picker. Computed by
   // `workspaceDisplayName` from three sources, most-specific first: a
   // manual rename (`renameWorkspace`, persisted per workspace), else an
-  // auto-name tracking the terminal's tab title (constant workspace
-  // prefix + the terminal/process title), else `hostLabel`.
+  // auto-name tracking the terminal's stable task title (constant workspace
+  // prefix + terminal/process title, without an OMP loader frame), else
+  // `hostLabel`.
   label: string;
   // The raw label the host reports for this window (root basename for a
   // fresh session). The stable fallback when there's no manual rename and
   // no terminal to track — kept separate from `label` so the resolver can
   // recompute the display name without losing the host's own name.
   hostLabel: string;
-  // Last-seen terminal tab title (combined foreground process + OSC title,
-  // the same string shown on the terminal's tab). Drives the auto-name
+  // Last-seen stable terminal task title (combined foreground process + OSC
+  // title, with a transient OMP loader frame removed). Drives the auto-name
   // when the workspace hasn't been manually renamed. `undefined` until the
   // session's terminal reports a non-default title.
   terminalTitle?: string;
+  // Current OMP loader frame parsed from the tab title. Kept out of
+  // `terminalTitle` so the workspace name stays stable while the frame spins.
+  terminalSpinner?: string;
   // Latest explicit OSC activity signal from the session's terminal (OSC
   // 133 command markers / OSC 9;4 progress): `true` = a command/task is
   // running, `false` = it has finished. When set, this is authoritative for
@@ -1270,7 +1274,7 @@ function sessionLastActiveDay(s: AgentSession): number {
 //   2. else, when it has a terminal that reports a title, an auto-name that
 //      tracks that terminal: a constant prefix (the workspace's own name, so
 //      you can still tell which workspace it is) + the changing terminal/
-//      process title (the same string the terminal tab shows),
+//      process title, excluding any transient OMP loader frame,
 //   3. else the host's own label (root basename).
 // Manual rename always wins, so naming a workspace pins it against the
 // auto-name (which would otherwise keep overwriting it as the tab title
@@ -1280,6 +1284,33 @@ const WORKSPACE_NAMES_KEY = "orchestrator.dock.names";
 // title in an auto-name (e.g. `proj · bash — root@host: ~/proj`).
 const WORKSPACE_AUTONAME_SEP = " \u{b7} ";
 let dockNames: Record<string, string> | null = null;
+const OMP_LOADER_FRAMES = new Set([
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+]);
+
+function splitOmpLoaderTitle(rawTitle: string): {
+  title: string;
+  spinner?: string;
+} {
+  const title = rawTitle.trim();
+  if (!title) return { title };
+  const separator = title.indexOf(" ");
+  const candidate = separator < 0 ? title : title.slice(0, separator);
+  if (!OMP_LOADER_FRAMES.has(candidate)) return { title };
+  return {
+    title: separator < 0 ? "" : title.slice(separator + 1).trimStart(),
+    spinner: candidate,
+  };
+}
 
 function loadNames(): Record<string, string> {
   if (dockNames) return dockNames;
@@ -1703,6 +1734,57 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
   }
   return cardSplitRow(segs, gitLineParts(s).right);
 }
+type StatusShimmerTier = "low" | "mid" | "high";
+
+const STATUS_SHIMMER_STYLES: Record<
+  StatusShimmerTier,
+  Record<string, unknown>
+> = {
+  low: { fg: "ui.menu_disabled_fg" },
+  mid: { fg: "diagnostic.warning_fg" },
+  high: { fg: "diagnostic.warning_fg", bold: true },
+};
+
+// OMP's classic shimmer: a cosine band moving left-to-right at 30 cells/s
+// through ten cells of padding on each side. Coalesce adjacent tiers so a
+// frame emits only a handful of styled segments rather than one per glyph.
+function shimmerStatusEntries(text: string, now = Date.now()): Entry[] {
+  let length = 0;
+  for (const _codePoint of text) length++;
+  if (length === 0) return [];
+
+  const position = ((now / 1000) * 30) % (length + 20);
+  const entries: Entry[] = [];
+  let index = 0;
+  let run = "";
+  let runTier: StatusShimmerTier | undefined;
+
+  for (const codePoint of text) {
+    const distance = Math.abs(index + 10 - position);
+    const intensity = distance >= 6
+      ? 0
+      : 0.5 * (1 + Math.cos((Math.PI * distance) / 6));
+    const tier: StatusShimmerTier = intensity >= 0.65
+      ? "high"
+      : intensity >= 0.22
+      ? "mid"
+      : "low";
+    if (tier !== runTier) {
+      if (runTier !== undefined) {
+        entries.push({ text: run, style: STATUS_SHIMMER_STYLES[runTier] });
+      }
+      run = codePoint;
+      runTier = tier;
+    } else {
+      run += codePoint;
+    }
+    index++;
+  }
+  if (runTier !== undefined) {
+    entries.push({ text: run, style: STATUS_SHIMMER_STYLES[runTier] });
+  }
+  return entries;
+}
 
 // Card line 2 (the continuation row): what this workspace *is* on the
 // left — its branch when that says something the name doesn't, else the
@@ -1725,8 +1807,16 @@ function sessionCardExtraLines(id: number): TextPropertyEntry[] {
   const dim = "ui.menu_disabled_fg";
   const pr = prLineEntries(s);
   const status = ompCompanion.statusTextEntry(s);
-  const right: Entry[] = [];
-  if (status) right.push({ text: status.text, style: status.style });
+  const right: Entry[] = status?.shimmer && s.terminalSpinner
+    ? [{
+      text: s.terminalSpinner + " ",
+      style: { fg: "diagnostic.warning_fg", bold: true },
+    }]
+    : [];
+  if (status) {
+    if (status.shimmer) right.push(...shimmerStatusEntries(status.text));
+    else right.push({ text: status.text, style: status.style });
+  }
   if (status && pr.length) right.push({ text: "   " });
   right.push(...pr);
   // The branch earns the row only when it differs from the workspace
@@ -2672,7 +2762,9 @@ function renderPillSpec(
   if (dockMode && dockView === "compact") {
     return flexLine(
       [stateGlyphEntry(s), ...remoteGlyph, nameEntry],
-      ompStatus ? [ompStatus] : git.right,
+      ompStatus
+        ? [{ text: ompStatus.text, style: ompStatus.style }]
+        : git.right,
     );
   }
 
@@ -11832,17 +11924,20 @@ editor.on("terminal_output", (payload) => {
       s.oscRunning = payload.osc_activity;
     }
     // Track the terminal's tab title so an un-renamed workspace names itself
-    // after whatever it's running. Only adopt the session's own agent
-    // terminal (when it has one) so a second shell the user opened in the
-    // same window can't hijack the workspace name.
-    const title = (payload.terminal_title ?? "").trim();
-    if (
-      title &&
-      (s.terminalId === null || s.terminalId === payload.terminal_id) &&
-      s.terminalTitle !== title
-    ) {
-      s.terminalTitle = title;
-      applyResolvedLabel(s);
+    // after whatever it's running. OMP prefixes its loader frame to that title;
+    // retain the frame separately for the status-row gutter so the workspace
+    // name does not churn every 80ms. Only adopt the session's own agent
+    // terminal (when it has one) so a second shell the user opened in the same
+    // window can't hijack the workspace name.
+    const ownsAgentTerminal = s.terminalId === null ||
+      s.terminalId === payload.terminal_id;
+    const activityTitle = splitOmpLoaderTitle(payload.terminal_title ?? "");
+    if (ownsAgentTerminal) {
+      s.terminalSpinner = activityTitle.spinner;
+      if (activityTitle.title && s.terminalTitle !== activityTitle.title) {
+        s.terminalTitle = activityTitle.title;
+        applyResolvedLabel(s);
+      }
     }
     refreshOpenDialog();
     // Ensure the row flips back to idle once output stops, even if no
@@ -11866,6 +11961,7 @@ editor.on("terminal_exit", (payload) => {
     // a command that never emitted its "done" marker (killed, detached)
     // doesn't leave the row stuck "working".
     s.oscRunning = null;
+    s.terminalSpinner = undefined;
     refreshOpenDialog();
   }
 });

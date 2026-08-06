@@ -15,6 +15,7 @@ use fresh_core::hooks::{
     OmpCompanionGoal, OmpCompanionGoalStatus, OmpCompanionModel, OmpCompanionSnapshotV1,
     OmpCompanionState, OmpCompanionThinkingLevel, OmpCompanionTodos,
 };
+use ratatui::style::{Color, Modifier};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -220,6 +221,38 @@ fn emit_companion_snapshot(
     );
 }
 
+fn emit_terminal_output(
+    harness: &EditorTestHarness,
+    window_id: fresh_core::WindowId,
+    terminal_id: fresh_core::TerminalId,
+    terminal_title: &str,
+) {
+    harness.editor().plugin_manager().run_hook(
+        "terminal_output",
+        HookArgs::TerminalOutput {
+            terminal_id: terminal_id.0 as u64,
+            window_id: window_id.0,
+            last_line: String::new(),
+            terminal_title: terminal_title.into(),
+            osc_activity: Some(true),
+        },
+    );
+}
+
+fn status_foregrounds(harness: &EditorTestHarness, text: &str) -> Vec<Color> {
+    let (column, row) = harness
+        .find_text_on_screen(text)
+        .expect("working status must be visible");
+    (0..text.chars().count() as u16)
+        .map(|offset| {
+            harness
+                .get_cell_style(column + offset, row)
+                .and_then(|style| style.fg)
+                .unwrap_or(Color::Reset)
+        })
+        .collect()
+}
+
 #[test]
 fn companion_snapshot_notifies_background_approval() {
     let (_temp, workspace, _path_restore) = set_up_workspace();
@@ -336,12 +369,83 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
     working.pending_approvals = 0;
     working.status_text = Some("Finding top-level files".into());
     emit_companion_snapshot(&harness, companion_window, terminal_id, working);
+
+    // The activation guard intentionally ignores the terminal's first redraw
+    // burst; inject a later OMP title frame exactly as the real PTY hook does.
+    harness.sleep(Duration::from_millis(1_600));
+    emit_terminal_output(&harness, companion_window, terminal_id, "⠧ omp-task");
     pump_until(&mut harness, 40, |h| {
-        h.screen_to_string().contains("│  Finding top-level files")
+        h.screen_to_string().contains("│⠧ Finding top-level files")
     });
     let working_screen = harness.screen_to_string();
+    assert!(
+        working_screen.contains(" · omp-task"),
+        "workspace title must retain the OMP task title:\n{working_screen}"
+    );
+    assert!(
+        !working_screen.contains(" · ⠧ omp-task"),
+        "loader frame must not animate in the workspace title:\n{working_screen}"
+    );
     assert!(!working_screen.contains("working… · build project"));
     assert!(!working_screen.contains("▸ (detached)"));
+
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let status_text = "Finding top-level files";
+    let mut first_pattern = Vec::new();
+    for frame in frames.iter().cycle().take(40) {
+        emit_terminal_output(
+            &harness,
+            companion_window,
+            terminal_id,
+            &format!("{frame} omp-task"),
+        );
+        harness.process_async_and_render().unwrap();
+        first_pattern = status_foregrounds(&harness, status_text);
+        if first_pattern
+            .first()
+            .is_some_and(|first| first_pattern.iter().any(|color| color != first))
+        {
+            break;
+        }
+        harness.sleep(Duration::from_millis(25));
+    }
+    assert!(
+        first_pattern
+            .first()
+            .is_some_and(|first| first_pattern.iter().any(|color| color != first)),
+        "OMP-style shimmer never painted its moving accent band"
+    );
+    let (status_column, status_row) = harness.find_text_on_screen(status_text).unwrap();
+    for offset in 0..status_text.chars().count() as u16 {
+        let style = harness
+            .get_cell_style(status_column + offset, status_row)
+            .expect("status cell must be rendered");
+        assert!(
+            !style.add_modifier.contains(Modifier::ITALIC),
+            "OMP shimmer text must not retain the old static italic style"
+        );
+    }
+
+    let mut highlight_moved = false;
+    for frame in frames.iter().cycle().take(30) {
+        harness.sleep(Duration::from_millis(40));
+        emit_terminal_output(
+            &harness,
+            companion_window,
+            terminal_id,
+            &format!("{frame} omp-task"),
+        );
+        harness.process_async_and_render().unwrap();
+        let next_pattern = status_foregrounds(&harness, status_text);
+        if next_pattern != first_pattern {
+            highlight_moved = true;
+            break;
+        }
+    }
+    assert!(
+        highlight_moved,
+        "OMP-style shimmer accent band did not move"
+    );
 
     let mut retrying = snapshot();
     retrying.sequence = 3;

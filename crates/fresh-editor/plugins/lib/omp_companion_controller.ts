@@ -32,6 +32,7 @@ export interface OmpCompanionControllerSession extends OmpCompanionSession {
 export interface OmpCompanionStatusEntry {
   text: string;
   style?: Record<string, unknown>;
+  shimmer?: boolean;
 }
 
 export interface OmpCompanionControllerHost<
@@ -123,10 +124,12 @@ export class OmpCompanionController<
 
     let text = snapshot.statusText;
     let style: Record<string, unknown>;
+    let shimmer = false;
     switch (snapshot.state) {
       case "working":
         text ??= "Working…";
         style = { fg: "diagnostic.warning_fg", italic: true };
+        shimmer = true;
         break;
       case "awaiting_approval":
         text ??= this.host.t("pill.omp_awaiting_approval");
@@ -135,10 +138,12 @@ export class OmpCompanionController<
       case "retrying":
         text ??= this.host.t("pill.omp_retrying");
         style = { fg: "diagnostic.warning_fg", italic: true };
+        shimmer = true;
         break;
       case "compacting":
         text ??= this.host.t("pill.omp_compacting");
         style = { fg: "diagnostic.warning_fg", italic: true };
+        shimmer = true;
         break;
       case "idle":
         text ??= this.host.t("preview.state_idle");
@@ -154,7 +159,7 @@ export class OmpCompanionController<
         break;
     }
 
-    return { text, style };
+    return { text, style, shimmer };
   }
 
   /** Build the allowlisted OMP rows appended to Orchestrator preview details. */
