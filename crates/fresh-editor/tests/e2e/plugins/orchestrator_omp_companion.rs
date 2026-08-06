@@ -378,6 +378,21 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
         h.screen_to_string().contains("│⠧ Finding top-level files")
     });
     let working_screen = harness.screen_to_string();
+    let title_line = working_screen
+        .lines()
+        .find(|line| line.contains(" · omp-task"))
+        .expect("working OMP card title must be visible");
+    assert!(
+        title_line.contains("│  ") || title_line.contains("┃  "),
+        "structured OMP status must reserve a blank first-row gutter:\n{title_line}"
+    );
+    assert!(
+        !title_line.contains("│* ")
+            && !title_line.contains("┃* ")
+            && !title_line.contains("│· ")
+            && !title_line.contains("┃· "),
+        "OMP card must not repeat working/idle state on its first row:\n{title_line}"
+    );
     assert!(
         working_screen.contains(" · omp-task"),
         "workspace title must retain the OMP task title:\n{working_screen}"
@@ -478,8 +493,27 @@ fn companion_snapshot_renders_and_refused_interrupt_only_stales_the_facet() {
     });
     assert!(!harness.screen_to_string().contains("│  idle"));
 
+    let mut error = snapshot();
+    error.sequence = 6;
+    error.state = OmpCompanionState::Error;
+    error.pending_approvals = 0;
+    error.status_text = Some("Model failed".into());
+    emit_companion_snapshot(&harness, companion_window, terminal_id, error);
+    pump_until(&mut harness, 40, |h| {
+        h.screen_to_string().contains("Model failed")
+    });
+    let error_screen = harness.screen_to_string();
+    let error_title = error_screen
+        .lines()
+        .find(|line| line.contains(" · omp-task"))
+        .expect("errored OMP card title must be visible");
+    assert!(
+        error_title.contains("│! ") || error_title.contains("┃! "),
+        "critical OMP errors must retain the first-row `!` glyph:\n{error_title}"
+    );
+
     let mut awaiting = snapshot();
-    awaiting.sequence = 6;
+    awaiting.sequence = 7;
     emit_companion_snapshot(&harness, companion_window, terminal_id, awaiting);
     pump_until(&mut harness, 40, |h| {
         h.screen_to_string().contains("Awaiting approval")

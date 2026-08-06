@@ -1697,7 +1697,12 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
   const s = orchestratorSessions.get(id);
   if (!s) return styledRow([{ text: editor.t("pill.unknown") }]);
   const isActive = id === activeId;
-  const segs: Entry[] = [stateGlyphEntry(s)];
+  const hasLiveOmpStatus = ompCompanion.statusTextEntry(s) !== undefined;
+  const hideActivityGlyph = hasLiveOmpStatus &&
+    s.ompCompanion?.snapshot.state !== "error";
+  const segs: Entry[] = hideActivityGlyph
+    ? [{ text: "  " }]
+    : [stateGlyphEntry(s)];
   if (s.remote) {
     segs.push({
       text: REMOTE_GLYPH[s.remote.kind] + " ",
