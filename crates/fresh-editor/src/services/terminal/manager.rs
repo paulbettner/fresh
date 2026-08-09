@@ -1436,7 +1436,8 @@ fn open_transcript_file(
 ) -> std::io::Result<LockedTranscriptFile> {
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .append(mode == BackingMode::Continue)
         .truncate(mode == BackingMode::Fresh)
         .open(path)?;
     Ok(LockedTranscriptFile { file, _lock: lock })
