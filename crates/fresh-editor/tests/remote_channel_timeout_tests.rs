@@ -282,6 +282,11 @@ fn test_reconnection_via_replace_transport() {
 
     // replace_transport_blocking waits until the channel is connected
     channel.replace_transport_blocking(new_reader, new_writer);
+    assert_eq!(
+        channel.reconnect_generation(),
+        1,
+        "connected replacement transport publishes its generation"
+    );
 
     // Third request works on the new connection
     arm_happy_path(&channel);

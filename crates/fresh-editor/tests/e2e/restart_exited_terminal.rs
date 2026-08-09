@@ -19,7 +19,7 @@ use crate::common::harness::{EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
-use fresh_core::api::PluginCommand;
+use fresh_core::api::{PluginCommand, TerminalCompanion};
 use portable_pty::{native_pty_system, PtySize};
 use tempfile::TempDir;
 
@@ -78,7 +78,17 @@ fn write_script(dir: &std::path::Path, name: &str, body: &str) -> String {
 /// real bug went unnoticed — `createTerminal` recorded neither, so an agent
 /// started in the current workspace restarted as a bare shell.
 fn spawn_agent_terminal(harness: &mut EditorTestHarness, launch: &[&str], resume: Option<&[&str]>) {
+    spawn_agent_terminal_with_relaunch(harness, launch, None, resume);
+}
+
+fn spawn_agent_terminal_with_relaunch(
+    harness: &mut EditorTestHarness,
+    launch: &[&str],
+    relaunch: Option<&[&str]>,
+    resume: Option<&[&str]>,
+) {
     let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let window_id = harness.editor().active_window_id();
     harness
         .editor_mut()
         .handle_plugin_command(PluginCommand::CreateTerminal {
@@ -86,15 +96,16 @@ fn spawn_agent_terminal(harness: &mut EditorTestHarness, launch: &[&str], resume
             direction: None,
             ratio: None,
             focus: Some(true),
-            // Ephemeral, like every plugin-created terminal. Carrying a command
-            // is what makes it a restorable *session* terminal regardless.
             persistent: false,
-            window_id: None,
+            window_id,
             command: Some(argv(launch)),
+            relaunch: relaunch.map(argv),
             title: None,
             resume: resume.map(argv),
             env: None,
+            companion: None,
             allow_script: false,
+            selected_agent: true,
             request_id: 0,
         })
         .expect("agent terminal should spawn");
@@ -533,4 +544,330 @@ fn test_terminal_tab_title_survives_an_editor_restart() {
         // Specifically not the auto-generated fallback.
         harness.assert_screen_not_contains("*Terminal");
     }
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn two_restored_exited_terminals_keep_unique_ids_and_restart_independently() {
+    if !pty_available() {
+        eprintln!("Skipping terminal-restart test: PTY not available");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+    let agent = write_script(
+        temp_dir.path(),
+        "two-agents.sh",
+        "#!/bin/sh\n\
+         if [ \"$1\" = --resume ]; then echo \"RESUMED-$2\"; exec sleep 30; fi\n\
+         echo \"EXITED-$2\"\n",
+    );
+    let session = || {
+        EditorTestHarness::create(
+            120,
+            30,
+            HarnessOptions::new()
+                .with_config(terminal_config())
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap()
+    };
+
+    {
+        let mut harness = session();
+        harness.editor_mut().set_session_mode(true);
+        for name in ["one", "two"] {
+            spawn_agent_terminal(
+                &mut harness,
+                &[agent.as_str(), "--launch", name],
+                Some(&[agent.as_str(), "--resume", name]),
+            );
+        }
+        harness
+            .wait_until(|h| h.editor().active_window().exited_terminals.len() == 2)
+            .expect("both agents should exit before saving");
+        harness.shutdown(true).unwrap();
+    }
+
+    {
+        let mut harness = session();
+        assert!(harness.startup(true, &[]).unwrap());
+        let ids: std::collections::HashSet<_> = harness
+            .editor()
+            .active_window()
+            .exited_terminals
+            .values()
+            .map(|record| record.terminal_id)
+            .collect();
+        assert_eq!(ids.len(), 2, "restored exited terminals need unique ids");
+        harness.shutdown(true).unwrap();
+    }
+
+    let mut harness = session();
+    assert!(harness.startup(true, &[]).unwrap());
+    let exited: Vec<_> = harness
+        .editor()
+        .active_window()
+        .exited_terminals
+        .iter()
+        .map(|(buffer_id, record)| (*buffer_id, record.terminal_id))
+        .collect();
+    assert_eq!(exited.len(), 2);
+    assert_ne!(exited[0].1, exited[1].1);
+
+    let mut restarted = Vec::new();
+    for (buffer_id, _) in exited {
+        restarted.push(
+            harness
+                .editor_mut()
+                .active_window_mut()
+                .restart_terminal_buffer(buffer_id)
+                .expect("each restored exited terminal should restart"),
+        );
+    }
+    assert_ne!(restarted[0], restarted[1]);
+    for terminal_id in restarted {
+        assert!(
+            harness
+                .editor()
+                .active_window()
+                .terminal_manager
+                .get(terminal_id)
+                .is_some_and(|handle| handle.is_alive()),
+            "restarting the second terminal must not kill the first"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn resume_agents_false_uses_clean_relaunch_instead_of_resuming_or_reprovisioning() {
+    if !pty_available() {
+        return;
+    }
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let agent = write_script(
+        temp_dir.path(),
+        "resume-gated.sh",
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+           --resume) echo WRONG-RESUME; exec sleep 30 ;;\n\
+           --provision) echo INITIAL-PROVISION; exit 0 ;;\n\
+           --clean) echo CLEAN-RELAUNCH; exec sleep 30 ;;\n\
+         esac\n",
+    );
+    let mut config = terminal_config();
+    config.terminal.resume_agents = false;
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(project_dir)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    spawn_agent_terminal_with_relaunch(
+        &mut harness,
+        &[agent.as_str(), "--provision", "one-shot-id"],
+        Some(&[agent.as_str(), "--clean"]),
+        Some(&[agent.as_str(), "--resume", "session-1"]),
+    );
+    harness
+        .wait_until(|h| h.screen_to_string().contains("⟳ Restart"))
+        .unwrap();
+
+    click_restart_indicator(&mut harness, "⟳ Restart");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("CLEAN-RELAUNCH"))
+        .expect("restart must use the clean relaunch argv");
+    harness.assert_screen_not_contains("WRONG-RESUME");
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn omp_exact_resume_wins_on_manual_restart_when_generic_resume_is_disabled() {
+    if !pty_available() {
+        return;
+    }
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let agent = write_script(
+        temp_dir.path(),
+        "omp",
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--fresh-omp-companion\" ] && [ \"$2\" = \"--version\" ]; then exit 0; fi\n\
+         case \"$1\" in\n\
+           --resume) echo EXACT-OMP-RESUME; exec sleep 30 ;;\n\
+           --clean) echo WRONG-CLEAN-RELAUNCH; exec sleep 30 ;;\n\
+           *) echo INITIAL; sleep 1; exit 0 ;;\n\
+         esac\n",
+    );
+    let _path_guard = crate::common::PathGuard::prepend_with_trusted_omp(
+        temp_dir.path(),
+        std::path::Path::new(&agent),
+    );
+    let mut config = terminal_config();
+    config.terminal.resume_agents = false;
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(project_dir)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    spawn_agent_terminal_with_relaunch(
+        &mut harness,
+        &[agent.as_str(), "--initial"],
+        Some(&[agent.as_str(), "--clean"]),
+        Some(&[
+            agent.as_str(),
+            "--resume",
+            "123e4567-e89b-42d3-a456-426614174099",
+        ]),
+    );
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(harness.editor().active_buffer_id())
+        .unwrap();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .terminal_companions
+        .insert(terminal_id, TerminalCompanion::Omp);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("⟳ Resume"))
+        .unwrap();
+
+    click_restart_indicator(&mut harness, "⟳ Resume");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("EXACT-OMP-RESUME"))
+        .unwrap();
+    harness.assert_screen_not_contains("WRONG-CLEAN-RELAUNCH");
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn empty_relaunch_remains_the_plain_shell_marker_after_restart() {
+    if !pty_available() {
+        return;
+    }
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let mut harness = harness(project_dir);
+    let window_id = harness.editor().active_window_id();
+    harness
+        .editor_mut()
+        .handle_plugin_command(PluginCommand::CreateTerminal {
+            cwd: None,
+            direction: None,
+            ratio: None,
+            focus: Some(true),
+            persistent: false,
+            window_id,
+            command: Some(vec!["sh".into(), "-c".into(), "exit 0".into()]),
+            relaunch: Some(Vec::new()),
+            title: None,
+            resume: None,
+            env: None,
+            companion: None,
+            allow_script: false,
+            selected_agent: false,
+            request_id: 0,
+        })
+        .unwrap();
+    let buffer_id = harness.editor().active_buffer_id();
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .active_window()
+                .exited_terminal(buffer_id)
+                .is_some()
+        })
+        .unwrap();
+    assert_eq!(
+        harness
+            .editor()
+            .active_window()
+            .exited_terminal(buffer_id)
+            .unwrap()
+            .command,
+        Some(Vec::new())
+    );
+
+    let new_id = harness
+        .editor_mut()
+        .active_window_mut()
+        .restart_terminal_buffer(buffer_id)
+        .expect("plain shell should restart");
+    assert_eq!(
+        harness
+            .editor()
+            .active_window()
+            .terminal_commands
+            .get(&new_id),
+        Some(&Vec::new())
+    );
+    let workspace = harness.editor().capture_workspace();
+    let round_trip: fresh::workspace::Workspace =
+        serde_json::from_str(&serde_json::to_string(&workspace).unwrap()).unwrap();
+    assert_eq!(round_trip.terminals[0].command, Some(Vec::new()));
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn background_terminal_exit_preserves_active_file_view_state() {
+    if !pty_available() {
+        eprintln!("Skipping terminal-restart test: PTY not available");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let file = project_dir.join("active-view.txt");
+    std::fs::write(
+        &file,
+        (0..200)
+            .map(|line| format!("active file line {line}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut harness = harness(project_dir);
+    harness.open_file(&file).unwrap();
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    let file_buffer = harness.editor().active_buffer_id();
+
+    spawn_agent_terminal(&mut harness, &["sh", "-c", "sleep 1"], None);
+    harness.render().unwrap();
+    let (col, row) = harness
+        .find_text_on_screen("active-view.txt")
+        .expect("file tab should remain visible beside the terminal");
+    harness.mouse_click(col + 1, row).unwrap();
+    harness.render().unwrap();
+    assert_eq!(harness.editor().active_buffer_id(), file_buffer);
+    let cursor_before = harness.cursor_position();
+    let top_before = harness.top_line_number();
+
+    harness
+        .wait_until(|h| !h.editor().active_window().exited_terminals.is_empty())
+        .expect("background terminal should exit");
+    assert_eq!(harness.editor().active_buffer_id(), file_buffer);
+    assert_eq!(harness.cursor_position(), cursor_before);
+    assert_eq!(harness.top_line_number(), top_before);
 }

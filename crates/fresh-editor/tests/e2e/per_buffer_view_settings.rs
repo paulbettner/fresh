@@ -106,14 +106,16 @@ fn test_line_numbers_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.txt");
     std::fs::write(&file, "alpha\nbeta\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: turn line numbers off for this buffer, then save the workspace.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -129,11 +131,12 @@ fn test_line_numbers_current_buffer_persists_across_restart() {
 
     // Session 2: restore the workspace; line numbers stay off for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -188,6 +191,7 @@ fn test_line_wrap_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.txt");
     std::fs::write(&file, format!("{}TAILAAA\n", "A".repeat(80))).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     let mk_config = || {
         let mut c = Config::default();
@@ -197,11 +201,12 @@ fn test_line_wrap_current_buffer_persists_across_restart() {
 
     // Session 1: wrap is on (tail visible); turn it off for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             60,
             24,
             mk_config(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -217,11 +222,12 @@ fn test_line_wrap_current_buffer_persists_across_restart() {
 
     // Session 2: restore; wrap stays off for this buffer (tail truncated).
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             60,
             24,
             mk_config(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -278,14 +284,16 @@ fn test_indentation_guide_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.rs");
     std::fs::write(&file, FOLDABLE_SOURCE).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: guides are off globally; turn them on for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -304,11 +312,12 @@ fn test_indentation_guide_current_buffer_persists_across_restart() {
     // Session 2: restore; the guides come back even though the global mode is
     // still `none`.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -374,14 +383,16 @@ fn test_fold_indicators_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.rs");
     std::fs::write(&file, FOLDABLE_SOURCE).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: hide the fold arrows for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -397,11 +408,12 @@ fn test_fold_indicators_current_buffer_persists_across_restart() {
 
     // Session 2: restore; the arrows stay hidden for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -429,14 +441,16 @@ fn test_whitespace_indicators_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.go");
     std::fs::write(&file, "func main() {\n\tprintln(\"x\")\n}\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: Go hides tab indicators; turn them on for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -451,11 +465,12 @@ fn test_whitespace_indicators_current_buffer_persists_across_restart() {
 
     // Session 2: restore; the indicators are still shown for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -478,14 +493,16 @@ fn test_indentation_style_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.go");
     std::fs::write(&file, "\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: show tab indicators, then switch this buffer to spaces.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -498,11 +515,12 @@ fn test_indentation_style_current_buffer_persists_across_restart() {
 
     // Session 2: restore, then press Tab — spaces, so no indicator appears.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -601,14 +619,16 @@ fn test_current_line_highlight_current_buffer_scopes_and_persists() {
     let b = project_dir.join("b.txt");
     std::fs::write(&a, "alpha\nbeta\n").unwrap();
     std::fs::write(&b, "delta\nepsilon\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: pin the highlight off for a.txt only.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&a).unwrap();
@@ -643,11 +663,12 @@ fn test_current_line_highlight_current_buffer_scopes_and_persists() {
 
     // Session 2: restore; a.txt is still unhighlighted, b.txt still is.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -681,14 +702,16 @@ fn test_occurrence_highlight_current_buffer_persists_across_restart() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.rs");
     std::fs::write(&file, "let alpha = 1;\nlet beta = alpha;\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: pin occurrence highlighting off for this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             200,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -704,11 +727,12 @@ fn test_occurrence_highlight_current_buffer_persists_across_restart() {
     // `reference_highlight_overlay.enabled` from config, so this is where a
     // dropped override would show up), and toggle again.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             200,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
@@ -902,14 +926,20 @@ fn test_workspace_does_not_shadow_config_persisted_settings() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.txt");
     std::fs::write(&file, format!("{}TAILAAA\n", "A".repeat(80))).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Session 1: line wrap off; save the workspace in that state.
     {
         let mut config = Config::default();
         config.editor.line_wrap = false;
-        let mut harness =
-            EditorTestHarness::with_config_and_working_dir(60, 24, config, project_dir.clone())
-                .unwrap();
+        let mut harness = EditorTestHarness::with_shared_dir_context(
+            60,
+            24,
+            config,
+            project_dir.clone(),
+            dir_context.clone(),
+        )
+        .unwrap();
         harness.open_file(&file).unwrap();
         harness.render().unwrap();
         harness.assert_screen_not_contains("TAILAAA");
@@ -921,9 +951,14 @@ fn test_workspace_does_not_shadow_config_persisted_settings() {
     {
         let mut config = Config::default();
         config.editor.line_wrap = true;
-        let mut harness =
-            EditorTestHarness::with_config_and_working_dir(60, 24, config, project_dir.clone())
-                .unwrap();
+        let mut harness = EditorTestHarness::with_shared_dir_context(
+            60,
+            24,
+            config,
+            project_dir.clone(),
+            dir_context.clone(),
+        )
+        .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();
         assert!(restored, "workspace should have been restored");
         harness.render().unwrap();
@@ -943,6 +978,7 @@ fn test_tab_indicators_toggle_independent_of_space_dots() {
     std::fs::create_dir(&project_dir).unwrap();
     let file = project_dir.join("a.txt");
     std::fs::write(&file, "\thello\n  world\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Leading-space dots on, so tabs and spaces are independently observable:
     // '→' for the tab, '·' for the leading spaces.
@@ -954,11 +990,12 @@ fn test_tab_indicators_toggle_independent_of_space_dots() {
 
     // Session 1
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             100,
             24,
             mk_config(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -995,11 +1032,12 @@ fn test_tab_indicators_toggle_independent_of_space_dots() {
 
     // Session 2: the tab pin survives the restart; the dots still show.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             100,
             24,
             mk_config(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();

@@ -94,6 +94,7 @@ fn validate_omp_companion_snapshot(snapshot: &fresh_core::hooks::OmpCompanionSna
         incarnation,
         sequence,
         session_generation,
+        work_epoch,
         timestamp_ms,
         omp_version,
         process_id,
@@ -118,6 +119,7 @@ fn validate_omp_companion_snapshot(snapshot: &fresh_core::hooks::OmpCompanionSna
         || !is_canonical_uuid(session_id, false)
         || !(1..=JS_SAFE_INTEGER_MAX).contains(sequence)
         || !(1..=JS_SAFE_INTEGER_MAX).contains(session_generation)
+        || !(1..=JS_SAFE_INTEGER_MAX).contains(work_epoch)
         || *timestamp_ms > JS_SAFE_INTEGER_MAX
         || !(1..=u32::MAX as u64).contains(process_id)
         || !is_normalized_companion_string(omp_version, 64, 128)
@@ -209,7 +211,15 @@ fn parse_omp_companion_candidate(
     parse_omp_companion_candidate_with(
         candidate,
         |sync_b64, body_b64, tag_b64| live.verify_output_auth(sync_b64, body_b64, tag_b64),
-        |incarnation, sequence| live.accept_sequence(incarnation, sequence),
+        |incarnation, sequence, session_generation, session_id, work_epoch| {
+            live.admit_sequence(
+                incarnation,
+                sequence,
+                session_generation,
+                session_id,
+                work_epoch,
+            )
+        },
     )
 }
 
@@ -220,7 +230,7 @@ fn parse_omp_companion_candidate_with<Verify, Accept>(
 ) -> Option<fresh_core::hooks::OmpCompanionSnapshotV1>
 where
     Verify: FnOnce(&[u8], &[u8], &[u8]) -> bool,
-    Accept: FnOnce(&str, u64) -> bool,
+    Accept: FnOnce(&str, u64, u64, &str, u64) -> bool,
 {
     if candidate.len() > OMP_OUTPUT_FRAME_MAX
         || !candidate.starts_with(OMP_OUTPUT_PREFIX)
@@ -267,7 +277,13 @@ where
     if envelope.version != 1
         || !matches!(envelope.message_type, OmpCompanionEnvelopeType::Snapshot)
         || !validate_omp_companion_snapshot(&envelope.snapshot)
-        || !accept_sequence(&envelope.snapshot.incarnation, envelope.snapshot.sequence)
+        || !accept_sequence(
+            &envelope.snapshot.incarnation,
+            envelope.snapshot.sequence,
+            envelope.snapshot.session_generation,
+            &envelope.snapshot.session_id,
+            envelope.snapshot.work_epoch,
+        )
     {
         return None;
     }
@@ -281,11 +297,29 @@ fn editor_receipt_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn snapshot_matches_owning_workspace(
+    window: &super::window::Window,
+    snapshot: &fresh_core::hooks::OmpCompanionSnapshotV1,
+) -> bool {
+    let Ok(snapshot_cwd) = std::fs::canonicalize(&snapshot.cwd) else {
+        return false;
+    };
+    let Ok(owning_root) = std::fs::canonicalize(&window.root) else {
+        return false;
+    };
+    matches!(
+        &window.authority().command_wrap,
+        crate::services::authority::CommandWrap::Direct
+    ) && window
+        .authority()
+        .matches_session_spec(&window.authority_spec)
+        && snapshot_cwd == owning_root
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct OmpCompanionHookPayload {
     pub terminal: fresh_core::WindowTerminalId,
     pub received_at_ms: u64,
-    pub launch_executable: String,
     pub snapshot: fresh_core::hooks::OmpCompanionSnapshotV1,
 }
 
@@ -373,7 +407,7 @@ impl Editor {
         if self.omp_companion_delivery.is_tombstoned(terminal) {
             return;
         }
-        let (live, launch_executable) = {
+        let live = {
             let Some(window) = self.windows.get(&terminal.window) else {
                 return;
             };
@@ -383,30 +417,103 @@ impl Editor {
             let Some(live) = handle.companion.as_ref().cloned() else {
                 return;
             };
-            let Some(launch_executable) = window
-                .terminal_commands
-                .get(&terminal.terminal)
-                .and_then(|argv| argv.first())
-                .filter(|executable| !executable.is_empty())
-                .cloned()
-            else {
-                return;
+            live
+        };
+
+        let mut queued = false;
+        for mut candidate in live.take_candidates() {
+            let snapshot = parse_omp_companion_candidate(&candidate, &live);
+            candidate.fill(0);
+            let Some(snapshot) = snapshot else {
+                continue;
             };
-            (live, launch_executable)
-        };
-        let Some(candidate) = live.take_candidate() else {
-            return;
-        };
-        let Some(snapshot) = parse_omp_companion_candidate(&candidate, &live) else {
-            return;
-        };
-        let payload = OmpCompanionHookPayload {
-            terminal,
-            received_at_ms: editor_receipt_time_ms(),
-            launch_executable,
-            snapshot,
-        };
-        if self.omp_companion_delivery.push(payload) {
+
+            // Authentication consumes sequence anti-replay in receipt order,
+            // but the authoritative incarnation/generation/session/work tuple
+            // stays on the last durable snapshot until workspace validation,
+            // its resume checkpoint, and positive ACK writer admission succeed.
+            let matches_owning_workspace = self
+                .windows
+                .get(&terminal.window)
+                .is_some_and(|window| snapshot_matches_owning_workspace(window, &snapshot));
+            if !matches_owning_workspace {
+                if let Some(handle) = self
+                    .windows
+                    .get(&terminal.window)
+                    .and_then(|window| window.terminal_manager.get(terminal.terminal))
+                {
+                    let _ = handle.enqueue_omp_companion_snapshot_ack(&snapshot, false);
+                }
+                continue;
+            }
+
+            let resume = live.exact_resume_argv(&snapshot.session_id);
+            let previous = {
+                let Some(window) = self.windows.get_mut(&terminal.window) else {
+                    break;
+                };
+                if window.terminal_resume_commands.get(&terminal.terminal) == Some(&resume) {
+                    None
+                } else {
+                    Some(
+                        window
+                            .terminal_resume_commands
+                            .insert(terminal.terminal, resume),
+                    )
+                }
+            };
+            let needs_checkpoint =
+                previous.is_some() || !live.resume_checkpointed_for(&snapshot.session_id);
+            let checkpoint_succeeded = if needs_checkpoint {
+                match self.save_workspace_metadata_for(terminal.window) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        if let Some(previous) = previous {
+                            let resumes = &mut self
+                                .windows
+                                .get_mut(&terminal.window)
+                                .expect("validated companion window remains present")
+                                .terminal_resume_commands;
+                            match previous {
+                                Some(argv) => {
+                                    resumes.insert(terminal.terminal, argv);
+                                }
+                                None => {
+                                    resumes.remove(&terminal.terminal);
+                                }
+                            }
+                        }
+                        tracing::warn!(
+                            "OMP companion resume checkpoint failed for {terminal:?}: {error}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            let accepted = checkpoint_succeeded;
+            let acknowledged = self
+                .windows
+                .get(&terminal.window)
+                .and_then(|window| window.terminal_manager.get(terminal.terminal))
+                .is_some_and(|handle| {
+                    handle.enqueue_omp_companion_snapshot_ack(&snapshot, accepted)
+                });
+            let committed = accepted
+                && acknowledged
+                && live.commit_admitted_snapshot(&snapshot, needs_checkpoint);
+            if !committed {
+                continue;
+            }
+
+            queued |= self.omp_companion_delivery.push(OmpCompanionHookPayload {
+                terminal,
+                received_at_ms: editor_receipt_time_ms(),
+                snapshot,
+            });
+        }
+        if queued {
             self.dispatch_next_omp_companion_hook();
         }
     }
@@ -420,17 +527,20 @@ impl Editor {
                 self.omp_companion_delivery.complete_in_flight();
                 continue;
             }
-            self.plugin_manager.read().unwrap().run_hook(
+            if self.run_plugin_hook_for_plugin_in_window(
+                "orchestrator",
+                payload.terminal.window,
                 "omp_companion_snapshot",
                 fresh_core::hooks::HookArgs::OmpCompanionSnapshot {
                     window_id: payload.terminal.window.0,
                     terminal_id: payload.terminal.terminal.0 as u64,
                     received_at_ms: payload.received_at_ms,
-                    launch_executable: payload.launch_executable,
                     snapshot: payload.snapshot,
                 },
-            );
-            return;
+            ) {
+                return;
+            }
+            self.omp_companion_delivery.complete_in_flight();
         }
     }
 

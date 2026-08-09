@@ -12,6 +12,43 @@
 
 use super::*;
 
+fn subtract_rect(
+    rect: ratatui::layout::Rect,
+    cut: ratatui::layout::Rect,
+) -> Vec<ratatui::layout::Rect> {
+    let rect_x1 = rect.x.saturating_add(rect.width);
+    let rect_y1 = rect.y.saturating_add(rect.height);
+    let cut_x1 = cut.x.saturating_add(cut.width);
+    let cut_y1 = cut.y.saturating_add(cut.height);
+    let x0 = rect.x.max(cut.x);
+    let y0 = rect.y.max(cut.y);
+    let x1 = rect_x1.min(cut_x1);
+    let y1 = rect_y1.min(cut_y1);
+    if x0 >= x1 || y0 >= y1 {
+        return vec![rect];
+    }
+    [
+        ratatui::layout::Rect::new(rect.x, rect.y, rect.width, y0 - rect.y),
+        ratatui::layout::Rect::new(rect.x, y0, x0 - rect.x, y1 - y0),
+        ratatui::layout::Rect::new(x1, y0, rect_x1 - x1, y1 - y0),
+        ratatui::layout::Rect::new(rect.x, y1, rect.width, rect_y1 - y1),
+    ]
+    .into_iter()
+    .filter(|rect| rect.width > 0 && rect.height > 0)
+    .collect()
+}
+
+fn layer_captures_ghostty_selection(kind: crate::app::overlay::LayerKind) -> bool {
+    matches!(
+        kind,
+        crate::app::overlay::LayerKind::EventDebug
+            | crate::app::overlay::LayerKind::Settings
+            | crate::app::overlay::LayerKind::KeybindingEditor
+            | crate::app::overlay::LayerKind::CalibrationWizard
+            | crate::app::overlay::LayerKind::WorkspaceTrust
+            | crate::app::overlay::LayerKind::FloatingModal
+    )
+}
 impl Editor {
     /// Get a reference to the async bridge (if available)
     pub fn async_bridge(&self) -> Option<&AsyncBridge> {
@@ -590,7 +627,8 @@ impl Editor {
             // Notify plugins so they can re-register state-gated commands
             // (e.g. devcontainer `Attach` only when not attached).
             let label = self.active_window().authority.display_label.clone();
-            self.plugin_manager.read().unwrap().run_hook(
+            self.run_plugin_hook_for_window(
+                active_id,
                 "authority_changed",
                 crate::services::plugins::hooks::HookArgs::AuthorityChanged { label },
             );
@@ -607,24 +645,10 @@ impl Editor {
     /// the per-session counterpart to [`Self::set_boot_authority`], which
     /// fans one authority across every window at boot.
     ///
-    /// Updates that window's `resources.authority` and re-points its LSP
-    /// backend (long-running spawner, path translation, trust); when the
-    /// window is the active one, mirrors into the editor-wide `authority`
-    /// cache the rest of the editor reads and fires the `authority_changed`
-    /// hook. This is the activation primitive a per-session attach (the
-    /// planned `attachRemoteAgent` op, and the Orchestrator session-swap)
-    /// builds on, and the seam that lets distinct windows hold distinct
-    /// authorities concurrently (`AUTHORITY_DESIGN.md` §"Evolution:
-    /// per-session authority").
-    ///
-    /// Caveat — why production attach still goes through the destructive
-    /// `install_authority` restart: like `set_boot_authority`, this does
-    /// not invalidate per-buffer captured filesystem handles or terminals
-    /// opened under the previous authority. Hot-swapping those safely is
-    /// the remaining per-window cache-invalidation work gated on the live
-    /// multi-session migration; until it lands, this method is the
-    /// infrastructure seam, exercised by tests and the activation path,
-    /// not yet the user-facing attach.
+    /// Rebinds every filesystem leaf owned by the window (open buffers and the
+    /// file-operation manager), invalidates explorer/mtime state captured from
+    /// the previous backend, and re-points LSP. When the window is active it
+    /// also refreshes editor-wide quick-open and plugin authority state.
     /// Set a session's **backend spec** — the persisted descriptor of how to
     /// rebuild/reconnect its backend ([`SessionAuthoritySpec`]). Independent of
     /// the live [`Authority`]: a session is *dormant* when its spec is remote
@@ -641,6 +665,12 @@ impl Editor {
         }
     }
 
+    /// Rebind a window to an already-proven equivalent live backend.
+    ///
+    /// This is only safe for a newly created window or a verified same-tenant
+    /// reconnect whose old transport is already dead. A plugin transition to
+    /// a different authority must use [`Self::install_authority`] so the old
+    /// editor and all authority-bound resources are dropped as one cutover.
     pub fn set_session_authority(
         &mut self,
         window_id: fresh_core::WindowId,
@@ -648,13 +678,27 @@ impl Editor {
     ) {
         let is_active = self.active_window == window_id;
         if let Some(w) = self.windows.get_mut(&window_id) {
-            // Re-point this window's LSP backend, then **move** the authority
-            // into the window it owns (single owner — never cloned).
+            let filesystem = authority.filesystem.clone();
+            w.resources.fs_manager =
+                std::sync::Arc::new(crate::services::fs::FsManager::new(filesystem.clone()));
+            for (_, state) in &mut w.buffers {
+                state.buffer.set_filesystem(filesystem.clone());
+            }
+            // An explorer/tree or mtime captured from the prior authority can
+            // neither be queried nor safely installed under the replacement.
+            w.file_explorer = None;
+            w.file_explorer_sync_in_progress = false;
+            w.file_mod_times.clear();
+            w.dir_mod_times.clear();
+
             let lsp = &mut w.lsp;
             lsp.set_long_running_spawner(authority.long_running_spawner.clone());
             lsp.set_path_translation(authority.path_translation.clone());
             lsp.set_workspace_trust(authority.workspace_trust.clone());
             w.authority = authority;
+            if w.file_explorer_visible {
+                w.init_file_explorer();
+            }
         }
         if is_active {
             // The active backend *is* this window's authority now — re-point
@@ -668,7 +712,8 @@ impl Editor {
             {
                 self.update_plugin_state_snapshot();
                 let label = self.active_window().authority.display_label.clone();
-                self.plugin_manager.read().unwrap().run_hook(
+                self.run_plugin_hook_for_window(
+                    window_id,
                     "authority_changed",
                     crate::services::plugins::hooks::HookArgs::AuthorityChanged { label },
                 );
@@ -707,7 +752,9 @@ impl Editor {
             {
                 self.update_plugin_state_snapshot();
                 let label = self.active_window().authority.display_label.clone();
-                self.plugin_manager.read().unwrap().run_hook(
+                let owner = self.active_window;
+                self.run_plugin_hook_for_window(
+                    owner,
                     "authority_changed",
                     crate::services::plugins::hooks::HookArgs::AuthorityChanged { label },
                 );
@@ -1021,20 +1068,83 @@ impl Editor {
         }
     }
 
-    /// Live terminal content rectangles from the most recently rendered frame.
-    /// smarty-fresh reports these to its bundled Ghostty so native selection is
-    /// reserved only for terminal cells, never editor chrome or file buffers.
+    /// Live terminal cells not covered by a blocking editor overlay. The
+    /// Ghostty passthrough grants native selection only to these rectangles.
     pub fn smarty_fresh_live_terminal_rects(
         &self,
     ) -> impl Iterator<Item = ratatui::layout::Rect> + '_ {
         let window = self.active_window();
-        window.layout_cache.split_areas.iter().filter_map(
-            move |(split_id, buffer_id, content_rect, _, _, _)| {
-                (window.is_terminal_buffer(*buffer_id)
-                    && !window.split_terminal_scrollback(*split_id, *buffer_id))
-                .then_some(*content_rect)
-            },
-        )
+        let frame = window.chrome_layout.last_frame;
+        let full = ratatui::layout::Rect::new(0, 0, frame.width, frame.height);
+        let (_, chrome) = self.compute_dock_split(full);
+        let mut occluders: Vec<_> = window
+            .chrome_layout
+            .popup_areas
+            .iter()
+            .map(|(_, outer, _, _, _, _, _)| *outer)
+            .chain(
+                window
+                    .chrome_layout
+                    .global_popup_areas
+                    .iter()
+                    .map(|(_, outer, _, _, _)| *outer),
+            )
+            .chain(window.chrome_layout.suggestions_outer_area)
+            .collect();
+        if self
+            .overlay_layers()
+            .iter()
+            .any(|layer| layer_captures_ghostty_selection(layer.kind))
+        {
+            occluders.push(full);
+        }
+        if let Some((theme_info, _)) = self.theme_info_popup_rect() {
+            occluders.push(theme_info);
+        }
+        if window.prompt.as_ref().is_some_and(|prompt| prompt.overlay) {
+            occluders.push(Self::centered_overlay_rect(chrome, 90, 90));
+        }
+        if let Some(menu) = window.context_menu_core() {
+            let (x, y) = menu.clamped_position(frame.width, frame.height);
+            occluders.push(ratatui::layout::Rect::new(x, y, menu.width, menu.height()));
+        }
+        if let Some(menu) = &window.chrome_layout.menu_layout {
+            occluders.extend(menu.dropdown_box);
+            occluders.extend(menu.submenu_boxes.iter().map(|(_, rect)| *rect));
+        }
+        if let Some(panel) = self.floating_widget_panel.as_ref() {
+            if let Some(outer) = panel.last_outer_rect {
+                occluders.push(outer);
+            }
+            occluders.extend(panel.dropdown_popup_rect);
+            occluders.extend(panel.dropdown_popup_hits.iter().map(|hit| hit.rect));
+        }
+        if self.is_file_open_active() {
+            occluders.extend(
+                window
+                    .file_browser_layout
+                    .as_ref()
+                    .map(|layout| layout.popup_area),
+            );
+        }
+        window
+            .layout_cache
+            .split_areas
+            .iter()
+            .filter(|(split_id, buffer_id, _, _, _, _)| {
+                window.is_terminal_buffer(*buffer_id)
+                    && !window.split_terminal_scrollback(*split_id, *buffer_id)
+            })
+            .flat_map(|(_, _, rect, _, _, _)| {
+                occluders.iter().copied().fold(vec![*rect], |rects, cut| {
+                    rects
+                        .into_iter()
+                        .flat_map(|rect| subtract_rect(rect, cut))
+                        .collect()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// The active window's layout-cache (split-leaf rects, tab rects,
@@ -1521,5 +1631,117 @@ impl Editor {
         self.request_completion();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_cut_leaves_only_unoccluded_terminal_cells() {
+        let terminal = ratatui::layout::Rect::new(10, 10, 10, 8);
+        let overlay = ratatui::layout::Rect::new(13, 12, 4, 3);
+        let remaining = subtract_rect(terminal, overlay);
+        assert_eq!(remaining.len(), 4);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|rect| rect.width as u32 * rect.height as u32)
+                .sum::<u32>(),
+            68
+        );
+        assert!(remaining.iter().all(|rect| {
+            rect.x + rect.width <= overlay.x
+                || rect.x >= overlay.x + overlay.width
+                || rect.y + rect.height <= overlay.y
+                || rect.y >= overlay.y + overlay.height
+        }));
+    }
+
+    #[test]
+    fn file_browser_popup_excludes_covered_live_terminal_cells_from_ghostty() {
+        use crate::app::file_open::FileOpenState;
+        use crate::config::Config;
+        use crate::config_io::DirectoryContext;
+        use crate::model::filesystem::{FileSystem, StdFileSystem};
+        use crate::services::terminal::TerminalId;
+        use crate::view::prompt::{Prompt, PromptType};
+        use crate::view::ui::FileBrowserLayout;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let filesystem: Arc<dyn FileSystem + Send + Sync> = Arc::new(StdFileSystem);
+        let mut editor = Editor::new(
+            Config::default(),
+            80,
+            24,
+            DirectoryContext::for_testing(temp.path()),
+            crate::view::color_support::ColorCapability::TrueColor,
+            filesystem.clone(),
+        )
+        .unwrap();
+        let terminal = ratatui::layout::Rect::new(10, 5, 50, 16);
+        let popup = ratatui::layout::Rect::new(25, 8, 20, 6);
+        let window = editor.active_window_mut();
+        let buffer_id = window.create_terminal_buffer_detached(TerminalId(0));
+        let split_id = fresh_core::LeafId(fresh_core::SplitId(0));
+        window.chrome_layout.last_frame.width = 80;
+        window.chrome_layout.last_frame.height = 24;
+        window.layout_cache.split_areas = vec![(
+            split_id,
+            buffer_id,
+            terminal,
+            ratatui::layout::Rect::default(),
+            0,
+            0,
+        )];
+        window.prompt = Some(Prompt::new(String::new(), PromptType::OpenFile));
+        window.file_open_state = Some(FileOpenState::new(
+            temp.path().to_path_buf(),
+            false,
+            filesystem,
+        ));
+        window.file_browser_layout = Some(FileBrowserLayout {
+            popup_area: popup,
+            nav_area: ratatui::layout::Rect::default(),
+            header_area: ratatui::layout::Rect::default(),
+            list_area: ratatui::layout::Rect::default(),
+            scrollbar_area: ratatui::layout::Rect::default(),
+            thumb_start: 0,
+            thumb_end: 0,
+            visible_rows: 0,
+            content_width: 0,
+            toggle_spans: Vec::new(),
+            shortcut_spans: Vec::new(),
+            column_spans: Vec::new(),
+        });
+
+        let rects: Vec<_> = editor.smarty_fresh_live_terminal_rects().collect();
+        assert!(!rects.is_empty());
+        assert!(rects.iter().all(|rect| {
+            rect.x + rect.width <= popup.x
+                || rect.x >= popup.x + popup.width
+                || rect.y + rect.height <= popup.y
+                || rect.y >= popup.y + popup.height
+        }));
+    }
+
+    #[test]
+    fn full_screen_modal_layers_exclude_ghostty_selection() {
+        use crate::app::overlay::LayerKind;
+
+        for layer in [
+            LayerKind::EventDebug,
+            LayerKind::Settings,
+            LayerKind::KeybindingEditor,
+            LayerKind::CalibrationWizard,
+            LayerKind::WorkspaceTrust,
+            LayerKind::FloatingModal,
+        ] {
+            assert!(layer_captures_ghostty_selection(layer));
+        }
+        assert!(!layer_captures_ghostty_selection(LayerKind::Dock));
+        assert!(!layer_captures_ghostty_selection(LayerKind::Editor));
     }
 }

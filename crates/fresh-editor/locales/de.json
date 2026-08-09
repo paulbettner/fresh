@@ -1555,6 +1555,7 @@
   "workspace.extract_no_file_path": "Extrahieren nicht möglich: Puffer hat keinen Dateipfad",
   "workspace.extract_terminal_dormant": "Extrahieren nicht möglich: Terminal hat keine aktive Sitzung",
   "workspace.extract_terminal_companion": "Extrahieren nicht möglich: OMP-Begleitterminals müssen in ihrem Arbeitsbereich bleiben",
+  "workspace.extract_terminal_script_capable": "Extrahieren nicht möglich: Terminals mit Skriptzugriff müssen in ihrem Arbeitsbereich bleiben",
   "workspace.extract_already_rooted": "Bereits in einem Arbeitsbereich mit Wurzel %{root}",
   "workspace.extracted_tab": "%{name} in Arbeitsbereich %{label} extrahiert",
   "whitespace.newline_added": "Abschließender Zeilenumbruch hinzugefügt",

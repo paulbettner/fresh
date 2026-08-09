@@ -53,16 +53,46 @@ pub enum ChannelError {
 
 /// Pending request state
 struct PendingRequest {
+    generation: u64,
     /// Channel for streaming data
     data_tx: mpsc::Sender<serde_json::Value>,
     /// Channel for final result
     result_tx: oneshot::Sender<Result<serde_json::Value, String>>,
 }
 
+/// One request admitted against an exact transport generation.
+struct OutboundMessage {
+    generation: u64,
+    id: u64,
+    json: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdmissionState {
+    connected: bool,
+    generation: u64,
+    replacing: bool,
+}
+
 /// Boxed async reader type used by the read task.
 type BoxedReader = Box<dyn AsyncBufRead + Unpin + Send>;
 /// Boxed async writer type used by the write task.
 type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+struct ReplacementReader {
+    reader: BoxedReader,
+    generation: u64,
+    installed: oneshot::Sender<()>,
+}
+
+/// Writer half of a transport hot-swap. The acknowledgement closes the gap
+/// where the reader could publish `connected` while requests still targeted
+/// the old writer.
+struct ReplacementWriter {
+    writer: BoxedWriter,
+    generation: u64,
+    installed: oneshot::Sender<()>,
+}
 
 /// Process-global source of stable per-channel ids. Lets the editor map an
 /// `AsyncMessage::RemoteReconnected` back to the window whose authority owns
@@ -81,8 +111,13 @@ pub struct AgentChannel {
     /// background reconnect reaches the app event-driven rather than by
     /// polling `is_connected()`.
     reconnect_notify: Arc<tokio::sync::Notify>,
+    /// Monotonic transport hot-swap generation. Consumers use it to ignore a
+    /// duplicate notification without confusing it with a later reconnect.
+    reconnect_generation: Arc<AtomicU64>,
     /// Sender to the write task
-    write_tx: mpsc::Sender<String>,
+    write_tx: mpsc::Sender<OutboundMessage>,
+    /// Admission fence pairing the connected check with the generation enqueue.
+    admission: Arc<tokio::sync::Mutex<AdmissionState>>,
     /// Pending requests awaiting responses
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     /// Next request ID
@@ -96,9 +131,9 @@ pub struct AgentChannel {
     /// Timeout for individual requests (stored as milliseconds for atomic access)
     request_timeout_ms: AtomicU64,
     /// Sender to deliver a new reader to the read task after reconnection
-    new_reader_tx: mpsc::Sender<BoxedReader>,
+    new_reader_tx: mpsc::Sender<ReplacementReader>,
     /// Sender to deliver a new writer to the write task after reconnection
-    new_writer_tx: mpsc::Sender<BoxedWriter>,
+    new_writer_tx: mpsc::Sender<ReplacementWriter>,
 }
 
 impl AgentChannel {
@@ -139,39 +174,50 @@ impl AgentChannel {
         let pending: Arc<Mutex<HashMap<u64, PendingRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::new(tokio::sync::Mutex::new(AdmissionState {
+            connected: true,
+            generation: 0,
+            replacing: false,
+        }));
+        let reconnect_notify = Arc::new(tokio::sync::Notify::new());
+        let reconnect_generation = Arc::new(AtomicU64::new(0));
         let runtime_handle = tokio::runtime::Handle::current();
 
         // Channel for outgoing requests (lives for the lifetime of the AgentChannel)
-        let (write_tx, write_rx) = mpsc::channel::<String>(64);
+        let (write_tx, write_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Channels for delivering replacement transports on reconnection.
         // Capacity 1: at most one pending reconnection at a time.
-        let (new_reader_tx, new_reader_rx) = mpsc::channel::<BoxedReader>(1);
-        let (new_writer_tx, new_writer_rx) = mpsc::channel::<BoxedWriter>(1);
+        let (new_reader_tx, new_reader_rx) = mpsc::channel::<ReplacementReader>(1);
+        let (new_writer_tx, new_writer_rx) = mpsc::channel::<ReplacementWriter>(1);
 
         // Spawn write task (lives for the lifetime of the AgentChannel)
-        let connected_write = connected.clone();
         tokio::spawn(Self::write_task(
             Box::new(writer),
             write_rx,
             new_writer_rx,
-            connected_write,
+            Arc::clone(&pending),
+            Arc::clone(&connected),
+            Arc::clone(&admission),
         ));
 
         // Spawn read task (lives for the lifetime of the AgentChannel)
-        let pending_read = pending.clone();
-        let connected_read = connected.clone();
         tokio::spawn(Self::read_task(
             Box::new(reader),
             new_reader_rx,
-            pending_read,
-            connected_read,
+            Arc::clone(&pending),
+            Arc::clone(&connected),
+            Arc::clone(&admission),
+            Arc::clone(&reconnect_generation),
+            Arc::clone(&reconnect_notify),
         ));
 
         Self {
             id: NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed),
-            reconnect_notify: Arc::new(tokio::sync::Notify::new()),
+            reconnect_notify,
+            reconnect_generation,
             write_tx,
+            admission,
             pending,
             next_id: AtomicU64::new(1),
             connected,
@@ -183,69 +229,187 @@ impl AgentChannel {
         }
     }
 
-    /// Long-lived write task. Reads outgoing messages from `write_rx` and
-    /// writes them to the current transport. On transport error or when a new
-    /// transport arrives via `new_writer_rx`, switches to the new writer.
+    /// Mark one exact transport generation disconnected. A delayed timeout or
+    /// EOF from an older transport must not tear down its replacement.
+    async fn mark_disconnected(
+        admission: &Arc<tokio::sync::Mutex<AdmissionState>>,
+        connected: &Arc<std::sync::atomic::AtomicBool>,
+        generation: u64,
+    ) {
+        let mut state = admission.lock().await;
+        if state.generation == generation {
+            state.connected = false;
+            connected.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn fail_outbound(
+        pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>,
+        message: &OutboundMessage,
+    ) {
+        let request = {
+            let mut pending = pending.lock().unwrap();
+            match pending.get(&message.id) {
+                Some(request) if request.generation == message.generation => {
+                    pending.remove(&message.id)
+                }
+                _ => None,
+            }
+        };
+        if let Some(request) = request {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = request.result_tx.send(Err(
+                "connection replaced before request was sent".to_string()
+            ));
+        }
+    }
+
+    fn install_replacement_writer(
+        writer: &mut BoxedWriter,
+        writer_generation: &mut u64,
+        replacement: ReplacementWriter,
+        write_rx: &mut mpsc::Receiver<OutboundMessage>,
+        pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    ) {
+        *writer = replacement.writer;
+        *writer_generation = replacement.generation;
+
+        // Request admission is fenced while replacement is in progress, so
+        // every message already queued here belongs to the retired writer.
+        // Purge them before acknowledging installation: otherwise a caller can
+        // receive "connection closed" and still mutate the replacement tenant.
+        while let Ok(stale) = write_rx.try_recv() {
+            debug_assert_ne!(stale.generation, *writer_generation);
+            Self::fail_outbound(pending, &stale);
+        }
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = replacement.installed.send(());
+    }
+
+    /// Long-lived write task. Every queued request is tagged with the transport
+    /// generation captured by the admission fence; stale generations are never
+    /// written to a replacement transport.
     async fn write_task(
         mut writer: BoxedWriter,
-        mut write_rx: mpsc::Receiver<String>,
-        mut new_writer_rx: mpsc::Receiver<BoxedWriter>,
+        mut write_rx: mpsc::Receiver<OutboundMessage>,
+        mut new_writer_rx: mpsc::Receiver<ReplacementWriter>,
+        pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
         connected: Arc<std::sync::atomic::AtomicBool>,
+        admission: Arc<tokio::sync::Mutex<AdmissionState>>,
     ) {
+        let mut writer_generation = 0;
         loop {
             tokio::select! {
-                // Normal path: send outgoing message
-                msg = write_rx.recv() => {
-                    let Some(msg) = msg else { break }; // AgentChannel dropped
-
-                    let write_ok = writer.write_all(msg.as_bytes()).await.is_ok()
-                        && writer.flush().await.is_ok();
-
-                    if !write_ok {
-                        connected.store(false, Ordering::SeqCst);
-                        // Wait for replacement (can't select here, just block)
-                        match new_writer_rx.recv().await {
-                            Some(new_writer) => { writer = new_writer; continue; }
-                            None => break,
-                        }
+                biased;
+                replacement = new_writer_rx.recv() => {
+                    match replacement {
+                        Some(replacement) => Self::install_replacement_writer(
+                            &mut writer,
+                            &mut writer_generation,
+                            replacement,
+                            &mut write_rx,
+                            &pending,
+                        ),
+                        None => break,
                     }
                 }
-                // Reconnection: new transport arrived, switch immediately
-                new_writer = new_writer_rx.recv() => {
-                    match new_writer {
-                        Some(w) => { writer = w; }
-                        None => break, // AgentChannel dropped
+                message = write_rx.recv() => {
+                    let Some(message) = message else { break };
+                    if message.generation != writer_generation {
+                        Self::fail_outbound(&pending, &message);
+                        continue;
+                    }
+
+                    let write_ok = writer.write_all(message.json.as_bytes()).await.is_ok()
+                        && writer.flush().await.is_ok();
+                    if !write_ok {
+                        Self::mark_disconnected(&admission, &connected, writer_generation).await;
+                        match new_writer_rx.recv().await {
+                            Some(replacement) => Self::install_replacement_writer(
+                                &mut writer,
+                                &mut writer_generation,
+                                replacement,
+                                &mut write_rx,
+                                &pending,
+                            ),
+                            None => break,
+                        }
                     }
                 }
             }
         }
     }
 
+    async fn install_replacement_reader(
+        reader: &mut BoxedReader,
+        replacement: ReplacementReader,
+        pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>,
+        connected: &Arc<std::sync::atomic::AtomicBool>,
+        admission: &Arc<tokio::sync::Mutex<AdmissionState>>,
+        reconnect_generation: &Arc<AtomicU64>,
+        reconnect_notify: &Arc<tokio::sync::Notify>,
+    ) {
+        Self::drain_pending(pending);
+        *reader = replacement.reader;
+        let generation = replacement.generation;
+        let published = {
+            let mut state = admission.lock().await;
+            if state.replacing && state.generation == generation {
+                state.connected = true;
+                state.replacing = false;
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            reconnect_generation.store(generation, Ordering::SeqCst);
+            connected.store(true, Ordering::SeqCst);
+            reconnect_notify.notify_one();
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = replacement.installed.send(());
+        }
+    }
+
     /// Long-lived read task. Reads responses from the current transport and
-    /// dispatches them to pending requests. On transport error or when a new
-    /// transport arrives, cleans up pending requests and switches readers.
+    /// publishes a replacement only after its writer half is installed.
     async fn read_task(
         mut reader: BoxedReader,
-        mut new_reader_rx: mpsc::Receiver<BoxedReader>,
+        mut new_reader_rx: mpsc::Receiver<ReplacementReader>,
         pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
         connected: Arc<std::sync::atomic::AtomicBool>,
+        admission: Arc<tokio::sync::Mutex<AdmissionState>>,
+        reconnect_generation: Arc<AtomicU64>,
+        reconnect_notify: Arc<tokio::sync::Notify>,
     ) {
+        let mut reader_generation = 0;
         let mut line = String::new();
 
         loop {
             line.clear();
-
             tokio::select! {
                 read_result = reader.read_line(&mut line) => {
                     match read_result {
                         Ok(0) | Err(_) => {
-                            // EOF or error — transport is dead
-                            connected.store(false, Ordering::SeqCst);
+                            Self::mark_disconnected(
+                                &admission,
+                                &connected,
+                                reader_generation,
+                            ).await;
                             Self::drain_pending(&pending);
-
-                            // Wait for replacement reader
                             match new_reader_rx.recv().await {
-                                Some(new_reader) => { reader = new_reader; continue; }
+                                Some(replacement) => {
+                                    reader_generation = replacement.generation;
+                                    Self::install_replacement_reader(
+                                        &mut reader,
+                                        replacement,
+                                        &pending,
+                                        &connected,
+                                        &admission,
+                                        &reconnect_generation,
+                                        &reconnect_notify,
+                                    ).await;
+                                }
                                 None => break,
                             }
                         }
@@ -256,19 +420,21 @@ impl AgentChannel {
                         }
                     }
                 }
-                // Reconnection: new transport arrived, switch immediately.
-                // Drain pending requests from the old connection first —
-                // they were sent to the old agent and won't get responses
-                // on the new one. Then mark connected so new requests can
-                // be submitted.
-                new_reader = new_reader_rx.recv() => {
-                    match new_reader {
-                        Some(r) => {
-                            Self::drain_pending(&pending);
-                            reader = r;
-                            connected.store(true, Ordering::SeqCst);
+                replacement = new_reader_rx.recv() => {
+                    match replacement {
+                        Some(replacement) => {
+                            reader_generation = replacement.generation;
+                            Self::install_replacement_reader(
+                                &mut reader,
+                                replacement,
+                                &pending,
+                                &connected,
+                                &admission,
+                                &reconnect_generation,
+                                &reconnect_notify,
+                            ).await;
                         }
-                        None => break, // AgentChannel dropped
+                        None => break,
                     }
                 }
             }
@@ -350,44 +516,58 @@ impl AgentChannel {
 
     /// Replace the underlying transport with a new reader/writer pair.
     ///
-    /// This is used for reconnection: after establishing a new SSH connection,
-    /// call this method to feed the new stdin/stdout to the existing read/write
-    /// tasks. The tasks will resume processing and `is_connected()` will return
-    /// `true` once the first successful read/write completes.
-    ///
-    /// The `connected` flag is set to `true` by the read task after it has
-    /// received the new reader and drained stale pending requests. This
-    /// ensures no race between draining and new request submission.
+    /// Request admission is closed and advanced to a new generation before
+    /// either half is handed off. The writer installs first, purges every
+    /// queued old-generation request, and acknowledges; only then may the
+    /// reader publish the generation as connected.
     pub async fn replace_transport<R, W>(&self, reader: R, writer: W)
     where
         R: AsyncBufRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        // Send new transports to the tasks. Order matters: send writer first
-        // so the write task is ready before the read task marks connected
-        // (which allows new requests to flow).
-        // Send can only fail if the task exited (AgentChannel dropped).
-        if self.new_writer_tx.send(Box::new(writer)).await.is_err() {
-            warn!("replace_transport: write task is gone, cannot reconnect");
+        let generation = {
+            let mut state = self.admission.lock().await;
+            if state.replacing {
+                warn!("replace_transport: replacement already in progress");
+                return;
+            }
+            state.connected = false;
+            state.replacing = true;
+            state.generation = state.generation.saturating_add(1);
+            self.connected.store(false, Ordering::SeqCst);
+            state.generation
+        };
+
+        let (writer_installed_tx, writer_installed_rx) = oneshot::channel();
+        let replacement = ReplacementWriter {
+            writer: Box::new(writer),
+            generation,
+            installed: writer_installed_tx,
+        };
+        if self.new_writer_tx.send(replacement).await.is_err() || writer_installed_rx.await.is_err()
+        {
+            warn!("replace_transport: write task could not install replacement");
+            let mut state = self.admission.lock().await;
+            if state.generation == generation {
+                state.replacing = false;
+            }
             return;
         }
-        if self.new_reader_tx.send(Box::new(reader)).await.is_err() {
-            warn!("replace_transport: read task is gone, cannot reconnect");
+
+        let (reader_installed_tx, reader_installed_rx) = oneshot::channel();
+        let replacement = ReplacementReader {
+            reader: Box::new(reader),
+            generation,
+            installed: reader_installed_tx,
+        };
+        if self.new_reader_tx.send(replacement).await.is_err() || reader_installed_rx.await.is_err()
+        {
+            warn!("replace_transport: read task could not publish replacement");
+            let mut state = self.admission.lock().await;
+            if state.generation == generation {
+                state.replacing = false;
+            }
         }
-        // The carrier was just hot-swapped back in: wake anyone watching for a
-        // reconnect (the editor's forwarder → `AsyncMessage::RemoteReconnected`,
-        // which respawns embedded terminals that died with the old carrier).
-        // Fired here rather than when `connected` flips true because the
-        // terminal respawn opens its own fresh carrier and doesn't depend on
-        // the agent channel's drain completing.
-        //
-        // `notify_one` (not `notify_waiters`) so a swap that lands in the gap
-        // between the forwarder's send and its next `notified()` still stores a
-        // permit and is delivered — reconnect events can't be dropped. Multiple
-        // swaps coalesce to one permit, which is fine: reattach is idempotent.
-        self.reconnect_notify.notify_one();
-        // Note: connected is set to true by the read task after it drains
-        // stale pending requests and switches to the new reader.
     }
 
     /// Stable identity for this channel (see the `id` field).
@@ -399,6 +579,17 @@ impl AgentChannel {
     /// editor awaits it to drive event-driven reconnect handling.
     pub fn reconnect_notify(&self) -> Arc<tokio::sync::Notify> {
         self.reconnect_notify.clone()
+    }
+
+    /// Current transport hot-swap generation.
+    pub fn reconnect_generation(&self) -> u64 {
+        self.reconnect_generation.load(Ordering::SeqCst)
+    }
+
+    /// Shared generation counter for the editor's reconnect forwarder. This
+    /// does not retain the channel or filesystem after a window closes.
+    pub fn reconnect_generation_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.reconnect_generation)
     }
 
     /// Replace the underlying transport (blocking version for non-async contexts).
@@ -413,12 +604,9 @@ impl AgentChannel {
     {
         self.block_on_request(self.replace_transport(reader, writer));
 
-        // Yield until the read task has processed the new reader.
-        // This is typically immediate since the channel send above wakes
-        // the read task's select!, which drains pending and sets connected.
-        while !self.is_connected() {
-            std::thread::yield_now();
-        }
+        // `replace_transport` returns only after the read task has published
+        // the replacement generation as connected.
+        debug_assert!(self.is_connected());
     }
 
     /// Set the request timeout duration.
@@ -442,11 +630,10 @@ impl AgentChannel {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ChannelError> {
-        let (mut data_rx, result_rx) = self.request_streaming(method, params).await?;
-
+        let (generation, mut data_rx, result_rx) =
+            self.request_streaming_in_generation(method, params).await?;
         let timeout = self.request_timeout();
 
-        // Drain streaming data and wait for final result, with timeout.
         let result = tokio::time::timeout(timeout, async {
             while data_rx.recv().await.is_some() {}
             result_rx
@@ -460,13 +647,61 @@ impl AgentChannel {
             Ok(inner) => inner,
             Err(_elapsed) => {
                 warn!("request '{}' timed out after {:?}", method, timeout);
-                self.connected.store(false, Ordering::SeqCst);
+                Self::mark_disconnected(&self.admission, &self.connected, generation).await;
                 Err(ChannelError::Timeout)
             }
         }
     }
 
-    /// Send a request that may stream data
+    async fn request_streaming_in_generation(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<
+        (
+            u64,
+            mpsc::Receiver<serde_json::Value>,
+            oneshot::Receiver<Result<serde_json::Value, String>>,
+        ),
+        ChannelError,
+    > {
+        // Reserve queue capacity before taking the admission fence. Holding
+        // the fence while awaiting a full queue would deadlock reconnect: the
+        // failed writer waits for a replacement that cannot advance admission.
+        let permit = self
+            .write_tx
+            .reserve()
+            .await
+            .map_err(|_| ChannelError::ChannelClosed)?;
+        let admission = self.admission.lock().await;
+        if !admission.connected {
+            return Err(ChannelError::ChannelClosed);
+        }
+        let generation = admission.generation;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (data_tx, data_rx) = mpsc::channel(self.data_channel_capacity);
+        let (result_tx, result_rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(
+            id,
+            PendingRequest {
+                generation,
+                data_tx,
+                result_tx,
+            },
+        );
+
+        let request = AgentRequest::new(id, method, params);
+        let message = OutboundMessage {
+            generation,
+            id,
+            json: request.to_json_line(),
+        };
+        permit.send(message);
+        drop(admission);
+        Ok((generation, data_rx, result_rx))
+    }
+
+    /// Send a request that may stream data.
     pub async fn request_streaming(
         &self,
         method: &str,
@@ -478,29 +713,7 @@ impl AgentChannel {
         ),
         ChannelError,
     > {
-        if !self.is_connected() {
-            return Err(ChannelError::ChannelClosed);
-        }
-
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        // Create channels for response
-        let (data_tx, data_rx) = mpsc::channel(self.data_channel_capacity);
-        let (result_tx, result_rx) = oneshot::channel();
-
-        // Register pending request
-        {
-            let mut pending = self.pending.lock().unwrap();
-            pending.insert(id, PendingRequest { data_tx, result_tx });
-        }
-
-        // Build and send request
-        let req = AgentRequest::new(id, method, params);
-        self.write_tx
-            .send(req.to_json_line())
-            .await
-            .map_err(|_| ChannelError::ChannelClosed)?;
-
+        let (_, data_rx, result_rx) = self.request_streaming_in_generation(method, params).await?;
         Ok((data_rx, result_rx))
     }
 
@@ -552,7 +765,8 @@ impl AgentChannel {
         method: &str,
         params: serde_json::Value,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value), ChannelError> {
-        let (mut data_rx, result_rx) = self.request_streaming(method, params).await?;
+        let (generation, mut data_rx, result_rx) =
+            self.request_streaming_in_generation(method, params).await?;
 
         // Idle deadline, reset on every chunk — NOT a cap on total transfer
         // time. A large file streaming over a slow link (e.g. a bandwidth-
@@ -580,7 +794,7 @@ impl AgentChannel {
                 Ok(None) => break, // stream closed: all data received
                 Err(_elapsed) => {
                     warn!("streaming request stalled: no data for {:?}", idle_timeout);
-                    self.connected.store(false, Ordering::SeqCst);
+                    Self::mark_disconnected(&self.admission, &self.connected, generation).await;
                     return Err(ChannelError::Timeout);
                 }
             }
@@ -601,7 +815,7 @@ impl AgentChannel {
                     "streaming request stalled awaiting result after {:?}",
                     idle_timeout
                 );
-                self.connected.store(false, Ordering::SeqCst);
+                Self::mark_disconnected(&self.admission, &self.connected, generation).await;
                 Err(ChannelError::Timeout)
             }
         }
@@ -653,5 +867,212 @@ impl AgentChannel {
 
 #[cfg(test)]
 mod tests {
-    // Tests are in the tests module to allow integration testing with mock agent
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, BufReader, DuplexStream};
+
+    struct GateWriter {
+        inner: DuplexStream,
+        dropped: Arc<AtomicBool>,
+        write_started: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+        released: bool,
+    }
+
+    impl Drop for GateWriter {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncWrite for GateWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if let Some(write_started) = this.write_started.take() {
+                let _ = write_started.send(());
+            }
+            if !this.released {
+                match Pin::new(&mut this.release).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => this.released = true,
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "writer-install gate dropped",
+                        )));
+                    }
+                }
+            }
+            Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    struct CaptureWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for CaptureWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_waiting_reader_installs_writer_before_publishing_reconnect() {
+        let (initial_reader, initial_reader_peer) = duplex(64);
+        let (initial_writer, _initial_writer_peer) = duplex(64);
+        let old_writer_dropped = Arc::new(AtomicBool::new(false));
+        let (write_started_tx, write_started_rx) = oneshot::channel();
+        let (release_writer_tx, release_writer_rx) = oneshot::channel();
+        let channel = AgentChannel::from_transport(
+            BufReader::new(initial_reader),
+            GateWriter {
+                inner: initial_writer,
+                dropped: Arc::clone(&old_writer_dropped),
+                write_started: Some(write_started_tx),
+                release: release_writer_rx,
+                released: false,
+            },
+            4,
+        );
+
+        let _request = channel
+            .request_streaming("test", serde_json::json!({}))
+            .await
+            .expect("initial request must reach the old writer");
+        write_started_rx
+            .await
+            .expect("old writer must block inside its write");
+        drop(initial_reader_peer);
+        while channel.is_connected() {
+            tokio::task::yield_now().await;
+        }
+
+        let notify = channel.reconnect_notify();
+        let notification = notify.notified();
+        tokio::pin!(notification);
+        let (replacement_reader, _replacement_reader_peer) = duplex(64);
+        let (replacement_writer, _replacement_writer_peer) = duplex(64);
+        let mut replacement = std::pin::pin!(
+            channel.replace_transport(BufReader::new(replacement_reader), replacement_writer,)
+        );
+        std::future::poll_fn(|cx| match replacement.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(()) => panic!("reconnect must wait for the writer-install gate"),
+        })
+        .await;
+
+        assert_eq!(channel.reconnect_generation(), 0);
+        std::future::poll_fn(|cx| match notification.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(()) => {
+                panic!("reconnect notification published before writer installation")
+            }
+        })
+        .await;
+
+        release_writer_tx
+            .send(())
+            .expect("writer-install gate must still be closed");
+        replacement.await;
+        notification.await;
+
+        assert!(old_writer_dropped.load(Ordering::SeqCst));
+        assert_eq!(channel.reconnect_generation(), 1);
+        assert!(channel.is_connected());
+        let second_notification = notify.notified();
+        tokio::pin!(second_notification);
+        std::future::poll_fn(|cx| match second_notification.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(()) => panic!("reconnect published more than one notification"),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn queued_old_generation_request_is_not_written_after_replacement() {
+        let (initial_reader, initial_reader_peer) = duplex(64);
+        let (initial_writer, _initial_writer_peer) = duplex(1024);
+        let (write_started_tx, write_started_rx) = oneshot::channel();
+        let (release_writer_tx, release_writer_rx) = oneshot::channel();
+        let channel = AgentChannel::from_transport(
+            BufReader::new(initial_reader),
+            GateWriter {
+                inner: initial_writer,
+                dropped: Arc::new(AtomicBool::new(false)),
+                write_started: Some(write_started_tx),
+                release: release_writer_rx,
+                released: false,
+            },
+            4,
+        );
+
+        let _in_flight = channel
+            .request_streaming("write", serde_json::json!({"path": "/old"}))
+            .await
+            .expect("first request reaches old writer");
+        write_started_rx.await.expect("old writer is blocked");
+        let _queued = channel
+            .request_streaming("rm", serde_json::json!({"path": "/must-not-run"}))
+            .await
+            .expect("second old-generation request is queued");
+
+        drop(initial_reader_peer);
+        while channel.is_connected() {
+            tokio::task::yield_now().await;
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (replacement_reader, _replacement_reader_peer) = duplex(64);
+        let replacement = channel.replace_transport(
+            BufReader::new(replacement_reader),
+            CaptureWriter {
+                bytes: Arc::clone(&captured),
+            },
+        );
+        tokio::pin!(replacement);
+        std::future::poll_fn(|cx| match replacement.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(()) => panic!("replacement must wait for the blocked old writer"),
+        })
+        .await;
+        release_writer_tx.send(()).expect("release old writer");
+        replacement.await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "queued old-generation mutation must be purged before replacement publication"
+        );
+    }
 }

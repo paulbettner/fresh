@@ -104,6 +104,7 @@ mod window_actions;
 pub mod window_resources;
 pub mod workspace;
 
+pub(crate) use async_dispatch::TerminalOutputHookDelivery;
 pub(crate) use omp_companion::OmpCompanionHookDelivery;
 
 use anyhow::Result as AnyhowResult;
@@ -407,6 +408,31 @@ pub(crate) const PLUGIN_COMMAND_HANDLER_LIMIT: std::time::Duration =
 pub(crate) const PLUGIN_COMMAND_HANDLER_HARD_LIMIT: std::time::Duration =
     std::time::Duration::from_millis(500);
 
+pub(crate) struct ClosingWindowExitBarrier {
+    pub(crate) terminal_ids: std::collections::HashSet<crate::services::terminal::TerminalId>,
+    pub(crate) bridge: crate::services::async_bridge::AsyncBridge,
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) stable_id: String,
+    pub(crate) invocation: fresh_core::api::PluginInvocation,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteAttachOwner {
+    Plugin {
+        plugin_instance_id: fresh_core::api::PluginInstanceId,
+        request_id: u64,
+        window_id: fresh_core::WindowId,
+    },
+    Reconnect {
+        window_id: fresh_core::WindowId,
+    },
+    /// Switch Project on a live remote window. It shares the window's single
+    /// attempt slot with reconnect, but installs a blank replacement session
+    /// instead of inheriting the previous tenant's buffers or terminals.
+    Switch {
+        window_id: fresh_core::WindowId,
+    },
+}
+
 /// The main editor struct - manages multiple buffers, clipboard, and rendering
 pub struct Editor {
     // Buffers moved onto `Window` (Step 0c). Each window owns its
@@ -599,6 +625,9 @@ pub struct Editor {
     /// changing and the hook stops re-firing. `None` until the first
     /// relayout.
     last_layout_signature: Option<(u16, u16, u16, u16)>,
+    /// Changes whenever authoritative screen geometry is re-derived, so a
+    /// multi-click sequence cannot promote across a relayout.
+    mouse_layout_generation: u64,
 
     // LSP manager moved onto `Window`. Access via
     // `Editor::lsp()` / `lsp_mut()` — each window has its own
@@ -616,13 +645,30 @@ pub struct Editor {
     /// Bridge for async messages from tokio tasks to main loop
     async_bridge: Option<AsyncBridge>,
 
-    /// Connection ids (`AgentChannel::id`) for which a reconnect-forwarder task
-    /// has already been spawned. The forwarder awaits each channel's
-    /// `reconnect_notify` and turns a hot-swap into an
-    /// `AsyncMessage::RemoteReconnected`, so reconnect handling is event-driven
-    /// rather than polled. `ensure_remote_reconnect_forwarders` registers one
-    /// lazily per remote window; this set makes that idempotent.
-    remote_reconnect_forwarders: std::collections::HashSet<u64>,
+    /// Reconnect-forwarder task owned by each live remote channel id. Keeping
+    /// the `JoinHandle` (rather than only an id marker) lets authority
+    /// replacement and window close abort the exact waiter instead of leaking
+    /// a task parked forever on the retired channel's `Notify`.
+    remote_reconnect_forwarders: HashMap<u64, tokio::task::JoinHandle<()>>,
+
+    /// Last transport generation handled for each remote channel. Prevents a
+    /// coalesced/duplicate notify from treating newly respawned PTYs as stale,
+    /// and lets terminal-exit handling recognize a published hot-swap before
+    /// its corresponding bridge event is dispatched.
+    remote_reconnect_generations: HashMap<u64, u64>,
+
+    /// Old live PTY identities observed by a reconnect event before their exit
+    /// barrier completed. Their bindings stay intact and are respawned when the
+    /// corresponding concrete `TerminalExited` message arrives.
+    pending_remote_reattach: HashMap<
+        fresh_core::WindowId,
+        std::collections::HashSet<crate::services::terminal::TerminalId>,
+    >,
+
+    /// Exact terminal identities explicitly stopped or closed by the user.
+    /// Their eventual exit must finalize permanently even if a remote
+    /// reconnect generation is concurrently pending.
+    terminal_stop_tombstones: std::collections::HashSet<fresh_core::WindowTerminalId>,
 
     /// Last-seen remote-connection state per window, so a per-tick poll can
     /// force a re-render when a link drops or comes back. The background
@@ -712,13 +758,7 @@ pub struct Editor {
     /// [`Editor::install_authority_with_keepalive`].
     pending_keepalive: Option<Box<dyn std::any::Any + Send>>,
 
-    /// Plugin-supplied override for the Remote Indicator. Takes
-    /// precedence over the authority-derived state at render time.
-    /// Cleared on editor restart (plugins must reassert the state
-    /// after `setAuthority`). See
-    /// `PluginCommand::SetRemoteIndicatorState`.
-    pub remote_indicator_override: Option<crate::view::ui::status_bar::RemoteIndicatorOverride>,
-
+    // Remote Indicator overrides live on their owning Window.
     /// Local filesystem for editor-internal files (log files, status
     /// log). Stays separate from `authority` because these are the
     /// editor's own private state — they live on the host disk
@@ -761,6 +801,17 @@ pub struct Editor {
     /// "base") until the orchestrator adds more.
     pub(crate) windows: HashMap<fresh_core::WindowId, crate::app::window::Window>,
 
+    /// Windows removed from the UI whose PTYs are still reporting concrete
+    /// exits. The retained bridge keeps receiving those exits after the
+    /// `Window` and its other per-window state are gone.
+    pub(crate) closing_windows: HashMap<fresh_core::WindowId, ClosingWindowExitBarrier>,
+    /// Checkpoint/history/log artifacts for explicitly closed terminals.
+    /// Cleanup waits for the concrete post-reader-drain exit, then verifies
+    /// the recorded history/log lengths still match before retaining the
+    /// checkpoint and deleting recovery sources.
+    pub(crate) pending_terminal_artifact_cleanup:
+        HashMap<fresh_core::WindowTerminalId, buffer_close::TerminalArtifactCleanup>,
+
     /// Connection keepalives for born-attached remote windows, keyed by
     /// `WindowId`. A remote (Kubernetes / SSH / …) window's carrier process +
     /// reconnect/heartbeat tasks + dedicated runtime live in this opaque
@@ -770,23 +821,24 @@ pub struct Editor {
     /// process-level keepalive the restart-based attach parks.
     pub(crate) session_keepalives: HashMap<fresh_core::WindowId, Box<dyn std::any::Any + Send>>,
 
-    /// Request ids of `attachRemoteAgent` connects currently in flight (added
-    /// when the connect is spawned, removed when it settles). Lets a plugin
-    /// cancel a pending connect (the New-Session dialog's Cancel).
-    pub(crate) remote_attach_inflight: std::collections::HashSet<u64>,
-    /// Request ids of in-flight attaches the plugin asked to cancel. When the
-    /// connect later resolves, the result (authority + carrier keepalive) is
-    /// dropped instead of installed — so no window is created and the carrier
-    /// is torn down — and a failure is ignored.
-    pub(crate) remote_attach_cancelled: std::collections::HashSet<u64>,
-    /// Cancellation senders for the background connect threads, keyed by
-    /// request id. The connect runs on a detached thread (so the carrier's
-    /// runtime outlives it); signalling here makes that thread's `select!` drop
-    /// the in-flight connect future, which drops the ssh child (spawned
-    /// kill-on-drop) — so even a hung handshake leaves no orphaned process. The
-    /// thread then finishes and its result is discarded. Cleared on settle.
-    pub(crate) remote_attach_cancels:
-        std::collections::HashMap<u64, tokio::sync::oneshot::Sender<()>>,
+    /// Monotonic host identity for remote connect attempts. Public callback ids
+    /// are plugin-local and reconnects have no callback at all, so neither can
+    /// safely identify an async completion by itself.
+    pub(crate) next_remote_attach_attempt: u64,
+    /// Live attempts keyed by the host identity carried by async completions.
+    /// Removing an entry is the cancellation/staleness fence: a late result is
+    /// dropped without installing its authority.
+    pub(crate) remote_attach_attempts: HashMap<u64, RemoteAttachOwner>,
+    /// Exact plugin-owned request → host attempt. Two plugin instances may use
+    /// the same callback id without cancelling or settling each other.
+    pub(crate) remote_attach_plugin_requests:
+        HashMap<(fresh_core::api::PluginInstanceId, u64), u64>,
+    /// Current reconnect attempt per window. Replacing/cancelling this entry
+    /// fences an older completion from resurrecting a closed or retried window.
+    pub(crate) remote_reconnect_attempts: HashMap<fresh_core::WindowId, u64>,
+    /// Cancellation senders keyed by host attempt id. Dropping an exact window
+    /// or plugin request aborts only its carrier, never unrelated connects.
+    pub(crate) remote_attach_cancels: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
 
     /// Id of the currently active session. Always `WindowId(1)` for
     /// now; multi-session support arrives in a follow-up commit.
@@ -874,6 +926,8 @@ pub struct Editor {
 
     /// Fair, latest-only delivery state for `omp_companion_snapshot`.
     omp_companion_delivery: OmpCompanionHookDelivery,
+    /// Fair, latest-only delivery state for the high-frequency `terminal_output` hook.
+    terminal_output_delivery: TerminalOutputHookDelivery,
 
     // `plugin_dev_workspaces` moved onto `Window` — keyed by `BufferId`,
     // and buffers are per-window, so the workspace map follows.
@@ -904,16 +958,14 @@ pub struct Editor {
     // grouped_subtrees moved onto `Window` — each window owns its
     // own buffer-group subtrees (a window with a Live Grep panel
     // open doesn't share the panel state with sibling windows).
-    /// Background process abort handles for cancellation
-    /// Maps process_id to abort handle
-    background_process_handles: HashMap<u64, tokio::task::AbortHandle>,
+    /// Background process abort handles keyed by process id and paired with
+    /// the immutable window authority that spawned them.
+    background_process_handles: HashMap<u64, (fresh_core::WindowId, tokio::task::AbortHandle)>,
 
-    /// Cancellation senders for host-side processes spawned via
-    /// `spawnHostProcess`. Firing the sender (or dropping it) triggers
-    /// an in-task `child.start_kill()` so the process is reaped, not
-    /// just orphaned. Entries are removed when the spawn task sends
-    /// its terminal `PluginProcessOutput`.
-    host_process_handles: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
+    /// Cancellation senders for one-shot/host processes, paired with their
+    /// immutable owning window. Exact-window kill commands cannot terminate a
+    /// same-id process owned by another session.
+    host_process_handles: HashMap<u64, (fresh_core::WindowId, tokio::sync::oneshot::Sender<()>)>,
     /// FIFO queue of plugin `editor.getNextKey()` callbacks awaiting a
     /// keypress. While non-empty, the next key arriving in
     /// `handle_key` is consumed by resolving the front-most callback
@@ -971,7 +1023,7 @@ pub struct Editor {
     /// ahead of the plugin channel on the next tick so a burst is spread
     /// across frames without reordering.
     #[cfg(feature = "plugins")]
-    plugin_command_backlog: std::collections::VecDeque<fresh_core::api::PluginCommand>,
+    plugin_command_backlog: std::collections::VecDeque<fresh_core::api::PluginCommandEnvelope>,
 
     /// Cancellation flag for the in-flight `grepProject`, if any. A new
     /// request supersedes the old one rather than queueing behind it.
@@ -995,9 +1047,10 @@ pub struct Editor {
     #[cfg(feature = "plugins")]
     next_diff_baseline_id: u64,
 
-    /// Async messages the frame budget deferred, in arrival order. Drained
-    /// ahead of the bridges on the next tick.
-    async_message_backlog: std::collections::VecDeque<crate::services::async_bridge::AsyncMessage>,
+    /// Source-tagged async messages the frame budget deferred, in arrival
+    /// order. Drained ahead of the bridges on the next tick.
+    async_message_backlog:
+        std::collections::VecDeque<crate::services::async_bridge::AsyncMessageEnvelope>,
 
     /// Pending chord sequence for multi-key bindings (e.g., C-x C-s in Emacs)
     /// Stores the keys pressed so far in a chord sequence
@@ -1398,6 +1451,9 @@ pub(crate) struct FloatingWidgetState {
     pub scrollbar_mouse: crate::view::ui::scrollbar::ScrollbarMouse,
     /// `list_key` of the scrollbar currently being drag-scrolled.
     pub scrollbar_drag_key: Option<String>,
+    /// Exact outer rect painted on the last frame. Mouse ownership must use
+    /// this rather than reconstructing geometry from requested placement.
+    pub last_outer_rect: Option<ratatui::layout::Rect>,
     /// Inner rect (frame interior) of the last draw — used by the
     /// click hit-test to map terminal coords back to buffer coords.
     pub last_inner_rect: Option<ratatui::layout::Rect>,
@@ -1483,6 +1539,20 @@ pub(crate) struct FloatingWidgetState {
     /// included), so a click anywhere inside it is consumed rather than
     /// dismissing the modal. `None` when no pop-over is drawn.
     pub dropdown_popup_rect: Option<ratatui::layout::Rect>,
+}
+
+impl FloatingWidgetState {
+    fn clear_painted_geometry(&mut self) {
+        self.last_outer_rect = None;
+        self.last_inner_rect = None;
+        self.close_button_rect = None;
+        self.scrollbar_tracks.clear();
+        self.scrollbar_hover_zones.clear();
+        self.scrollbar_mouse.release();
+        self.scrollbar_drag_key = None;
+        self.dropdown_popup_hits.clear();
+        self.dropdown_popup_rect = None;
+    }
 }
 
 /// One option row of the open dropdown pop-over, captured at draw time as
@@ -1937,6 +2007,17 @@ fn parse_key_string(key_str: &str) -> Option<(KeyCode, KeyModifiers)> {
     Some((code, modifiers))
 }
 
+impl Drop for Editor {
+    fn drop(&mut self) {
+        for window in self.windows.values_mut() {
+            window.revoke_all_terminal_script_tokens();
+        }
+        for (_, forwarder) in self.remote_reconnect_forwarders.drain() {
+            forwarder.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2025,6 +2106,7 @@ mod tests {
             scrollbar_tracks: Vec::new(),
             scrollbar_mouse: Default::default(),
             scrollbar_drag_key: None,
+            last_outer_rect: None,
             last_inner_rect: None,
             scrollbar_hover_zones: Vec::new(),
             scrollbar_zone_hovered: false,
@@ -2090,6 +2172,37 @@ mod tests {
         editor.floating_widget_panel = Some(test_panel(PanelPlacement::Centered, true));
         // The centered modal resolves as Normal (not Dock).
         assert_eq!(editor.get_key_context(), KeyContext::Normal);
+    }
+
+    #[test]
+    fn dock_split_reports_only_the_effective_painted_column() {
+        let mut editor = default_test_editor();
+        editor.dock = Some(test_panel(
+            PanelPlacement::LeftDock { width_cols: 30 },
+            false,
+        ));
+
+        let narrow = ratatui::layout::Rect::new(0, 0, 40, 24);
+        assert_eq!(editor.compute_dock_split(narrow), (None, narrow));
+
+        let squeezed = ratatui::layout::Rect::new(0, 0, 45, 24);
+        let (dock, chrome) = editor.compute_dock_split(squeezed);
+        assert_eq!(dock, Some(ratatui::layout::Rect::new(0, 0, 25, 24)));
+        assert_eq!(chrome, ratatui::layout::Rect::new(25, 0, 20, 24));
+    }
+
+    #[test]
+    fn hidden_dock_drops_last_frame_hit_geometry() {
+        let mut dock = test_panel(PanelPlacement::LeftDock { width_cols: 30 }, false);
+        dock.last_outer_rect = Some(ratatui::layout::Rect::new(0, 0, 30, 24));
+        dock.last_inner_rect = Some(ratatui::layout::Rect::new(0, 0, 29, 24));
+        dock.dropdown_popup_rect = Some(ratatui::layout::Rect::new(2, 2, 10, 5));
+
+        dock.clear_painted_geometry();
+
+        assert!(dock.last_outer_rect.is_none());
+        assert!(dock.last_inner_rect.is_none());
+        assert!(dock.dropdown_popup_rect.is_none());
     }
 
     /// F3: hiding the left dock (Toggle Dock → unmount) must request a

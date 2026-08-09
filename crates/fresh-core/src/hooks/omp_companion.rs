@@ -11,6 +11,7 @@ pub struct OmpCompanionSnapshotV1 {
     pub incarnation: String,
     pub sequence: u64,
     pub session_generation: u64,
+    pub work_epoch: u64,
     pub timestamp_ms: u64,
     pub omp_version: String,
     pub process_id: u64,
@@ -193,6 +194,7 @@ mod tests {
             "incarnation": "550e8400-e29b-41d4-a716-446655440000",
             "sequence": 7,
             "sessionGeneration": 3,
+            "workEpoch": 9,
             "timestampMs": 1234,
             "ompVersion": "0.52.1",
             "processId": 42,
@@ -212,7 +214,6 @@ mod tests {
             window_id: 9,
             terminal_id: 4,
             received_at_ms: 5678,
-            launch_executable: "omp".to_string(),
             snapshot: sample_omp_companion_snapshot(),
         })
         .unwrap();
@@ -226,18 +227,11 @@ mod tests {
         outer_keys.sort_unstable();
         assert_eq!(
             outer_keys,
-            [
-                "launch_executable",
-                "received_at_ms",
-                "snapshot",
-                "terminal_id",
-                "window_id",
-            ]
+            ["received_at_ms", "snapshot", "terminal_id", "window_id"]
         );
         assert_eq!(json["window_id"], 9);
         assert_eq!(json["terminal_id"], 4);
         assert_eq!(json["received_at_ms"], 5678);
-        assert_eq!(json["launch_executable"], "omp");
 
         let snapshot = json["snapshot"].as_object().unwrap();
         let mut snapshot_keys: Vec<_> = snapshot.keys().map(String::as_str).collect();
@@ -258,9 +252,11 @@ mod tests {
                 "statusText",
                 "timestampMs",
                 "version",
+                "workEpoch",
             ]
         );
         assert_eq!(snapshot["sessionGeneration"], 3);
+        assert_eq!(snapshot["workEpoch"], 9);
         assert_eq!(snapshot["ompVersion"], "0.52.1");
         assert!(snapshot.get("session_generation").is_none());
         assert!(snapshot.get("sessionName").is_none());
@@ -268,10 +264,38 @@ mod tests {
 
     #[test]
     fn omp_companion_optional_fields_reject_explicit_null() {
-        for field in ["sessionName", "statusText"] {
+        for field in [
+            "sessionName",
+            "statusText",
+            "model",
+            "thinkingLevel",
+            "currentTool",
+            "goal",
+            "todos",
+            "context",
+            "asyncJobs",
+        ] {
             let mut snapshot = serde_json::to_value(sample_omp_companion_snapshot()).unwrap();
             snapshot[field] = serde_json::Value::Null;
-            assert!(serde_json::from_value::<OmpCompanionSnapshotV1>(snapshot).is_err());
+            assert!(
+                serde_json::from_value::<OmpCompanionSnapshotV1>(snapshot).is_err(),
+                "{field} must reject explicit null"
+            );
         }
+
+        let mut current_tool = serde_json::to_value(sample_omp_companion_snapshot()).unwrap();
+        current_tool["currentTool"] = serde_json::json!({ "name": "read", "intent": null });
+        assert!(serde_json::from_value::<OmpCompanionSnapshotV1>(current_tool).is_err());
+
+        let mut todos = serde_json::to_value(sample_omp_companion_snapshot()).unwrap();
+        todos["todos"] = serde_json::json!({
+            "pending": 1,
+            "inProgress": 1,
+            "blocked": 0,
+            "completed": 0,
+            "abandoned": 0,
+            "current": null
+        });
+        assert!(serde_json::from_value::<OmpCompanionSnapshotV1>(todos).is_err());
     }
 }

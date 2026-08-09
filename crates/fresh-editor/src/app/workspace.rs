@@ -9,22 +9,23 @@
 //!
 //! ## Workspace Save
 //!
-//! [`Editor::save_workspace`] calls [`Editor::sync_all_terminal_backing_files`] to ensure
-//! all terminal backing files contain complete state (scrollback + visible screen)
-//! before serializing workspace metadata.
+//! Interactive checkpoints capture immutable workspace/file-state data on the
+//! editor thread, then a per-window blocking worker coalesces generations,
+//! flushes terminal history, and durably publishes checkpoints plus metadata.
 //!
 //! ## Workspace Restore
 //!
-//! [`Editor::restore_terminal_from_workspace`] loads the backing file directly as a
-//! read-only buffer, skipping the expensive log replay. The user starts in scrollback
-//! mode viewing the last workspace state. A new PTY is spawned when they re-enter
-//! terminal mode.
+//! [`Editor::restore_terminal_from_workspace`] loads the checkpoint directly as a
+//! read-only buffer, skipping log replay. A replacement PTY continues only the separate
+//! rendered history file, so later output never truncates or rewrites a saved screen.
 //!
 //! Performance: O(1) ≈ 10ms (lazy load) vs O(n) ≈ 1000ms (log replay)
 
+use parking_lot::{Condvar, Mutex};
 use rust_i18n::t;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::Instant;
 
 use crate::state::EditorState;
@@ -43,6 +44,387 @@ use crate::workspace::{
 
 use super::bookmarks::{Bookmark, BookmarkState};
 use super::Editor;
+
+fn terminal_artifacts_equal(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut left = std::fs::File::open(left)?;
+    let mut right = std::fs::File::open(right)?;
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut left_buffer = [0u8; 64 * 1024];
+    let mut right_buffer = [0u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn terminal_artifact_identity<'a>(history: Option<&'a Path>, backing: &'a Path) -> &'a Path {
+    history.unwrap_or(backing)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedCheckpointTail {
+    MatchingPrefix,
+    Complete,
+    NewerHistory,
+}
+
+fn classify_saved_checkpoint_tail(tail: &[u8], checkpoint: &[u8]) -> SavedCheckpointTail {
+    if tail == checkpoint {
+        SavedCheckpointTail::Complete
+    } else if checkpoint.starts_with(tail) {
+        SavedCheckpointTail::MatchingPrefix
+    } else {
+        SavedCheckpointTail::NewerHistory
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct WorkspacePersistenceKey {
+    workspaces_dir: PathBuf,
+    working_dir: PathBuf,
+    stable_id: String,
+}
+
+struct TerminalCheckpointCapture {
+    history_path: PathBuf,
+    state: Arc<std::sync::Mutex<crate::services::terminal::TerminalState>>,
+}
+
+struct WorkspacePersistenceCapture {
+    key: WorkspacePersistenceKey,
+    dir_context: crate::config_io::DirectoryContext,
+    workspace: Workspace,
+    has_virtual_buffers: bool,
+    file_states: Vec<(PathBuf, SerializedFileState)>,
+    terminal_checkpoints: Vec<TerminalCheckpointCapture>,
+}
+
+struct ScheduledGeneration<T> {
+    generation: u64,
+    payload: T,
+}
+
+struct CoalescingGenerationState<T> {
+    next_generation: u64,
+    running: bool,
+    pending: Option<ScheduledGeneration<T>>,
+    completed_generation: u64,
+    last_error: Option<String>,
+}
+
+impl<T> Default for CoalescingGenerationState<T> {
+    fn default() -> Self {
+        Self {
+            next_generation: 0,
+            running: false,
+            pending: None,
+            completed_generation: 0,
+            last_error: None,
+        }
+    }
+}
+
+impl<T> CoalescingGenerationState<T> {
+    fn enqueue(&mut self, payload: T) -> (u64, bool) {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("workspace persistence generation exhausted");
+        let generation = self.next_generation;
+        self.pending = Some(ScheduledGeneration {
+            generation,
+            payload,
+        });
+        let start_worker = !self.running;
+        self.running = true;
+        (generation, start_worker)
+    }
+
+    fn take_pending(&mut self) -> Option<ScheduledGeneration<T>> {
+        self.pending.take()
+    }
+
+    fn finish(&mut self, generation: u64, error: Option<String>) {
+        self.completed_generation = generation;
+        self.last_error = error;
+    }
+}
+
+struct WorkspacePersistenceSlot {
+    state: Mutex<CoalescingGenerationState<WorkspacePersistenceCapture>>,
+    settled: Condvar,
+}
+
+impl WorkspacePersistenceSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CoalescingGenerationState::default()),
+            settled: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, capture: WorkspacePersistenceCapture) -> (u64, bool) {
+        self.state.lock().enqueue(capture)
+    }
+
+    fn wait_for(&self, generation: u64) -> Result<(), WorkspaceError> {
+        let mut state = self.state.lock();
+        while state.completed_generation < generation {
+            self.settled.wait(&mut state);
+        }
+        match &state.last_error {
+            Some(error) => Err(std::io::Error::other(error.clone()).into()),
+            None => Ok(()),
+        }
+    }
+}
+
+static WORKSPACE_PERSISTENCE_SLOTS: LazyLock<
+    Mutex<HashMap<WorkspacePersistenceKey, Weak<WorkspacePersistenceSlot>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn workspace_persistence_slot(key: &WorkspacePersistenceKey) -> Arc<WorkspacePersistenceSlot> {
+    let mut slots = WORKSPACE_PERSISTENCE_SLOTS.lock();
+    if let Some(slot) = slots.get(key).and_then(Weak::upgrade) {
+        return slot;
+    }
+    let slot = Arc::new(WorkspacePersistenceSlot::new());
+    slots.insert(key.clone(), Arc::downgrade(&slot));
+    slot
+}
+
+#[cfg(test)]
+struct PersistenceTestGate {
+    started: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static PERSISTENCE_TEST_GATES: LazyLock<
+    Mutex<HashMap<WorkspacePersistenceKey, Arc<PersistenceTestGate>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn install_persistence_test_gate(
+    key: WorkspacePersistenceKey,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    PERSISTENCE_TEST_GATES.lock().insert(
+        key,
+        Arc::new(PersistenceTestGate {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        }),
+    );
+    (started_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_persistence_test_gate(key: &WorkspacePersistenceKey) {
+    let gate = PERSISTENCE_TEST_GATES.lock().remove(key);
+    if let Some(gate) = gate {
+        let _ = gate.started.send(());
+        let _ = gate
+            .release
+            .lock()
+            .recv_timeout(std::time::Duration::from_secs(2));
+    }
+}
+
+fn publish_terminal_checkpoint(
+    capture: TerminalCheckpointCapture,
+) -> std::io::Result<crate::app::terminal::TerminalCheckpointPublication> {
+    let (history_end, visible_screen) = {
+        let mut state = capture
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("terminal state lock poisoned"))?;
+        let history_end = crate::app::terminal::durably_flush_terminal_scrollback(
+            &capture.history_path,
+            &mut state,
+        )?;
+        let mut visible_screen = Vec::new();
+        state.append_visible_screen(&mut visible_screen)?;
+        (history_end, visible_screen)
+    };
+    crate::app::terminal::write_terminal_checkpoint_generation(
+        &capture.history_path,
+        history_end,
+        &visible_screen,
+    )
+}
+
+fn publish_terminal_checkpoints(
+    captures: Vec<TerminalCheckpointCapture>,
+) -> std::io::Result<HashMap<PathBuf, crate::app::terminal::TerminalCheckpointPublication>> {
+    let mut publications = HashMap::new();
+    for capture in captures {
+        let history_path = capture.history_path.clone();
+        match publish_terminal_checkpoint(capture) {
+            Ok(publication) => {
+                publications.insert(history_path, publication);
+            }
+            Err(error) => {
+                for publication in publications.values() {
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = crate::app::terminal::remove_terminal_checkpoint(
+                        &publication.checkpoint_path,
+                    );
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(publications)
+}
+
+fn drain_workspace_persistence_slot(slot: Arc<WorkspacePersistenceSlot>) {
+    loop {
+        let scheduled = {
+            let mut state = slot.state.lock();
+            match state.take_pending() {
+                Some(scheduled) => scheduled,
+                None => {
+                    state.running = false;
+                    slot.settled.notify_all();
+                    return;
+                }
+            }
+        };
+
+        let generation = scheduled.generation;
+        let error = publish_workspace_persistence_capture(scheduled.payload)
+            .err()
+            .map(|error| error.to_string());
+        if let Some(error) = &error {
+            tracing::warn!("workspace persistence generation {generation} failed: {error}");
+        }
+
+        let mut state = slot.state.lock();
+        state.finish(generation, error);
+        slot.settled.notify_all();
+    }
+}
+
+fn publish_workspace_persistence_capture(
+    mut capture: WorkspacePersistenceCapture,
+) -> Result<(), WorkspaceError> {
+    #[cfg(test)]
+    wait_on_persistence_test_gate(&capture.key);
+
+    let previous = Workspace::load_by_id_in(
+        &capture.dir_context,
+        &capture.workspace.working_dir,
+        &capture.key.stable_id,
+    )?;
+
+    // Never let a transient virtual-only layout replace real durable content.
+    if capture.workspace.has_no_real_content()
+        && capture.has_virtual_buffers
+        && previous
+            .as_ref()
+            .is_some_and(|existing| !existing.has_no_preservable_content())
+    {
+        tracing::info!(
+            "Skipping workspace save: only virtual buffers are open, \
+             on-disk workspace already has preservable file content"
+        );
+        return Ok(());
+    }
+
+    for (path, state) in capture.file_states {
+        PersistedFileWorkspace::save(&path, state);
+    }
+
+    let mut publications = publish_terminal_checkpoints(capture.terminal_checkpoints)?;
+    for terminal in &mut capture.workspace.terminals {
+        let terminal_identity =
+            terminal_artifact_identity(terminal.history_path.as_deref(), &terminal.backing_path);
+        let saved = previous.as_ref().and_then(|workspace| {
+            workspace.terminals.iter().find(|candidate| {
+                terminal_artifact_identity(
+                    candidate.history_path.as_deref(),
+                    &candidate.backing_path,
+                ) == terminal_identity
+            })
+        });
+        let publication = terminal
+            .history_path
+            .as_ref()
+            .and_then(|history| publications.get(history));
+        if let Some(publication) = publication {
+            terminal.backing_path = publication.checkpoint_path.clone();
+            terminal.backing_history_end = Some(publication.history_end);
+            terminal.checkpoint_generation = Some(publication.generation.clone());
+        } else if let Some(saved) = saved {
+            terminal.backing_path = saved.backing_path.clone();
+            terminal.backing_history_end = saved.backing_history_end;
+            terminal.checkpoint_generation = saved.checkpoint_generation.clone();
+        } else {
+            terminal.backing_history_end = None;
+            terminal.checkpoint_generation = None;
+        }
+    }
+
+    // Commandless ephemeral terminals are absent from the workspace. Remove
+    // any checkpoint captured for one before publishing the metadata.
+    publications.retain(|history, publication| {
+        let used = capture
+            .workspace
+            .terminals
+            .iter()
+            .any(|terminal| terminal.history_path.as_ref() == Some(history));
+        if !used {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = crate::app::terminal::remove_terminal_checkpoint(&publication.checkpoint_path);
+        }
+        used
+    });
+
+    if let Err(error) = capture.workspace.save_in(&capture.dir_context) {
+        for publication in publications.values() {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = crate::app::terminal::remove_terminal_checkpoint(&publication.checkpoint_path);
+        }
+        return Err(error);
+    }
+
+    // Metadata now names only the new immutable generation. Retire older
+    // generated checkpoints after the durable workspace replacement.
+    if let Some(previous) = previous {
+        for terminal in previous.terminals {
+            if terminal.checkpoint_generation.is_none()
+                || capture
+                    .workspace
+                    .terminals
+                    .iter()
+                    .any(|current| current.backing_path == terminal.backing_path)
+            {
+                continue;
+            }
+            if let Err(error) =
+                crate::app::terminal::remove_terminal_checkpoint(&terminal.backing_path)
+            {
+                tracing::warn!(
+                    "Failed to retire terminal checkpoint {:?}: {error}",
+                    terminal.backing_path
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Resolve a saved fold's header_line against the current buffer, using
 /// `header_text` to detect drift from external edits (issue #1568).
@@ -408,53 +790,82 @@ impl Editor {
         // See issue #1156.
     }
 
-    /// Save a specific window's workspace to disk, keyed by its own
-    /// `root`. No active-window flip: reads `windows[id]` directly,
-    /// snapshots via `Window::capture_workspace`, and injects the
-    /// editor-global `plugin_global_state`.
+    /// Capture a specific window immediately, then wait for its serialized
+    /// blocking worker to durably publish that generation. Lifecycle callers
+    /// use this barrier before mutations that must not outrun persistence.
     pub fn save_workspace_for(&mut self, id: fresh_core::WindowId) -> Result<(), WorkspaceError> {
+        self.persist_workspace_for(id, true, true)
+    }
+
+    /// Persist metadata without rewriting terminal artifacts. OMP uses this
+    /// path to checkpoint an exact resume argv as soon as it is authenticated.
+    pub(crate) fn save_workspace_metadata_for(
+        &mut self,
+        id: fresh_core::WindowId,
+    ) -> Result<(), WorkspaceError> {
+        self.persist_workspace_for(id, false, true)
+    }
+
+    fn capture_workspace_persistence(
+        &self,
+        id: fresh_core::WindowId,
+        sync_terminals: bool,
+    ) -> Option<WorkspacePersistenceCapture> {
         // A session still descriptor-backed in `dormant_remote` never had its
-        // workspace restored: its window, when present, is only the empty
-        // disconnected shell a failed reconnect built. The on-disk workspace —
-        // written by the last *connected* session — is authoritative; saving
-        // the shell would clobber the real layout (and its terminals).
+        // workspace restored; its disconnected shell must not replace the last
+        // connected snapshot.
         if self.dormant_remote.contains_key(&id) {
-            return Ok(());
+            return None;
         }
-        let Some(win) = self.windows.get(&id) else {
+        let win = self.windows.get(&id)?;
+        let (workspace, file_states) = win.capture_workspace_for_persistence();
+        let terminal_checkpoints = if sync_terminals {
+            win.capture_terminal_checkpoints()
+        } else {
+            Vec::new()
+        };
+        let key = WorkspacePersistenceKey {
+            workspaces_dir: self.dir_context.workspaces_dir(),
+            working_dir: win.root.clone(),
+            stable_id: win.stable_id.clone(),
+        };
+        Some(WorkspacePersistenceCapture {
+            key,
+            dir_context: self.dir_context.clone(),
+            workspace,
+            has_virtual_buffers: win.has_any_virtual_buffer(),
+            file_states,
+            terminal_checkpoints,
+        })
+    }
+
+    fn persist_workspace_for(
+        &self,
+        id: fresh_core::WindowId,
+        sync_terminals: bool,
+        wait_for_durability: bool,
+    ) -> Result<(), WorkspaceError> {
+        let Some(capture) = self.capture_workspace_persistence(id, sync_terminals) else {
             return Ok(());
         };
-
-        // Ensure terminal backing files have complete state, and persist
-        // per-file global states, before snapshotting.
-        win.sync_terminal_backing_files();
-        win.save_all_global_file_states();
-
-        let workspace = win.capture_workspace();
-
-        // Refuse to overwrite a non-empty on-disk workspace with an
-        // all-virtual snapshot (issue #2027). The protection is for
-        // FILE/unnamed content only — terminals are live runtime state, so
-        // a terminal-only on-disk workspace must NOT block this save.
-        if workspace.has_no_real_content() && win.has_any_virtual_buffer() {
-            let root = win.root.clone();
-            let on_disk = Workspace::load(&root).ok().flatten();
-            if let Some(existing) = on_disk {
-                if !existing.has_no_preservable_content() {
-                    tracing::info!(
-                        "Skipping workspace save: only virtual buffers are open, \
-                         on-disk workspace already has preservable file content"
-                    );
-                    return Ok(());
-                }
+        let slot = workspace_persistence_slot(&capture.key);
+        let (generation, start_worker) = slot.enqueue(capture);
+        if start_worker {
+            let worker_slot = Arc::clone(&slot);
+            if let Some(runtime) = &self.tokio_runtime {
+                runtime.spawn_blocking(move || drain_workspace_persistence_slot(worker_slot));
+            } else {
+                let _worker = std::thread::spawn(move || {
+                    drain_workspace_persistence_slot(worker_slot);
+                });
             }
         }
 
-        // One store, whatever launched this editor. A daemon — named or not —
-        // is a host for workspaces, not an owner of a private set of them, so
-        // its windows persist exactly where a direct-mode run's do and boot
-        // discovery (which only ever scans this store) can see them all.
-        workspace.save()
+        if wait_for_durability {
+            slot.wait_for(generation)
+        } else {
+            Ok(())
+        }
     }
 
     /// Restore a specific window's workspace from disk into
@@ -484,14 +895,13 @@ impl Editor {
         let workspace = if stable_id.is_empty() {
             // No durable id yet (a brand-new window): fall back to the
             // freshest file for the root.
-            Workspace::load(&root)?
+            Workspace::load_in(&self.dir_context, &root)?
         } else {
             // Restore THIS window's own identity, not merely the freshest file
             // for the root — several co-tenant workspaces may share the root.
-            Workspace::load_by_id(&root, &stable_id)?
+            Workspace::load_by_id_in(&self.dir_context, &root, &stable_id)?
         };
         let Some(workspace) = workspace else {
-            tracing::debug!("No workspace found for {:?}", root);
             return Ok(false);
         };
 
@@ -629,23 +1039,19 @@ impl Editor {
         }
     }
 
-    /// Persist a single window's workspace *now*, as a crash-safety checkpoint
-    /// outside the quit path.
+    /// Capture a single window's workspace now and enqueue its crash-safety
+    /// checkpoint without waiting for disk durability.
     ///
     /// Sessions used to be written only when the editor exited cleanly
     /// (`save_all_windows_workspaces` on quit). A killed or crashed editor
     /// therefore forgot every Orchestrator session created since the last clean
-    /// exit — the directory-keyed registry (`workspaces/*.json`) is *the* record
-    /// of which sessions exist, and it never got the new file. Calling this at
-    /// natural checkpoints — finalizing a new session's identity, and switching
-    /// away from a window — keeps that on-disk registry current, so the dock
-    /// remembers every open workspace even after a hard kill.
+    /// exit. Natural interactive checkpoints keep that registry current, but
+    /// focus changes must not inherit the terminal/workspace fsync latency.
     ///
-    /// Mirrors `save_all_windows_workspaces`'s guard exactly: never write a
+    /// Mirrors `save_all_windows_workspaces`'s guard exactly: never capture a
     /// window still pending lazy materialization (it holds only an empty seed
-    /// while its on-disk file is authoritative) or one without a split layout
-    /// yet. Best-effort — a failed write is logged and swallowed so a checkpoint
-    /// never disrupts the interactive action that triggered it.
+    /// while its on-disk file is authoritative) or one without a split layout.
+    /// Pending generations coalesce per window on the blocking worker.
     pub(crate) fn checkpoint_window_workspace(&mut self, id: fresh_core::WindowId) {
         let savable = self
             .windows
@@ -655,8 +1061,8 @@ impl Editor {
         if !savable {
             return;
         }
-        if let Err(e) = self.save_workspace_for(id) {
-            tracing::warn!("checkpoint_window_workspace: failed to save window {id}: {e}");
+        if let Err(e) = self.persist_workspace_for(id, true, false) {
+            tracing::warn!("checkpoint_window_workspace: failed to queue window {id}: {e}");
         }
     }
 
@@ -707,16 +1113,62 @@ impl crate::app::window::Window {
     fn restore_terminals_from_workspace(
         &mut self,
         terminals: &[SerializedTerminalWorkspace],
-    ) -> HashMap<usize, BufferId> {
+        persisted_tracked_terminal: Option<usize>,
+    ) -> (HashMap<usize, BufferId>, Option<usize>) {
         let mut terminal_buffer_map: HashMap<usize, BufferId> = HashMap::new();
         if terminals.is_empty() {
-            return terminal_buffer_map;
+            return (terminal_buffer_map, None);
         }
+        // Markerless workspaces from the pre-companion build can be upgraded
+        // only when one live local terminal has trusted exact OMP metadata.
+        // Multiple candidates, remote placeholders, and nested multiplexers
+        // remain ordinary terminals rather than guessing native ownership.
+        let direct_local = matches!(
+            &self.authority().command_wrap,
+            crate::services::authority::CommandWrap::Direct
+        ) && self.authority().matches_session_spec(&self.authority_spec);
+        let multiplexer_active = ["TMUX", "STY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+        let legacy_candidates: Vec<usize> = if direct_local && !multiplexer_active {
+            terminals
+                .iter()
+                .filter(|terminal| terminal.companion.is_none() && terminal.exited.is_none())
+                .filter(|terminal| {
+                    terminal.agent_resume.as_ref().is_some_and(|resume| {
+                        crate::app::terminal::trusted_legacy_exact_omp_resume(
+                            &resume.argv,
+                            terminal.command.as_deref(),
+                            cfg!(windows),
+                        )
+                    })
+                })
+                .map(|terminal| terminal.terminal_index)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let legacy_candidate = (legacy_candidates.len() == 1)
+            .then(|| legacy_candidates[0])
+            .filter(|candidate| {
+                persisted_tracked_terminal.is_none_or(|tracked| tracked == *candidate)
+            });
+
         let __window_bridge = self.bridge.clone();
         self.terminal_manager.set_async_bridge(__window_bridge);
+        let mut migrated_companion = None;
         for terminal in terminals {
-            if let Some(buffer_id) = self.restore_terminal_from_workspace(terminal) {
+            let migrate = legacy_candidate == Some(terminal.terminal_index);
+            if let Some(buffer_id) = self.restore_terminal_from_workspace(terminal, migrate) {
                 terminal_buffer_map.insert(terminal.terminal_index, buffer_id);
+                if migrate {
+                    migrated_companion = self
+                        .terminal_buffers
+                        .get(&buffer_id)
+                        .map(|binding| binding.terminal_id)
+                        .filter(|terminal_id| self.terminal_companions.contains_key(terminal_id))
+                        .map(|_| terminal.terminal_index);
+                }
                 // A restored terminal is created with an empty scrollback set,
                 // so every split showing it is live by default — focusing it
                 // brings back a live terminal rather than read-only scrollback.
@@ -726,7 +1178,7 @@ impl crate::app::window::Window {
                 // that split into scrollback as usual.
             }
         }
-        terminal_buffer_map
+        (terminal_buffer_map, migrated_companion)
     }
 
     /// Re-create bookmarks from the saved workspace, resolving file paths to buffer IDs.
@@ -811,6 +1263,220 @@ impl crate::app::window::Window {
         self.set_status_message(msg);
     }
 
+    /// Resolve one persisted terminal artifact into this window's stable-id
+    /// namespace. Older workspaces stored absolute or root-relative paths in a
+    /// directory shared by co-tenants; copy those files rather than renaming so
+    /// each saved workspace can migrate independently without stealing another
+    /// tenant's transcript.
+    fn restore_terminal_artifact_path(&self, saved: &std::path::Path, fallback: &str) -> PathBuf {
+        let legacy_root = self
+            .resources
+            .dir_context
+            .terminal_dir_for(self.root.as_path());
+        let stable_root = self.terminal_artifacts_dir();
+        let source = if saved.is_absolute() {
+            saved.to_path_buf()
+        } else {
+            legacy_root.join(saved)
+        };
+        let target = stable_root.join(
+            saved
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new(fallback)),
+        );
+        if source == target {
+            return target;
+        }
+        if !source.exists() {
+            return target;
+        }
+
+        let source_lock = crate::services::terminal::manager::try_lock_terminal_artifact(&source);
+        let target_lock = crate::services::terminal::manager::try_lock_terminal_artifact(&target);
+        let (Ok(Some(_source_lock)), Ok(Some(_target_lock))) = (source_lock, target_lock) else {
+            tracing::warn!(
+                "Deferred terminal artifact migration while a writer owns {:?} or {:?}",
+                source,
+                target
+            );
+            return source;
+        };
+
+        if target.exists() {
+            match terminal_artifacts_equal(&source, &target) {
+                Ok(true) => return target,
+                Ok(false) => {
+                    tracing::warn!(
+                        "Terminal artifact migration is ambiguous; preserving source {:?} and target {:?}",
+                        source,
+                        target
+                    );
+                    return source;
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to validate terminal artifact migration: {error}");
+                    return source;
+                }
+            }
+        }
+        if let Err(error) = std::fs::create_dir_all(&stable_root) {
+            tracing::warn!("Failed to create terminal artifact namespace: {error}");
+            return source;
+        }
+
+        let target_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(fallback);
+        let temp = stable_root.join(format!(".{target_name}.{}.tmp", uuid::Uuid::new_v4()));
+        let publication = (|| -> std::io::Result<()> {
+            let mut reader = std::fs::File::open(&source)?;
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            std::io::copy(&mut reader, &mut writer)?;
+            writer.sync_all()?;
+            drop(writer);
+            crate::workspace::durable_rename(&temp, &target)
+        })();
+
+        match publication {
+            Ok(()) => target,
+            Err(error) => {
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = std::fs::remove_file(&temp);
+                tracing::warn!(
+                    "Failed to migrate terminal artifact {:?} to {:?}: {error}",
+                    source,
+                    target
+                );
+                source
+            }
+        }
+    }
+
+    /// Append the saved visible-screen delta at its exact append-only history
+    /// boundary before a replacement PTY starts writing. Later append-only
+    /// history supersedes a stale checkpoint; a partial prior promotion is
+    /// recognized by matching the bounded checkpoint prefix and retried.
+    pub(crate) fn promote_saved_terminal_checkpoint(
+        &self,
+        checkpoint_path: &Path,
+        history_path: &Path,
+        saved_history_end: u64,
+        checkpoint_generation: &str,
+    ) -> std::io::Result<()> {
+        let fs = crate::app::terminal::terminal_backing_fs();
+        let expected = format!("checkpoint-{checkpoint_generation}.txt");
+        if !checkpoint_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&expected))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "terminal checkpoint generation does not match its path",
+            ));
+        }
+        let _checkpoint_lock =
+            crate::services::terminal::manager::try_lock_terminal_artifact(checkpoint_path)?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "terminal checkpoint is live",
+                    )
+                })?;
+        let _history_lock =
+            crate::services::terminal::manager::try_lock_terminal_artifact(history_path)?
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "terminal history is live")
+                })?;
+        let checkpoint_len = fs.metadata(checkpoint_path)?.size;
+        let final_history_end = saved_history_end
+            .checked_add(checkpoint_len)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "terminal checkpoint boundary overflow",
+                )
+            })?;
+        let history_len = match fs.metadata(history_path) {
+            Ok(metadata) => metadata.size,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if history_len < saved_history_end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "terminal history rewound: expected at least {saved_history_end}, found {history_len}"
+                ),
+            ));
+        }
+        if history_len > final_history_end {
+            // The live terminal appended newer scrollback after this save.
+            // Never rewind it or append the stale visible-screen generation.
+            return Ok(());
+        }
+        if history_len > saved_history_end {
+            let partial_len = usize::try_from(history_len - saved_history_end).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "terminal checkpoint delta exceeds addressable memory",
+                )
+            })?;
+            let checkpoint_len = usize::try_from(checkpoint_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "terminal checkpoint exceeds addressable memory",
+                )
+            })?;
+            let persisted = fs.read_range(history_path, saved_history_end, partial_len)?;
+            let checkpoint = fs.read_range(checkpoint_path, 0, checkpoint_len)?;
+            match classify_saved_checkpoint_tail(&persisted, &checkpoint) {
+                SavedCheckpointTail::NewerHistory | SavedCheckpointTail::Complete => {
+                    // Any mismatch, even a short one within the checkpoint's
+                    // bounded length, is newer authoritative scrollback.
+                    return Ok(());
+                }
+                SavedCheckpointTail::MatchingPrefix => {
+                    fs.set_file_length(history_path, saved_history_end)?;
+                }
+            }
+        }
+
+        let parent = history_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("terminal history has no parent"))?;
+        fs.create_dir_all(parent)?;
+        let append = (|| -> std::io::Result<()> {
+            let mut reader = fs.open_file(checkpoint_path)?;
+            let mut writer = fs.open_file_for_append(history_path)?;
+            let copied = std::io::copy(&mut reader, &mut writer)?;
+            if copied != checkpoint_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "terminal checkpoint changed during promotion",
+                ));
+            }
+            writer.sync_all()
+        })();
+        if let Err(error) = append {
+            if let Err(rollback_error) = fs.set_file_length(history_path, saved_history_end) {
+                return Err(std::io::Error::other(format!(
+                    "terminal checkpoint promotion failed ({error}); history rollback failed ({rollback_error})"
+                )));
+            }
+            if let Ok(history) = fs.open_file_for_append(history_path) {
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = history.sync_all();
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Restore a terminal from serialized workspace metadata.
     ///
     /// Uses the incremental streaming architecture for fast restore:
@@ -822,38 +1488,120 @@ impl crate::app::window::Window {
     fn restore_terminal_from_workspace(
         &mut self,
         terminal: &SerializedTerminalWorkspace,
+        migrate_legacy_omp: bool,
     ) -> Option<BufferId> {
-        // Resolve paths (accept absolute; otherwise treat as relative to terminals dir)
-        let terminals_root = self
-            .resources
-            .dir_context
-            .terminal_dir_for(self.root.as_path());
-        let log_path = if terminal.log_path.is_absolute() {
-            terminal.log_path.clone()
-        } else {
-            terminals_root.join(&terminal.log_path)
-        };
-        let backing_path = if terminal.backing_path.is_absolute() {
-            terminal.backing_path.clone()
-        } else {
-            terminals_root.join(&terminal.backing_path)
-        };
-
-        // Best-effort directory creation for terminal backing files
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = crate::app::terminal::terminal_backing_fs().create_dir_all(
-            log_path
-                .parent()
-                .or_else(|| backing_path.parent())
-                .unwrap_or(&terminals_root),
+        let log_path = self.restore_terminal_artifact_path(
+            &terminal.log_path,
+            &format!("fresh-terminal-{}.log", terminal.terminal_index),
         );
+        let backing_path = self.restore_terminal_artifact_path(
+            &terminal.backing_path,
+            &format!("fresh-terminal-{}.txt", terminal.terminal_index),
+        );
+        let mut history_path = match terminal.history_path.as_ref() {
+            Some(saved) => self.restore_terminal_artifact_path(
+                saved,
+                &format!("fresh-terminal-{}.history.txt", terminal.terminal_index),
+            ),
+            None => {
+                let stem = backing_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("fresh-terminal");
+                backing_path.with_file_name(format!("{stem}.history.txt"))
+            }
+        };
 
-        // Record paths using the predicted ID so buffer creation can reuse them
-        let predicted_id = self.terminal_manager.next_terminal_id();
+        if let Some(parent) = history_path
+            .parent()
+            .or_else(|| log_path.parent())
+            .or_else(|| backing_path.parent())
+        {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = crate::app::terminal::terminal_backing_fs().create_dir_all(parent);
+        }
+
+        // A replacement PTY may start only after the exact immutable
+        // checkpoint generation is promoted, or after a legacy combined
+        // transcript is copied into the append-only history namespace.
+        let mut restoration_blocked = false;
+        let mut restored_generation = false;
+        let mut pending_history_migration = None;
+        if let (Some(saved_history_end), Some(generation)) = (
+            terminal.backing_history_end,
+            terminal.checkpoint_generation.as_deref(),
+        ) {
+            match self.promote_saved_terminal_checkpoint(
+                &backing_path,
+                &history_path,
+                saved_history_end,
+                generation,
+            ) {
+                Ok(()) => restored_generation = true,
+                Err(error) => {
+                    tracing::warn!("Failed to promote saved terminal checkpoint: {error}");
+                    restoration_blocked = true;
+                }
+            }
+        } else if terminal.backing_history_end.is_some() {
+            tracing::warn!(
+                "Refusing to resume terminal from a checkpoint boundary without an exact generation"
+            );
+            restoration_blocked = true;
+        } else if terminal.history_path.is_none() && !history_path.exists() {
+            if let Err(error) =
+                crate::app::terminal::migrate_legacy_terminal_history(&backing_path, &history_path)
+            {
+                tracing::warn!("Failed to initialize terminal history: {error}");
+                pending_history_migration = Some(history_path.clone());
+                history_path = backing_path.clone();
+                restoration_blocked = true;
+            }
+        }
+        let display_path = if restored_generation {
+            history_path.clone()
+        } else {
+            backing_path.clone()
+        };
+        let live_backing_path = if restored_generation {
+            crate::app::terminal::mutable_terminal_backing_path(&history_path)
+        } else {
+            backing_path.clone()
+        };
+
+        // A persisted backend is authoritative. Until the exact container or
+        // remote authority is live, reserve identity and restore only the
+        // checkpoint buffer; spawning through the local placeholder would run
+        // the agent on the wrong machine.
+        let dormant_for_authority = terminal.exited.is_none()
+            && !self.authority().matches_session_spec(&self.authority_spec);
+        // Live restore peeks because `spawn` consumes the ID. A restored exited
+        // or authority-dormant terminal has no spawn, so reserve its identity.
+        let predicted_id =
+            if terminal.exited.is_some() || dormant_for_authority || restoration_blocked {
+                self.terminal_manager.reserve_terminal_id()
+            } else {
+                self.terminal_manager.next_terminal_id()
+            };
         self.terminal_log_files
             .insert(predicted_id, log_path.clone());
+        self.terminal_history_files
+            .insert(predicted_id, history_path.clone());
         self.terminal_backing_files
-            .insert(predicted_id, backing_path.clone());
+            .insert(predicted_id, live_backing_path.clone());
+
+        if restoration_blocked {
+            return self.restore_exited_terminal(
+                terminal,
+                &crate::workspace::ExitedTerminalState { exit_code: None },
+                predicted_id,
+                log_path,
+                history_path,
+                backing_path,
+                display_path.clone(),
+                pending_history_migration,
+            );
+        }
 
         // A terminal that had already exited when the workspace was saved comes
         // back *dead*: its transcript is restored and the restart offer is
@@ -867,29 +1615,105 @@ impl crate::app::window::Window {
                 state,
                 predicted_id,
                 log_path,
+                history_path,
                 backing_path,
+                display_path.clone(),
+                None,
             );
         }
+        if dormant_for_authority {
+            if let Some(argv) = terminal.command.as_ref() {
+                let mut argv = argv.clone();
+                if terminal.companion == Some(fresh_core::api::TerminalCompanion::Omp) {
+                    crate::app::terminal::remove_omp_companion_arg(&mut argv);
+                }
+                self.terminal_commands.insert(predicted_id, argv);
+            }
+            if let Some(resume) = terminal.agent_resume.as_ref() {
+                let mut argv = resume.argv.clone();
+                if terminal.companion == Some(fresh_core::api::TerminalCompanion::Omp) {
+                    crate::app::terminal::remove_omp_companion_arg(&mut argv);
+                }
+                if !argv.is_empty()
+                    && (terminal.companion != Some(fresh_core::api::TerminalCompanion::Omp)
+                        || crate::app::terminal::exact_omp_resume_argv(&argv, cfg!(windows)))
+                {
+                    self.terminal_resume_commands.insert(predicted_id, argv);
+                }
+            }
+            if let Some(kind) = terminal.companion {
+                self.terminal_companions.insert(predicted_id, kind);
+            }
+            if terminal.script_access {
+                self.remember_terminal_script_access(predicted_id);
+            }
+            let buffer_id = self.create_terminal_buffer_detached(predicted_id);
+            self.apply_restored_terminal_title(buffer_id, terminal.title.as_deref());
+            self.load_terminal_backing_file_as_buffer(buffer_id, &display_path);
+            return Some(buffer_id);
+        }
 
-        // Decide what to run in the restored terminal:
-        //  1. an agent-resume argv (rejoin the conversation), when present
-        //     and resume is enabled — `claude --resume <id>` / `--continue`;
-        //  2. else the launch command (re-run the agent / shell);
-        //  3. else the configured shell.
-        // The resume argv runs as the PTY child through the authority's
-        // wrapper, exactly like a launch command (mirrors
-        // `spawn_terminal_session`).
-        let resume_argv = terminal
+        let companion = terminal
+            .companion
+            .or_else(|| migrate_legacy_omp.then_some(fresh_core::api::TerminalCompanion::Omp));
+        // OMP's authenticated companion marker makes its exact non-empty
+        // resume argv authoritative even when generic agent resume is disabled.
+        // Every ordinary terminal still obeys the preference and otherwise
+        // falls back to its persisted clean relaunch argv.
+        let mut normalized_launch = terminal.command.clone();
+        let mut normalized_resume = terminal
             .agent_resume
             .as_ref()
-            .map(|r| &r.argv)
-            .filter(|argv| {
-                !argv.is_empty()
-                    && (terminal.companion == Some(fresh_core::api::TerminalCompanion::Omp)
-                        || self.resources.config.terminal.resume_agents)
+            .map(|resume| resume.argv.clone());
+        if companion == Some(fresh_core::api::TerminalCompanion::Omp) {
+            for argv in [&mut normalized_launch, &mut normalized_resume]
+                .into_iter()
+                .flatten()
+            {
+                crate::app::terminal::remove_omp_companion_arg(argv);
+            }
+        }
+        let mut spawn_argv = crate::app::terminal::select_restorable_terminal_argv(
+            companion,
+            normalized_resume.as_deref(),
+            normalized_launch.as_deref(),
+            self.resources.config.terminal.resume_agents,
+        )
+        .map(<[String]>::to_vec);
+        let direct_local = matches!(
+            &self.authority().command_wrap,
+            crate::services::authority::CommandWrap::Direct
+        );
+        let mut pinned_omp_executable = None;
+        if companion == Some(fresh_core::api::TerminalCompanion::Omp) && direct_local {
+            let pin_failed = spawn_argv.as_mut().is_some_and(|argv| {
+                if crate::app::terminal::pin_current_trusted_omp_argv(argv, cfg!(windows)) {
+                    pinned_omp_executable = argv.first().cloned();
+                    false
+                } else {
+                    true
+                }
             });
-        let spawn_argv =
-            resume_argv.or_else(|| terminal.command.as_ref().filter(|argv| !argv.is_empty()));
+            if pin_failed {
+                tracing::warn!(
+                    "Failed to pin the trusted OMP executable while restoring terminal {}",
+                    terminal.terminal_index
+                );
+                let dormant_id = self.terminal_manager.reserve_terminal_id();
+                debug_assert_eq!(dormant_id, predicted_id);
+                return self.restore_exited_terminal(
+                    terminal,
+                    &crate::workspace::ExitedTerminalState { exit_code: None },
+                    dormant_id,
+                    log_path,
+                    history_path,
+                    backing_path,
+                    display_path.clone(),
+                    None,
+                );
+            }
+        }
+        let spawn_argv = spawn_argv.as_deref();
         // Run the resume/launch argv through the workspace's backend (local →
         // directly; container → `docker exec … <argv>`) so a restored agent
         // rejoins *inside* its backend, not on the host. For a dormant remote
@@ -900,7 +1724,7 @@ impl crate::app::window::Window {
             Some(argv) => self.authority().terminal_command(argv),
             None => self.resolved_terminal_wrapper(),
         };
-        let wrapper_for_spawn = self.apply_remote_terminal_env(wrapper_for_spawn);
+        let mut wrapper_for_spawn = self.apply_remote_terminal_env(wrapper_for_spawn);
         let mut env_delta = self.terminal_env_delta(&wrapper_for_spawn);
         // A terminal saved with the script grant comes back holding it: mint a
         // token bound to *this* (restored) window and stamp it into the child's
@@ -911,24 +1735,49 @@ impl crate::app::window::Window {
         } else {
             std::collections::HashMap::new()
         };
-        let companion_preparation = match terminal.companion {
+        let script_capability = self.terminal_script_capability(predicted_id);
+        let companion_preparation = match companion {
             Some(kind) => match self.prepare_omp_companion_spawn(
                 kind,
-                spawn_argv.map(Vec::as_slice),
+                spawn_argv,
                 &mut env_delta,
                 &mut extra_env,
             ) {
                 Ok(preparation) => Some(preparation),
                 Err(error) => {
                     tracing::warn!("Failed to prepare restored OMP companion: {error}");
-                    return None;
+                    let dormant_id = self.terminal_manager.reserve_terminal_id();
+                    debug_assert_eq!(dormant_id, predicted_id);
+                    self.revoke_terminal_script_token(predicted_id, false);
+                    return self.restore_exited_terminal(
+                        terminal,
+                        &crate::workspace::ExitedTerminalState { exit_code: None },
+                        dormant_id,
+                        log_path,
+                        history_path,
+                        backing_path,
+                        display_path.clone(),
+                        None,
+                    );
                 }
             },
             None => None,
         };
-        let preserves_companion_marker = companion_preparation
-            .as_ref()
-            .is_some_and(crate::app::terminal::OmpCompanionPreparation::preserves_marker);
+        let companion_active = matches!(
+            companion_preparation.as_ref(),
+            Some(crate::app::terminal::OmpCompanionPreparation::Active(_))
+        );
+        let migrated_companion_active = migrate_legacy_omp && companion_active;
+        let preserves_companion_marker = if migrate_legacy_omp {
+            migrated_companion_active
+        } else {
+            companion_preparation
+                .as_ref()
+                .is_some_and(crate::app::terminal::OmpCompanionPreparation::preserves_marker)
+        };
+        if companion_active {
+            crate::app::terminal::insert_omp_companion_arg(&mut wrapper_for_spawn.args);
+        }
         let companion_spawn = companion_preparation
             .and_then(crate::app::terminal::OmpCompanionPreparation::into_spawn);
         let terminal_id = match self.terminal_manager.spawn(
@@ -936,14 +1785,13 @@ impl crate::app::window::Window {
             terminal.rows,
             terminal.cwd.clone(),
             Some(log_path.clone()),
-            Some(backing_path.clone()),
-            // Restore: this terminal's own saved transcript — keep streaming
-            // into it so the restored buffer keeps its scrollback.
+            Some(history_path.clone()),
             crate::services::terminal::BackingMode::Continue,
             wrapper_for_spawn,
             env_delta,
             extra_env,
             companion_spawn,
+            script_capability,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -952,7 +1800,17 @@ impl crate::app::window::Window {
                     terminal.terminal_index,
                     e
                 );
-                return None;
+                self.revoke_terminal_script_token(predicted_id, false);
+                return self.restore_exited_terminal(
+                    terminal,
+                    &crate::workspace::ExitedTerminalState { exit_code: None },
+                    predicted_id,
+                    log_path,
+                    history_path,
+                    backing_path,
+                    display_path.clone(),
+                    None,
+                );
             }
         };
 
@@ -961,29 +1819,49 @@ impl crate::app::window::Window {
         if terminal_id != predicted_id {
             self.terminal_log_files
                 .insert(terminal_id, log_path.clone());
+            self.terminal_history_files
+                .insert(terminal_id, history_path.clone());
             self.terminal_backing_files
-                .insert(terminal_id, backing_path.clone());
+                .insert(terminal_id, live_backing_path.clone());
             self.terminal_log_files.remove(&predicted_id);
+            self.terminal_history_files.remove(&predicted_id);
             self.terminal_backing_files.remove(&predicted_id);
         }
 
         // Carry the restore markers forward (even the empty-vec plain-shell
         // marker) so a later save re-persists them and the workspace keeps
-        // restoring — and resuming — across multiple restarts.
-        if let Some(argv) = terminal.command.as_ref() {
-            self.terminal_commands.insert(terminal_id, argv.clone());
+        // restoring — and resuming — across multiple restarts. A native OMP
+        // restore pins the configured host-owned executable rather than keeping
+        // a caller/PATH-selected spelling from legacy metadata.
+        let pin_omp = |mut argv: Vec<String>| {
+            if companion == Some(fresh_core::api::TerminalCompanion::Omp) {
+                crate::app::terminal::remove_omp_companion_arg(&mut argv);
+            }
+            if let (Some(executable), Some(argv0)) =
+                (pinned_omp_executable.as_ref(), argv.first_mut())
+            {
+                *argv0 = executable.clone();
+            }
+            argv
+        };
+        if let Some(argv) = normalized_launch.as_ref() {
+            self.terminal_commands
+                .insert(terminal_id, pin_omp(argv.clone()));
         }
-        if let Some(resume) = terminal.agent_resume.as_ref() {
-            if !resume.argv.is_empty() {
+        if let Some(resume) = normalized_resume.as_ref() {
+            if !resume.is_empty()
+                && (companion != Some(fresh_core::api::TerminalCompanion::Omp)
+                    || crate::app::terminal::exact_omp_resume_argv(resume, cfg!(windows)))
+            {
                 self.terminal_resume_commands
-                    .insert(terminal_id, resume.argv.clone());
+                    .insert(terminal_id, pin_omp(resume.clone()));
             }
         }
-        // A marker is durable through a temporary unsupported launch, so the
-        // saved workspace gets another chance to activate on a direct local
-        // spawn. Entropy failure is intentionally not retried or persisted.
+        // Existing markers survive temporary unsupported launches. A legacy
+        // markerless terminal is promoted only after an active capability was
+        // minted, so ambiguity/multiplexer/entropy fallbacks stay ordinary.
         if preserves_companion_marker {
-            if let Some(kind) = terminal.companion {
+            if let Some(kind) = companion {
                 self.terminal_companions.insert(terminal_id, kind);
             }
         }
@@ -992,9 +1870,7 @@ impl crate::app::window::Window {
         let buffer_id = self.create_terminal_buffer_detached(terminal_id);
         self.apply_restored_terminal_title(buffer_id, terminal.title.as_deref());
 
-        // Load backing file directly as read-only buffer (skip log replay)
-        // The backing file already contains complete terminal state from last workspace
-        self.load_terminal_backing_file_as_buffer(buffer_id, &backing_path);
+        self.load_terminal_backing_file_as_buffer(buffer_id, &display_path);
 
         Some(buffer_id)
     }
@@ -1013,14 +1889,32 @@ impl crate::app::window::Window {
         state: &crate::workspace::ExitedTerminalState,
         terminal_id: crate::services::terminal::TerminalId,
         log_path: PathBuf,
+        history_path: PathBuf,
         backing_path: PathBuf,
+        display_path: PathBuf,
+        pending_history_migration: Option<PathBuf>,
     ) -> Option<BufferId> {
-        let command = terminal.command.clone().filter(|argv| !argv.is_empty());
-        let resume = terminal
+        let omp_companion = terminal.companion == Some(fresh_core::api::TerminalCompanion::Omp);
+        let mut command = terminal.command.clone();
+        let mut resume = terminal
             .agent_resume
             .as_ref()
-            .map(|r| r.argv.clone())
-            .filter(|argv| !argv.is_empty());
+            .map(|resume| resume.argv.clone());
+        if omp_companion {
+            let direct_local = matches!(
+                &self.authority().command_wrap,
+                crate::services::authority::CommandWrap::Direct
+            );
+            for argv in [&mut command, &mut resume].into_iter().flatten() {
+                crate::app::terminal::remove_omp_companion_arg(argv);
+                if direct_local {
+                    let _ = crate::app::terminal::pin_current_trusted_omp_argv(argv, cfg!(windows));
+                }
+            }
+        }
+        let resume = resume.filter(|argv| !argv.is_empty()).filter(|argv| {
+            !omp_companion || crate::app::terminal::exact_omp_resume_argv(argv, cfg!(windows))
+        });
         // Carry the launch/resume argv forward under the reserved id so a
         // *later* save re-persists them and the terminal stays restartable
         // across any number of restarts.
@@ -1036,7 +1930,7 @@ impl crate::app::window::Window {
         // the exit path does — the PTY this id names no longer exists.
         let buffer_id = self.create_terminal_buffer_detached(terminal_id);
         self.apply_restored_terminal_title(buffer_id, terminal.title.as_deref());
-        self.load_terminal_backing_file_as_buffer(buffer_id, &backing_path);
+        self.load_terminal_backing_file_as_buffer(buffer_id, &display_path);
         // A restored-dead tab shows the same "(exited)" marker a tab that died
         // in this session does — the state is identical, so it must read
         // identically.
@@ -1044,6 +1938,9 @@ impl crate::app::window::Window {
             meta.display_name = t!("terminal.tab_exited", name = meta.display_name).to_string();
         }
         self.terminal_buffers.remove(&buffer_id);
+        if terminal.script_access {
+            self.remember_terminal_script_access(terminal_id);
+        }
         self.exited_terminals.insert(
             buffer_id,
             crate::app::window::ExitedTerminal {
@@ -1053,7 +1950,11 @@ impl crate::app::window::Window {
                 rows: terminal.rows,
                 cwd: terminal.cwd.clone(),
                 backing_path: Some(backing_path),
+                history_path: Some(history_path),
                 log_path: Some(log_path),
+                backing_history_end: terminal.backing_history_end,
+                checkpoint_generation: terminal.checkpoint_generation.clone(),
+                pending_history_migration,
                 command,
                 resume,
                 // A restored terminal is re-persisted by the branch above on
@@ -1861,6 +2762,10 @@ impl crate::app::window::Window {
             .insert(buffer_id, crate::model::event::EventLog::new());
         self.buffer_metadata
             .insert(buffer_id, crate::app::types::BufferMetadata::new());
+        // Until bytes arrive from the exact authority this is only a visual
+        // placeholder. Editing it would turn a transient read failure into an
+        // apparently valid empty file that can overwrite remote content.
+        self.mark_buffer_read_only(buffer_id, true);
         self.pending_content_load
             .push((buffer_id, abs_path.to_path_buf()));
         buffer_id
@@ -2000,42 +2905,17 @@ impl crate::app::window::Window {
             .any(|m| matches!(m.kind, crate::app::types::BufferKind::Virtual { .. }))
     }
 
-    /// Persist per-file global state (cursor/scroll) for every file
-    /// buffer in this window's splits.
-    pub(crate) fn save_all_global_file_states(&self) {
-        for (leaf_id, view_state) in self
-            .buffers
-            .splits()
-            .map(|(_, vs)| vs)
-            .expect("window must have a populated split layout")
-        {
-            let active_buffer = self
-                .buffers
-                .splits()
-                .map(|(mgr, _)| mgr)
-                .expect("window must have a populated split layout")
-                .root()
-                .get_leaves_with_rects(ratatui::layout::Rect::default())
-                .into_iter()
-                .find(|(sid, _, _)| *sid == *leaf_id)
-                .map(|(_, buffer_id, _)| buffer_id);
-
-            if let Some(buffer_id) = active_buffer {
-                self.save_buffer_file_state(buffer_id, view_state);
-            }
-        }
-    }
-
-    /// Save per-file global state (cursor/scroll) for a specific buffer.
-    fn save_buffer_file_state(&self, buffer_id: BufferId, view_state: &SplitViewState) {
-        let abs_path = match self.buffer_metadata.get(&buffer_id) {
-            Some(metadata) => match metadata.file_path() {
-                Some(path) => path.to_path_buf(),
-                None => return,
-            },
-            None => return,
-        };
-
+    /// Capture per-file global cursor/scroll state without touching disk.
+    fn capture_buffer_file_state(
+        &self,
+        buffer_id: BufferId,
+        view_state: &SplitViewState,
+    ) -> Option<(PathBuf, SerializedFileState)> {
+        let abs_path = self
+            .buffer_metadata
+            .get(&buffer_id)?
+            .file_path()?
+            .to_path_buf();
         let primary_cursor = view_state.cursors.primary();
         let file_state = SerializedFileState {
             cursor: SerializedCursor {
@@ -2075,61 +2955,58 @@ impl crate::app::window::Window {
             plugin_state: std::collections::HashMap::new(),
             folds: Vec::new(),
         };
-
-        PersistedFileWorkspace::save(&abs_path, file_state);
+        Some((abs_path, file_state))
     }
 
-    /// Sync this window's active terminal visible screens to their
-    /// backing files (so the snapshot captures complete terminal state).
-    pub(crate) fn sync_terminal_backing_files(&self) {
-        use std::io::BufWriter;
-
-        let terminals_to_sync: Vec<_> = self
-            .terminal_buffers
+    /// Capture the stable path and shared parser state for each live terminal.
+    /// The blocking worker performs the durable history/checkpoint publication.
+    fn capture_terminal_checkpoints(&self) -> Vec<TerminalCheckpointCapture> {
+        let mut seen = HashSet::new();
+        self.terminal_buffers
             .values()
-            .map(|tb| tb.terminal_id)
+            .map(|binding| binding.terminal_id)
+            .filter(|terminal_id| seen.insert(*terminal_id))
             .filter_map(|terminal_id| {
-                self.terminal_backing_files
-                    .get(&terminal_id)
-                    .map(|path| (terminal_id, path.clone()))
+                Some(TerminalCheckpointCapture {
+                    history_path: self.terminal_history_files.get(&terminal_id)?.clone(),
+                    state: Arc::clone(&self.terminal_manager.get(terminal_id)?.state),
+                })
             })
-            .collect();
+            .collect()
+    }
 
-        for (terminal_id, backing_path) in terminals_to_sync {
-            if let Some(handle) = self.terminal_manager.get(terminal_id) {
-                if let Ok(mut state) = handle.state.lock() {
-                    // Persist any scrolled-off lines not yet in the file (e.g.
-                    // lines a resize spilled into history on a terminal that was
-                    // never viewed before quitting) so a restored workspace keeps
-                    // the full scrollback.
-                    if let Ok(mut file) = crate::app::terminal::terminal_backing_fs()
-                        .open_file_for_append(&backing_path)
-                    {
-                        let mut writer = BufWriter::new(&mut *file);
-                        if let Err(e) = state.flush_new_scrollback(&mut writer) {
-                            tracing::warn!(
-                                "Failed to flush terminal {:?} scrollback: {}",
-                                terminal_id,
-                                e
-                            );
-                        }
-                    }
-
-                    if let Ok(mut file) = crate::app::terminal::terminal_backing_fs()
-                        .open_file_for_append(&backing_path)
-                    {
-                        let mut writer = BufWriter::new(&mut *file);
-                        if let Err(e) = state.append_visible_screen(&mut writer) {
-                            tracing::warn!(
-                                "Failed to sync terminal {:?} to backing file: {}",
-                                terminal_id,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    /// Synchronous terminal-mode boundary: publish one exact checkpoint before
+    /// the live terminal is replaced by its scrollback buffer.
+    pub(crate) fn publish_terminal_checkpoint(
+        &self,
+        terminal_id: TerminalId,
+    ) -> std::io::Result<crate::app::terminal::TerminalCheckpointPublication> {
+        let history_path = self
+            .terminal_history_files
+            .get(&terminal_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("terminal {:?} has no history artifact", terminal_id),
+                )
+            })?
+            .clone();
+        let state = Arc::clone(
+            &self
+                .terminal_manager
+                .get(terminal_id)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("terminal {:?} disappeared during checkpoint", terminal_id),
+                    )
+                })?
+                .state,
+        );
+        publish_terminal_checkpoint(TerminalCheckpointCapture {
+            history_path,
+            state,
+        })
     }
 
     /// Create an unnamed (unsaved) buffer in this window from recovered
@@ -2492,7 +3369,24 @@ impl crate::app::window::Window {
         self.restore_external_files(&workspace.external_files, &mut path_to_buffer);
         self.apply_read_only_flags(&workspace.read_only_files, &path_to_buffer);
 
-        let terminal_buffer_map = self.restore_terminals_from_workspace(&workspace.terminals);
+        let (terminal_buffer_map, migrated_companion) = self.restore_terminals_from_workspace(
+            &workspace.terminals,
+            workspace.tracked_agent_terminal,
+        );
+        self.tracked_agent_terminal = workspace
+            .tracked_agent_terminal
+            .or(migrated_companion)
+            .and_then(|index| {
+                let buffer_id = terminal_buffer_map.get(&index)?;
+                self.terminal_buffers
+                    .get(buffer_id)
+                    .map(|binding| binding.terminal_id)
+                    .or_else(|| {
+                        self.exited_terminals
+                            .get(buffer_id)
+                            .map(|exited| exited.terminal_id)
+                    })
+            });
 
         let mut split_id_map: HashMap<usize, SplitId> = HashMap::new();
         self.restore_split_node(
@@ -2539,12 +3433,21 @@ impl crate::app::window::Window {
         window
     }
 
-    /// Snapshot THIS window's restorable state into a `Workspace`,
-    /// rooted at `self.root` and reading only window-owned state +
-    /// `self.resources`. The inverse of restore. `plugin_global_state`
-    /// is left empty here — it is editor-global, so the `Editor` wrapper
-    /// fills it in (see `Editor::capture_workspace`).
+    /// Snapshot this window's restorable state without persistence side effects.
     pub(crate) fn capture_workspace(&self) -> Workspace {
+        self.capture_workspace_snapshot(false).0
+    }
+
+    fn capture_workspace_for_persistence(
+        &self,
+    ) -> (Workspace, Vec<(PathBuf, SerializedFileState)>) {
+        self.capture_workspace_snapshot(true)
+    }
+
+    fn capture_workspace_snapshot(
+        &self,
+        capture_file_states: bool,
+    ) -> (Workspace, Vec<(PathBuf, SerializedFileState)>) {
         tracing::debug!("Capturing workspace for {:?}", self.root);
 
         let mut terminals = Vec::new();
@@ -2578,16 +3481,24 @@ impl crate::app::window::Window {
                     .get(&terminal_id)
                     .cloned()
                     .unwrap_or_else(|| {
-                        let root = self.resources.dir_context.terminal_dir_for(&self.root);
-                        root.join(format!("fresh-terminal-{}.log", terminal_id.0))
+                        self.terminal_artifacts_dir()
+                            .join(format!("fresh-terminal-{}.log", terminal_id.0))
+                    });
+                let history_path = self
+                    .terminal_history_files
+                    .get(&terminal_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.terminal_artifacts_dir()
+                            .join(format!("fresh-terminal-{}.history.txt", terminal_id.0))
                     });
                 let backing_path = self
                     .terminal_backing_files
                     .get(&terminal_id)
                     .cloned()
                     .unwrap_or_else(|| {
-                        let root = self.resources.dir_context.terminal_dir_for(&self.root);
-                        root.join(format!("fresh-terminal-{}.txt", terminal_id.0))
+                        self.terminal_artifacts_dir()
+                            .join(format!("fresh-terminal-{}.txt", terminal_id.0))
                     });
 
                 let agent_resume = self
@@ -2613,6 +3524,9 @@ impl crate::app::window::Window {
                     rows,
                     log_path,
                     backing_path,
+                    history_path: Some(history_path),
+                    backing_history_end: None,
+                    checkpoint_generation: None,
                     command,
                     agent_resume,
                     exited: None,
@@ -2648,13 +3562,23 @@ impl crate::app::window::Window {
                 cols: exited.cols,
                 rows: exited.rows,
                 log_path: exited.log_path.clone().unwrap_or_else(|| {
-                    let root = self.resources.dir_context.terminal_dir_for(&self.root);
-                    root.join(format!("fresh-terminal-{}.log", exited.terminal_id.0))
+                    self.terminal_artifacts_dir()
+                        .join(format!("fresh-terminal-{}.log", exited.terminal_id.0))
                 }),
                 backing_path: exited.backing_path.clone().unwrap_or_else(|| {
-                    let root = self.resources.dir_context.terminal_dir_for(&self.root);
-                    root.join(format!("fresh-terminal-{}.txt", exited.terminal_id.0))
+                    self.terminal_artifacts_dir()
+                        .join(format!("fresh-terminal-{}.txt", exited.terminal_id.0))
                 }),
+                history_path: exited.pending_history_migration.is_none().then(|| {
+                    exited.history_path.clone().unwrap_or_else(|| {
+                        self.terminal_artifacts_dir().join(format!(
+                            "fresh-terminal-{}.history.txt",
+                            exited.terminal_id.0
+                        ))
+                    })
+                }),
+                backing_history_end: exited.backing_history_end,
+                checkpoint_generation: exited.checkpoint_generation.clone(),
                 command: exited.command.clone(),
                 agent_resume: exited
                     .resume
@@ -2706,8 +3630,16 @@ impl crate::app::window::Window {
             .collect();
 
         let mut split_states = HashMap::new();
+        let mut file_states = Vec::new();
         for (leaf_id, view_state) in view_states {
             let active_buffer = active_buffers.get(leaf_id).copied();
+            if capture_file_states {
+                if let Some(file_state) = active_buffer
+                    .and_then(|buffer_id| self.capture_buffer_file_state(buffer_id, view_state))
+                {
+                    file_states.push(file_state);
+                }
+            }
             let serialized = serialize_split_view_state(
                 view_state,
                 self.buffers.as_map(),
@@ -2846,7 +3778,7 @@ impl crate::app::window::Window {
             Vec::new()
         };
 
-        Workspace {
+        let workspace = Workspace {
             version: WORKSPACE_VERSION,
             working_dir: self.root.clone(),
             split_layout,
@@ -2858,6 +3790,10 @@ impl crate::app::window::Window {
             search_options,
             bookmarks,
             terminals,
+            tracked_agent_terminal: self
+                .tracked_agent_terminal
+                .and_then(|terminal_id| terminal_indices.get(&terminal_id).copied()),
+
             external_files,
             read_only_files,
             unnamed_buffers,
@@ -2873,7 +3809,8 @@ impl crate::app::window::Window {
             // How to rebuild/reconnect this workspace's backend on restore.
             authority_spec: self.authority_spec.clone(),
             stable_id: Some(self.stable_id.clone()),
-        }
+        };
+        (workspace, file_states)
     }
 }
 
@@ -3324,4 +4261,175 @@ fn get_expanded_dirs(
     }
 
     expanded
+}
+
+#[cfg(test)]
+mod checkpoint_identity_tests {
+    use super::{classify_saved_checkpoint_tail, terminal_artifact_identity, SavedCheckpointTail};
+    use std::path::Path;
+
+    #[test]
+    fn checkpoint_identity_prefers_durable_history_over_serialization_index_paths() {
+        let history = Path::new("terminal-a.history.txt");
+        let old_checkpoint = Path::new("terminal-a.checkpoint-old.txt");
+        let new_checkpoint = Path::new("terminal-a.checkpoint-new.txt");
+
+        assert_eq!(
+            terminal_artifact_identity(Some(history), old_checkpoint),
+            terminal_artifact_identity(Some(history), new_checkpoint),
+        );
+        assert_ne!(
+            terminal_artifact_identity(None, old_checkpoint),
+            terminal_artifact_identity(None, new_checkpoint),
+        );
+    }
+
+    #[test]
+    fn every_bounded_mismatching_tail_is_newer_authoritative_history() {
+        let checkpoint = b"visible-screen-checkpoint";
+        for tail_len in 1..=checkpoint.len() {
+            let mut newer = checkpoint[..tail_len].to_vec();
+            newer[tail_len - 1] ^= 1;
+            assert_eq!(
+                classify_saved_checkpoint_tail(&newer, checkpoint),
+                SavedCheckpointTail::NewerHistory,
+                "tail length {tail_len} must be treated as a legitimate overtake"
+            );
+        }
+    }
+
+    #[test]
+    fn only_exact_checkpoint_prefixes_enter_partial_promotion_recovery() {
+        let checkpoint = b"visible-screen-checkpoint";
+        for tail_len in 1..checkpoint.len() {
+            assert_eq!(
+                classify_saved_checkpoint_tail(&checkpoint[..tail_len], checkpoint),
+                SavedCheckpointTail::MatchingPrefix
+            );
+        }
+        assert_eq!(
+            classify_saved_checkpoint_tail(checkpoint, checkpoint),
+            SavedCheckpointTail::Complete
+        );
+    }
+}
+
+#[cfg(test)]
+mod persistence_worker_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn test_editor(root: &Path) -> crate::app::Editor {
+        let dir_context = crate::config_io::DirectoryContext::for_testing(root);
+        crate::app::Editor::for_test(
+            crate::config::Config::default(),
+            80,
+            24,
+            Some(root.to_path_buf()),
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn persistence_key(
+        editor: &crate::app::Editor,
+        id: fresh_core::WindowId,
+    ) -> WorkspacePersistenceKey {
+        let window = editor.windows.get(&id).unwrap();
+        WorkspacePersistenceKey {
+            workspaces_dir: editor.dir_context.workspaces_dir(),
+            working_dir: window.root.clone(),
+            stable_id: window.stable_id.clone(),
+        }
+    }
+
+    #[test]
+    fn pending_generations_coalesce_to_the_latest_in_serial_order() {
+        let mut state = CoalescingGenerationState::default();
+        let (first_generation, start_worker) = state.enqueue("first");
+        assert!(start_worker);
+        let first = state.take_pending().unwrap();
+        assert_eq!(first.generation, first_generation);
+
+        let (second_generation, start_worker) = state.enqueue("second");
+        assert!(!start_worker);
+        let (third_generation, start_worker) = state.enqueue("third");
+        assert!(!start_worker);
+        assert!(second_generation < third_generation);
+
+        state.finish(first.generation, None);
+        let next = state.take_pending().unwrap();
+        assert_eq!(next.generation, third_generation);
+        assert_eq!(next.payload, "third");
+        state.finish(next.generation, None);
+        assert_eq!(state.completed_generation, third_generation);
+        assert!(state.take_pending().is_none());
+    }
+
+    #[test]
+    fn active_window_switch_returns_before_durable_publication_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let target_root = temp.path().join("target");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&target_root).unwrap();
+        let mut editor = test_editor(&source_root);
+        let source = editor.active_window;
+        let target = editor.create_window_at(target_root, "target".into());
+        let (started, release) = install_persistence_test_gate(persistence_key(&editor, source));
+
+        let before = Instant::now();
+        editor.set_active_window(target);
+        let elapsed = before.elapsed();
+
+        assert_eq!(editor.active_window, target);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "focus switch waited {elapsed:?} for the blocked persistence worker"
+        );
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();
+        editor.save_workspace_for(source).unwrap();
+    }
+
+    #[test]
+    fn durable_barrier_waits_and_newest_generation_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut editor = test_editor(&root);
+        let id = editor.active_window;
+        let stable_id = editor.windows.get(&id).unwrap().stable_id.clone();
+        let dir_context = editor.dir_context.clone();
+        let (started, release) = install_persistence_test_gate(persistence_key(&editor, id));
+
+        editor.windows.get_mut(&id).unwrap().label = "first".into();
+        editor.checkpoint_window_workspace(id);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        editor.windows.get_mut(&id).unwrap().label = "coalesced".into();
+        editor.checkpoint_window_workspace(id);
+        editor.windows.get_mut(&id).unwrap().label = "newest".into();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        let before = Instant::now();
+        editor.save_workspace_for(id).unwrap();
+        assert!(before.elapsed() >= Duration::from_millis(75));
+        releaser.join().unwrap();
+
+        let saved = Workspace::load_by_id_in(&dir_context, &root, &stable_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.label.as_deref(), Some("newest"));
+    }
 }

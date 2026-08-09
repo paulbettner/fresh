@@ -4,8 +4,10 @@ use crate::input::command_registry::CommandRegistry;
 use crate::model::filesystem::FileSystem;
 use crate::services::signal_handler;
 use crate::view::theme;
-use fresh_core::api::DirEntry as PluginDirEntry;
-use fresh_core::services::{PluginFileStat, PluginFilesystem, PluginServiceBridge};
+use fresh_core::api::{AuthorityStamp, DirEntry as PluginDirEntry};
+use fresh_core::services::{
+    NoopPluginFilesystem, PluginFileStat, PluginFilesystem, PluginServiceBridge,
+};
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +26,12 @@ pub struct WindowFsRegistry {
 
 struct WindowFsRegistryInner {
     active: WindowId,
-    map: HashMap<WindowId, Arc<dyn FileSystem + Send + Sync>>,
+    map: HashMap<WindowId, WindowFsEntry>,
+}
+
+struct WindowFsEntry {
+    authority: Option<AuthorityStamp>,
+    filesystem: Arc<dyn FileSystem + Send + Sync>,
 }
 
 impl WindowFsRegistry {
@@ -33,7 +40,13 @@ impl WindowFsRegistry {
     /// refresh, which runs during startup before any plugin executes.
     pub fn new(seed: Arc<dyn FileSystem + Send + Sync>) -> Self {
         let mut map = HashMap::new();
-        map.insert(WindowId(1), seed);
+        map.insert(
+            WindowId(1),
+            WindowFsEntry {
+                authority: None,
+                filesystem: seed,
+            },
+        );
         Self {
             inner: RwLock::new(WindowFsRegistryInner {
                 active: WindowId(1),
@@ -46,19 +59,44 @@ impl WindowFsRegistry {
     pub fn rebuild(
         &self,
         active: WindowId,
-        entries: Vec<(WindowId, Arc<dyn FileSystem + Send + Sync>)>,
+        entries: Vec<(WindowId, AuthorityStamp, Arc<dyn FileSystem + Send + Sync>)>,
     ) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.active = active;
-        inner.map = entries.into_iter().collect();
+        inner.map = entries
+            .into_iter()
+            .map(|(window, authority, filesystem)| {
+                (
+                    window,
+                    WindowFsEntry {
+                        authority: Some(authority),
+                        filesystem,
+                    },
+                )
+            })
+            .collect();
     }
 
-    /// The backend for `window`, or the active window's when `None`. Returns
-    /// `None` if the requested window no longer exists.
-    fn get(&self, window: Option<WindowId>) -> Option<Arc<dyn FileSystem + Send + Sync>> {
-        let inner = self.inner.read().unwrap();
+    /// Resolve one concrete backend. An invocation-bound lookup fails when the
+    /// window has closed or its authority incarnation has been replaced.
+    fn get(
+        &self,
+        window: Option<WindowId>,
+        authority: Option<AuthorityStamp>,
+    ) -> Option<Arc<dyn FileSystem + Send + Sync>> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = window.unwrap_or(inner.active);
-        inner.map.get(&id).cloned()
+        let entry = inner.map.get(&id)?;
+        if authority.is_some_and(|expected| entry.authority != Some(expected)) {
+            return None;
+        }
+        Some(Arc::clone(&entry.filesystem))
     }
 }
 
@@ -68,9 +106,9 @@ impl WindowFsRegistry {
 /// retargeting.
 type FsResolver = Arc<dyn Fn() -> Option<Arc<dyn FileSystem + Send + Sync>> + Send + Sync>;
 
-/// [`PluginFilesystem`] that routes every operation to a backend chosen per
-/// call by its resolver — either a fixed local-host filesystem (`LocalPath`)
-/// or a window's authority looked up live in a [`WindowFsRegistry`].
+/// [`PluginFilesystem`] that routes every operation to one concrete backend.
+/// Authority selection happens once, before this object is returned, so a
+/// reconnect or focus change cannot retarget a multi-step operation.
 pub struct RoutedFilesystem {
     resolve: FsResolver,
 }
@@ -83,12 +121,13 @@ impl RoutedFilesystem {
         }
     }
 
-    /// Route to `window`'s authority (or the active window's) looked up in
-    /// `registry` on each call.
-    pub fn window(registry: Arc<WindowFsRegistry>, window: Option<WindowId>) -> Self {
-        Self {
-            resolve: Arc::new(move || registry.get(window)),
-        }
+    /// Resolve and bind a window authority once.
+    pub fn window(
+        registry: &WindowFsRegistry,
+        window: Option<WindowId>,
+        authority: Option<AuthorityStamp>,
+    ) -> Option<Self> {
+        registry.get(window, authority).map(Self::fixed)
     }
 
     /// Ensure `path`'s parent directory exists, creating it if necessary.
@@ -103,6 +142,56 @@ impl RoutedFilesystem {
             }
         }
         true
+    }
+
+    fn remove_staging(fs: &dyn FileSystem, path: &Path, is_dir: bool) {
+        if !fs.exists(path) {
+            return;
+        }
+        if is_dir {
+            let _ = fs.remove_dir_all(path);
+        } else {
+            let _ = fs.remove_file(path);
+        }
+    }
+
+    /// Complete an EXDEV move without ever copying into the final destination.
+    /// A complete sibling is published with one rename; every earlier failure
+    /// removes the staging tree and leaves both source and destination alone.
+    fn move_across_devices(fs: &dyn FileSystem, from: &Path, to: &Path) -> bool {
+        if fs.exists(to) {
+            return false;
+        }
+        let Some(parent) = to.parent() else {
+            return false;
+        };
+        let name = to
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("move"))
+            .to_string_lossy();
+        let staging = parent.join(format!(
+            ".{name}.fresh-move-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let is_dir = fs.is_dir(from).unwrap_or(false);
+        let copied = if is_dir {
+            fs.copy_dir_all(from, &staging).is_ok()
+        } else {
+            fs.copy(from, &staging).is_ok()
+        };
+        if !copied {
+            Self::remove_staging(fs, &staging, is_dir);
+            return false;
+        }
+        if fs.exists(to) || fs.rename(&staging, to).is_err() {
+            Self::remove_staging(fs, &staging, is_dir);
+            return false;
+        }
+        if is_dir {
+            fs.remove_dir_all(from).is_ok()
+        } else {
+            fs.remove_file(from).is_ok()
+        }
     }
 }
 
@@ -161,23 +250,12 @@ impl PluginFilesystem for RoutedFilesystem {
         let Some(fs) = (self.resolve)() else {
             return false;
         };
-        if fs.rename(from, to).is_ok() {
-            return true;
-        }
-        // Same-backend cross-device fallback: copy then remove the source.
-        let is_dir = fs.is_dir(from).unwrap_or(false);
-        let copied = if is_dir {
-            fs.copy_dir_all(from, to).is_ok()
-        } else {
-            fs.copy(from, to).is_ok()
-        };
-        if !copied {
-            return false;
-        }
-        if is_dir {
-            fs.remove_dir_all(from).is_ok()
-        } else {
-            fs.remove_file(from).is_ok()
+        match fs.rename(from, to) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                Self::move_across_devices(fs.as_ref(), from, to)
+            }
+            Err(_) => false,
         }
     }
 
@@ -226,11 +304,18 @@ impl PluginServiceBridge for EditorServiceBridge {
         self
     }
 
-    fn authority_filesystem(&self, window: Option<u64>) -> Arc<dyn PluginFilesystem> {
-        Arc::new(RoutedFilesystem::window(
-            Arc::clone(&self.window_registry),
+    fn authority_filesystem(
+        &self,
+        window: Option<u64>,
+        authority: Option<AuthorityStamp>,
+    ) -> Arc<dyn PluginFilesystem> {
+        RoutedFilesystem::window(
+            self.window_registry.as_ref(),
             window.map(WindowId),
-        ))
+            authority,
+        )
+        .map(|filesystem| Arc::new(filesystem) as Arc<dyn PluginFilesystem>)
+        .unwrap_or_else(|| Arc::new(NoopPluginFilesystem))
     }
 
     fn local_filesystem(&self) -> Arc<dyn PluginFilesystem> {
@@ -369,5 +454,77 @@ impl PluginServiceBridge for EditorServiceBridge {
     fn theme_file_exists(&self, name: &str) -> bool {
         let themes_dir = self.dir_context.themes_dir();
         themes_dir.join(format!("{}.json", name)).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::filesystem::StdFileSystem;
+
+    #[test]
+    fn cross_device_move_publishes_a_complete_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::write(&source, b"complete").unwrap();
+
+        assert!(RoutedFilesystem::move_across_devices(
+            &StdFileSystem,
+            &source,
+            &destination,
+        ));
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn cross_device_move_never_merges_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(source.join("source-only"), b"source").unwrap();
+        std::fs::write(destination.join("destination-only"), b"destination").unwrap();
+
+        assert!(!RoutedFilesystem::move_across_devices(
+            &StdFileSystem,
+            &source,
+            &destination,
+        ));
+        assert!(source.join("source-only").exists());
+        assert!(destination.join("destination-only").exists());
+        assert!(!destination.join("source-only").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cross_device_move_cleans_staging_after_unsafe_symlink_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let outside = temp.path().join("outside");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(source.join("ordinary"), b"ordinary").unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("escape")).unwrap();
+
+        assert!(!RoutedFilesystem::move_across_devices(
+            &StdFileSystem,
+            &source,
+            &destination,
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+        assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".fresh-move-")
+        }));
     }
 }

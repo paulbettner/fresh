@@ -14,15 +14,15 @@
 //! ## Key Methods
 //!
 //! - `process_output`: Feed PTY bytes into the terminal emulator
-//! - `flush_new_scrollback`: Stream new scrollback lines to backing file
-//! - `append_visible_screen`: Append visible screen on mode exit
-//! - `backing_file_history_end`: Get truncation point for mode re-entry
+//! - `flush_new_scrollback`: Stream new scrollback lines to append-only history
+//! - `append_visible_screen`: Render the screen into a separate checkpoint writer
+//! - `backing_file_history_end`: Track the current durable history boundary
 //!
 //! ## State Tracking
 //!
 //! `synced_history_lines` tracks how many scrollback lines have been written to the
-//! backing file. When `grid.history_size() > synced_history_lines`, new lines need
-//! to be flushed.
+//! append-only history. When `grid.history_size() > synced_history_lines`, new lines
+//! need to be flushed.
 //!
 //! That pointer counts rows from the *oldest surviving* history row, so it only
 //! stays meaningful while that row does. The emulator must therefore never evict
@@ -33,8 +33,7 @@
 //! `history <= synced_history_lines` guard permanently true and stops streaming for
 //! the rest of the session (fresh#2820).
 //!
-//! `backing_file_history_end` tracks the byte offset where scrollback ends in the
-//! backing file, used for truncation when re-entering terminal mode.
+//! `backing_file_history_end` tracks the append-only rendered history's durable byte end.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Scroll;
@@ -464,8 +463,12 @@ pub struct TerminalState {
     /// primary grid's history was reflowed but couldn't be re-anchored yet
     /// (the grid in view was the alt grid). Deferred until alt-screen exit.
     pending_reflow_resync: bool,
-    /// Byte offset in backing file where scrollback ends (for truncation)
+    /// Byte offset of the durable append-only rendered history.
     backing_file_history_end: u64,
+    /// File boundary to restore before retrying a partially published batch.
+    /// Kept on the state so reader, checkpoint, and scrollback-mode flushes
+    /// share one retry fence.
+    backing_file_rollback: Option<u64>,
     /// Queue of data to write back to the PTY (for DSR responses, etc.)
     pty_write_queue: Arc<Mutex<Vec<String>>>,
     /// Pending title set by the program via OSC 0/1/2 (shared with the
@@ -481,6 +484,62 @@ pub struct TerminalState {
     /// lifecycle, OSC 9;4 progress) — the emulator drops these, so we sniff
     /// them from the raw stream too. Drives the workspace working/idle dot.
     osc_activity: OscActivityScanner,
+}
+
+/// Rendered scrollback plus the sync cursor to publish only after the bytes
+/// have reached the backing file successfully.
+pub(crate) struct ScrollbackFlush {
+    bytes: Vec<u8>,
+    lines_written: usize,
+    synced_history_lines: usize,
+    synced_logical_lines: usize,
+    clears_history_overrun: bool,
+}
+
+/// File operations required to publish one scrollback batch durably.
+pub(crate) trait DurableScrollbackWriter: Write {
+    fn len(&self) -> io::Result<u64>;
+    fn set_len(&mut self, len: u64) -> io::Result<()>;
+    fn sync_all(&self) -> io::Result<()>;
+}
+
+impl DurableScrollbackWriter for std::fs::File {
+    fn len(&self) -> io::Result<u64> {
+        self.metadata().map(|metadata| metadata.len())
+    }
+
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        std::fs::File::set_len(self, len)
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        std::fs::File::sync_all(self)
+    }
+}
+
+fn restore_scrollback_boundary<W: DurableScrollbackWriter>(
+    writer: &mut W,
+    boundary: u64,
+) -> io::Result<()> {
+    writer.set_len(boundary)?;
+    writer.sync_all()?;
+    let actual = writer.len()?;
+    if actual != boundary {
+        return Err(io::Error::other(format!(
+            "terminal history rollback length mismatch: expected {boundary}, found {actual}"
+        )));
+    }
+    Ok(())
+}
+
+impl ScrollbackFlush {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn lines_written(&self) -> usize {
+        self.lines_written
+    }
 }
 
 /// What `append_visible_screen` re-attached ahead of the first visible
@@ -533,6 +592,7 @@ impl TerminalState {
             history_overrun: false,
             pending_reflow_resync: false,
             backing_file_history_end: 0,
+            backing_file_rollback: None,
             pty_write_queue,
             pending_title,
             cwd: None,
@@ -757,14 +817,20 @@ impl TerminalState {
             // content sits on the row above. Take that row whole and
             // strip any right-edge padding from it.
             let cells = self.get_line(row - 1);
-            let mut s: String = cells.iter().map(|cell| cell.c).collect();
-            let trimmed_len = s.trim_end_matches(' ').len();
-            s.truncate(trimmed_len);
-            return s;
+            let mut text = String::new();
+            for cell in &cells {
+                cell.append_text_to(&mut text);
+            }
+            let trimmed_len = text.trim_end_matches(' ').len();
+            text.truncate(trimmed_len);
+            return text;
         }
         let cells = self.get_line(row);
-        let take = (col as usize).min(cells.len());
-        cells.iter().take(take).map(|cell| cell.c).collect()
+        let mut text = String::new();
+        for cell in cells.iter().take((col as usize).min(cells.len())) {
+            cell.append_text_to(&mut text);
+        }
+        text
     }
 
     /// Get a line of content for rendering
@@ -799,15 +865,25 @@ impl TerminalState {
             let fg = color_to_rgb(&cell.fg);
             let bg = color_to_rgb(&cell.bg);
 
-            // Check flags
+            // Preserve terminal-cell width and zero-width continuations. A
+            // spacer occupies a grid column but paints/copies no text; combining
+            // marks and ZWJ continuations stay attached to their base cell.
             let flags = cell.flags;
             let bold = flags.contains(Flags::BOLD);
             let italic = flags.contains(Flags::ITALIC);
             let underline = flags.contains(Flags::UNDERLINE);
             let inverse = flags.contains(Flags::INVERSE);
+            let wide_spacer =
+                flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            let zerowidth = cell
+                .zerowidth()
+                .map(|chars| chars.iter().copied().collect())
+                .unwrap_or_default();
 
             cells.push(TerminalCell {
                 c,
+                zerowidth,
+                wide_spacer,
                 fg,
                 bg,
                 bold,
@@ -825,8 +901,8 @@ impl TerminalState {
         let mut result = String::new();
         for row in 0..self.rows {
             let line = self.get_line(row);
-            for cell in line {
-                result.push(cell.c);
+            for cell in &line {
+                cell.append_text_to(&mut result);
             }
             result.push('\n');
         }
@@ -866,8 +942,11 @@ impl TerminalState {
         // Then add visible screen content (line indices 0 to rows-1)
         for row in 0..self.rows {
             let line = self.get_line(row);
-            let line_str: String = line.iter().map(|c| c.c).collect();
-            let trimmed = line_str.trim_end();
+            let mut line_text = String::new();
+            for cell in &line {
+                cell.append_text_to(&mut line_text);
+            }
+            let trimmed = line_text.trim_end();
             result.push_str(trimmed);
             if row < self.rows - 1 {
                 result.push('\n');
@@ -968,59 +1047,144 @@ impl TerminalState {
     /// are written; a trailing line still continuing into the visible screen is
     /// left for a later flush, keeping the file on a logical-line boundary.
     pub fn flush_new_scrollback<W: Write>(&mut self, writer: &mut W) -> io::Result<usize> {
-        use alacritty_terminal::grid::Dimensions;
+        let flush = self.prepare_scrollback_flush()?;
+        writer.write_all(flush.bytes())?;
+        writer.flush()?;
+        let lines_written = flush.lines_written();
+        self.commit_scrollback_flush(flush);
+        Ok(lines_written)
+    }
 
-        if self.history_overrun {
-            // The emulator dropped rows before we streamed them, so the pointer
-            // no longer refers to the rows it was set against. Restart the epoch:
-            // re-emit everything still in history (bounded duplication) rather
-            // than skip past it (unbounded loss).
-            tracing::warn!(
-                "Terminal scrollback overran the grid's {}-row cap; re-streaming \
-                 the surviving history (some lines may be duplicated or lost)",
-                self.grid_history_cap()
-            );
-            self.synced_history_lines = 0;
-            self.synced_logical_lines = 0;
-            self.history_overrun = false;
+    /// Append the next scrollback batch as one durable transaction.
+    ///
+    /// The grid cursor advances only after the bytes are written, flushed,
+    /// synced, and the exact resulting length is verified. Any failed attempt
+    /// is truncated back to its captured boundary; a failed rollback remains
+    /// recorded on the terminal state and fences the next caller before retry.
+    pub(crate) fn persist_new_scrollback<W: DurableScrollbackWriter>(
+        &mut self,
+        writer: &mut W,
+    ) -> io::Result<usize> {
+        if let Some(boundary) = self.backing_file_rollback {
+            restore_scrollback_boundary(writer, boundary)?;
+            self.backing_file_rollback = None;
         }
 
-        let history = self.term.grid().history_size();
-        if history <= self.synced_history_lines {
-            // Nothing new — but history may still sit above the retained window
-            // (an in-progress wrapped line can block a trim), so still try.
-            self.trim_synced_history();
+        let rollback_boundary = writer.len()?;
+        let flush = self.prepare_scrollback_flush()?;
+        let lines_written = flush.lines_written();
+        if lines_written == 0 {
+            self.commit_scrollback_flush(flush);
+            self.backing_file_history_end = rollback_boundary;
             return Ok(0);
         }
+        let expected_end = rollback_boundary
+            .checked_add(u64::try_from(flush.bytes().len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "terminal scrollback batch exceeds the durable file offset range",
+                )
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "terminal scrollback history length overflow",
+                )
+            })?;
 
-        // History rows oldest→newest map to k = 0..history via line index
-        // -(history - k); -history is oldest, -1 is newest (just above visible).
-        // Write every complete logical line past the pointer, advancing the
-        // pointer only past lines actually written — so a line is never skipped,
-        // i.e. never lost. (A grow that rewinds the boundary may re-write a
-        // bounded handful of lines; duplication is the accepted trade-off.)
-        let mut written = 0usize;
-        let mut line_start = self.synced_history_lines;
-        let mut k = self.synced_history_lines;
-        while k < history {
-            let line_idx = -((history - k) as i32);
-            if self.row_wraps(Line(line_idx)) {
-                // Logical line continues onto the next row.
-                k += 1;
-                continue;
+        let publication = writer
+            .write_all(flush.bytes())
+            .and_then(|()| writer.flush())
+            .and_then(|()| writer.sync_all())
+            .and_then(|()| writer.len())
+            .and_then(|actual_end| {
+                if actual_end == expected_end {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "terminal history length mismatch: expected {expected_end}, found {actual_end}"
+                    )))
+                }
+            });
+        match publication {
+            Ok(()) => {
+                self.commit_scrollback_flush(flush);
+                self.backing_file_history_end = expected_end;
+                Ok(lines_written)
             }
-            // Row k ends a logical line spanning rows [line_start ..= k].
-            self.write_logical_line(writer, line_start, k, history)?;
-            written += 1;
-            self.synced_logical_lines += 1;
-            k += 1;
-            self.synced_history_lines = k;
-            line_start = k;
+            Err(error) => {
+                self.backing_file_rollback = Some(rollback_boundary);
+                if restore_scrollback_boundary(writer, rollback_boundary).is_ok() {
+                    self.backing_file_rollback = None;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Render the next complete scrollback batch without advancing the sync
+    /// cursor. The terminal reader publishes this cursor only after its backing
+    /// file flush succeeds, so a failed flush remains retryable from the grid.
+    pub(crate) fn prepare_scrollback_flush(&self) -> io::Result<ScrollbackFlush> {
+        use alacritty_terminal::grid::Dimensions;
+
+        let clears_history_overrun = self.history_overrun;
+        let (mut synced_history_lines, mut synced_logical_lines) = if clears_history_overrun {
+            tracing::warn!(
+                "Terminal scrollback overran the grid's {}-row cap; re-streaming \
+                     the surviving history (some lines may be duplicated or lost)",
+                self.grid_history_cap()
+            );
+            (0, 0)
+        } else {
+            (self.synced_history_lines, self.synced_logical_lines)
+        };
+
+        let history = self.term.grid().history_size();
+        let mut bytes = Vec::new();
+        let mut lines_written = 0usize;
+        if history > synced_history_lines {
+            // History rows oldest→newest map to k = 0..history via line index
+            // -(history - k); -history is oldest, -1 is newest (just above visible).
+            let mut line_start = synced_history_lines;
+            let mut k = synced_history_lines;
+            while k < history {
+                let line_idx = -((history - k) as i32);
+                if self.row_wraps(Line(line_idx)) {
+                    // Logical line continues onto the next row.
+                    k += 1;
+                    continue;
+                }
+                // Row k ends a logical line spanning rows [line_start ..= k].
+                self.write_logical_line(&mut bytes, line_start, k, history)?;
+                lines_written += 1;
+                synced_logical_lines += 1;
+                k += 1;
+                synced_history_lines = k;
+                line_start = k;
+            }
+        }
+
+        Ok(ScrollbackFlush {
+            bytes,
+            lines_written,
+            synced_history_lines,
+            synced_logical_lines,
+            clears_history_overrun,
+        })
+    }
+
+    /// Publish a successfully-written batch and trim only rows now known to be
+    /// represented by the backing file.
+    pub(crate) fn commit_scrollback_flush(&mut self, flush: ScrollbackFlush) {
+        self.synced_history_lines = flush.synced_history_lines;
+        self.synced_logical_lines = flush.synced_logical_lines;
+        if flush.clears_history_overrun {
+            self.history_overrun = false;
         }
         // Any rows past `synced_history_lines` form an incomplete logical line
         // (its final row wraps into the visible screen); leave them uncommitted.
         self.trim_synced_history();
-        Ok(written)
     }
 
     /// The grid's hard history cap — the retained window plus staging margin.
@@ -1246,6 +1410,9 @@ impl TerminalState {
             let fg = color_to_rgb(&cell.fg);
             let bg = color_to_rgb(&cell.bg);
             let flags = cell.flags;
+            if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
             let bold = flags.contains(Flags::BOLD);
             let italic = flags.contains(Flags::ITALIC);
             let underline = flags.contains(Flags::UNDERLINE);
@@ -1315,20 +1482,18 @@ impl TerminalState {
             }
 
             out.push(cell.c);
+            if let Some(zerowidth) = cell.zerowidth() {
+                out.extend(zerowidth.iter().copied());
+            }
         }
     }
 
-    /// Get the byte offset where scrollback history ends in the backing file.
-    ///
-    /// Used for truncating the file when re-entering terminal mode
-    /// (to remove the visible screen portion).
+    /// Byte offset of the durable append-only rendered history.
     pub fn backing_file_history_end(&self) -> u64 {
         self.backing_file_history_end
     }
 
-    /// Set the byte offset where scrollback history ends.
-    ///
-    /// Call this after flushing scrollback to record the file position.
+    /// Record the durable end after a successful scrollback flush.
     pub fn set_backing_file_history_end(&mut self, offset: u64) {
         self.backing_file_history_end = offset;
     }
@@ -1352,6 +1517,10 @@ impl TerminalState {
 pub struct TerminalCell {
     /// The character
     pub c: char,
+    /// Zero-width codepoints attached to `c` by the terminal emulator.
+    pub zerowidth: Vec<char>,
+    /// Grid-width continuation marker for a preceding wide grapheme.
+    pub wide_spacer: bool,
     /// Foreground color as RGB
     pub fg: Option<(u8, u8, u8)>,
     /// Background color as RGB
@@ -1370,6 +1539,8 @@ impl Default for TerminalCell {
     fn default() -> Self {
         Self {
             c: ' ',
+            zerowidth: Vec::new(),
+            wide_spacer: false,
             fg: None,
             bg: None,
             bold: false,
@@ -1377,6 +1548,16 @@ impl Default for TerminalCell {
             underline: false,
             inverse: false,
         }
+    }
+}
+
+impl TerminalCell {
+    pub fn append_text_to(&self, output: &mut String) {
+        if self.wide_spacer {
+            return;
+        }
+        output.push(self.c);
+        output.extend(self.zerowidth.iter().copied());
     }
 }
 
@@ -1488,6 +1669,22 @@ mod tests {
         state.process_output(b"Hello, World!");
         let content = state.content_string();
         assert!(content.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn terminal_cells_preserve_combining_zwj_and_wide_spacers() {
+        let mut state = TerminalState::new(12, 2);
+        state.process_output("e\u{301}界👩\u{200d}💻".as_bytes());
+
+        let line = state.get_line(0);
+        let mut text = String::new();
+        for cell in &line {
+            cell.append_text_to(&mut text);
+        }
+
+        assert!(text.starts_with("e\u{301}界👩\u{200d}💻"));
+        assert!(line.iter().any(|cell| cell.wide_spacer));
+        assert!(line.iter().any(|cell| !cell.zerowidth.is_empty()));
     }
 
     #[test]
@@ -2056,6 +2253,19 @@ mod tests {
             output.contains("Line C"),
             "Visible screen should contain Line C"
         );
+    }
+
+    #[test]
+    fn visible_screen_preserves_wide_combining_and_zwj_graphemes() {
+        let mut state = TerminalState::new(20, 2);
+        let text = "界e\u{301}👩\u{200d}💻";
+        state.process_output(text.as_bytes());
+
+        let mut buffer = Vec::new();
+        state.append_visible_screen(&mut buffer).unwrap();
+
+        let captured = String::from_utf8(buffer).unwrap();
+        assert_eq!(captured.lines().next(), Some(text));
     }
 
     /// fresh#2649: a single logical line taller than the pane leaves its

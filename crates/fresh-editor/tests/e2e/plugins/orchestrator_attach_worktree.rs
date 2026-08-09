@@ -18,11 +18,81 @@
 
 #![cfg(feature = "plugins")]
 
-use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
+use crate::common::fail_retirement_write_fs::FailRetirementWriteFs;
+use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
+use fresh::config_io::DirectoryContext;
 use portable_pty::{native_pty_system, PtySize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+
+const FOCUS_RESULT_FILE: &str = ".focus-probe-result";
+const FOCUS_PROBE: &str = r#"/// <reference path="./lib/fresh.d.ts" />
+/// @depends-on orchestrator
+const editor = getEditor();
+
+type FocusWorkspaceRow = { windowId: number; root: string };
+type FocusOrchestratorApi = {
+  listWorkspaces(): FocusWorkspaceRow[];
+  focusWorkspace(target: number): Promise<boolean>;
+};
+
+async function probeDiscoveredFocus(): Promise<void> {
+  const api = editor.getPluginApi("orchestrator") as FocusOrchestratorApi | null;
+  if (!api) throw new Error("orchestrator API missing");
+  const discovered = api.listWorkspaces().find((row) => row.windowId < 0);
+  if (!discovered) {
+    editor.setStatus("FOCUS_ERROR:no discovered workspace");
+    return;
+  }
+  const sourceRoot = editor.listWindows().find((window) =>
+    window.id === editor.activeWindow()
+  )?.root;
+  try {
+    const focused = await api.focusWorkspace(discovered.windowId);
+    const result = `FOCUS:${focused}`;
+    if (sourceRoot) editor.writeFile(`${sourceRoot}/.focus-probe-result`, result);
+    editor.setStatus(result);
+  } catch (error) {
+    const result = `FOCUS_ERROR:${String(error)}`;
+    if (sourceRoot) editor.writeFile(`${sourceRoot}/.focus-probe-result`, result);
+    editor.setStatus(result);
+  }
+}
+
+async function probeSupersededFocus(): Promise<void> {
+  const api = editor.getPluginApi("orchestrator") as FocusOrchestratorApi | null;
+  if (!api) throw new Error("orchestrator API missing");
+  const discovered = api.listWorkspaces().filter((row) => row.windowId < 0);
+  if (discovered.length < 2) {
+    editor.setStatus("SUPERSEDED_ERROR:not enough discovered workspaces");
+    return;
+  }
+  const firstRoot = discovered[0].root;
+  const first = api.focusWorkspace(discovered[0].windowId);
+  const second = api.focusWorkspace(discovered[1].windowId);
+  const [firstFocused, secondFocused] = await Promise.all([first, second]);
+  const firstRows = api.listWorkspaces().filter((row) => row.root === firstRoot);
+  editor.setStatus(
+    `SUPERSEDED:${firstFocused}:${secondFocused}:${firstRows.length}:` +
+      `${firstRows.every((row) => row.windowId > 0)}`,
+  );
+}
+registerHandler("probeSupersededFocus", probeSupersededFocus);
+editor.registerCommand(
+  "Test: Supersede Discovered Workspace Focus",
+  "",
+  "probeSupersededFocus",
+);
+registerHandler("probeDiscoveredFocus", probeDiscoveredFocus);
+editor.registerCommand(
+  "Test: Focus Discovered Workspace",
+  "",
+  "probeDiscoveredFocus",
+);
+"#;
 
 fn pty_available() -> bool {
     native_pty_system()
@@ -54,6 +124,25 @@ fn canonical_dir(p: &Path) -> PathBuf {
         }
     }
     c
+}
+
+/// Find terminal text by grapheme cells, skipping continuation columns for
+/// wide clusters instead of relying on the screen string's serialization.
+fn cell_text_position(harness: &EditorTestHarness, needle: &str) -> Option<(u16, u16)> {
+    let area = harness.buffer().area;
+    for y in area.y..area.y + area.height {
+        'start: for start in area.x..area.x + area.width {
+            let mut x = start;
+            for grapheme in needle.graphemes(true) {
+                if harness.get_cell(x, y).as_deref() != Some(grapheme) {
+                    continue 'start;
+                }
+                x = x.saturating_add(fresh_core::display_width::str_width(grapheme) as u16);
+            }
+            return Some((start, y));
+        }
+    }
+    None
 }
 
 /// Run a git subcommand in `cwd`, panicking with stderr on failure.
@@ -107,6 +196,10 @@ fn set_up_repo_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (temp, repo, worktree)
 }
 
+fn install_focus_probe(repo: &Path) {
+    std::fs::write(repo.join("plugins/focus_probe.ts"), FOCUS_PROBE).unwrap();
+}
+
 /// Like `set_up_repo_with_worktree` but adds two linked worktrees
 /// (`feature-x`, `feature-y`) so multi-select / bulk flows have more
 /// than one discovered row to work with. Returns (guard, repo, wt1,
@@ -157,6 +250,21 @@ fn wait_for_command(harness: &mut EditorTestHarness, name: &str) {
                 .iter()
                 .any(|c| c.get_localized_name() == owned)
         })
+        .unwrap();
+}
+
+fn run_palette_command(harness: &mut EditorTestHarness, name: &str) {
+    wait_for_command(harness, name);
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text(name).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains(name))
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
 }
 
@@ -297,6 +405,50 @@ fn discovered_worktree_preview_offers_open() {
                 harness.screen_to_string()
             )
         });
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Open"),
+        "discovered preview must expose its only valid action. Screen:\n{screen}",
+    );
+    for invalid in ["Stop", "Archive", "Delete"] {
+        assert!(
+            !screen.contains(invalid),
+            "discovered preview must not expose `{invalid}` before a live window exists. Screen:\n{screen}",
+        );
+    }
+}
+
+/// Branch truncation is measured in terminal cells and never slices through a
+/// grapheme cluster. This compound emoji is one grapheme but several Unicode
+/// scalar values; thirteen two-cell clusters plus an ellipsis fit the 28-cell
+/// branch budget.
+#[test]
+fn discovered_branch_truncation_preserves_wide_graphemes() {
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
+    let cluster = "👩🏽‍💻";
+    let long_branch = cluster.repeat(20);
+    git(&wt, &["branch", "-m", &long_branch]);
+
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Open");
+    open_orchestrator_dialog(&mut harness);
+    ensure_worktrees_shown(&mut harness);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("· on-disk"))
+        .unwrap();
+    navigate_to_discovered_row(&mut harness);
+
+    let expected = format!("▸ {}…", cluster.repeat(13));
+    harness
+        .wait_until(|h| cell_text_position(h, &expected).is_some())
+        .unwrap_or_else(|_| {
+            panic!(
+                "branch should truncate to complete graphemes within 28 cells; expected {expected:?}. Screen:\n{}",
+                harness.screen_to_string(),
+            )
+        });
 }
 
 /// Diving a discovered worktree opens a real session there: the
@@ -310,7 +462,7 @@ fn diving_discovered_worktree_attaches_managed_session() {
         eprintln!("skipping: no PTY available in this environment");
         return;
     }
-    let (_temp, repo, _wt) = set_up_repo_with_worktree();
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
     let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
     harness.tick_and_render().unwrap();
     wait_for_command(&mut harness, "Orchestrator: Open");
@@ -329,11 +481,11 @@ fn diving_discovered_worktree_attaches_managed_session() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
 
-    // Attach is async (`createWindowWithTerminal`). Synchronize on the
-    // new window existing before reopening so the dialog's one-shot
-    // discovery scan sees the worktree as live, not on-disk.
+    // Attach is async and the session window exists before its activation
+    // command is applied. Wait for the corrected contract—the worktree is
+    // active—before issuing a new selection that would supersede the intent.
     harness
-        .wait_until(|h| h.editor().session_count() >= 2)
+        .wait_until(|h| canonical_dir(&h.editor().active_window().root) == canonical_dir(&wt))
         .unwrap();
 
     // Reopen the dialog. The worktree is now a live session, so the
@@ -364,6 +516,86 @@ fn diving_discovered_worktree_attaches_managed_session() {
         "attached worktree session must not be flagged shared (`⇄`).\nRow: {}\nScreen:\n{}",
         feature_line,
         screen,
+    );
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn focus_workspace_reports_success_only_after_activation() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
+    install_focus_probe(&repo);
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Test: Focus Discovered Workspace");
+
+    open_orchestrator_dialog(&mut harness);
+    ensure_worktrees_shown(&mut harness);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("· on-disk"))
+        .unwrap();
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+
+    let focus_result = repo.join(FOCUS_RESULT_FILE);
+    run_palette_command(&mut harness, "Test: Focus Discovered Workspace");
+    harness
+        .wait_until(|h| {
+            let active = canonical_dir(&h.editor().active_window().root) == canonical_dir(&wt);
+            let result = std::fs::read_to_string(&focus_result).ok();
+            assert!(
+                result.as_deref() != Some("FOCUS:true") || active,
+                "focusWorkspace resolved before the requested worktree became active"
+            );
+            active && result.as_deref() == Some("FOCUS:true")
+        })
+        .unwrap();
+    assert_eq!(
+        canonical_dir(&harness.editor().active_window().root),
+        canonical_dir(&wt),
+        "focusWorkspace(true) must mean the requested worktree is active",
+    );
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach probes a Unix worktree session.
+fn focus_workspace_propagates_attach_failure() {
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
+    install_focus_probe(&repo);
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Test: Focus Discovered Workspace");
+
+    // Let discovery capture the row, then make that target unsafe before the
+    // API call. The row remains the requested identity, while attach must fail.
+    open_orchestrator_dialog(&mut harness);
+    ensure_worktrees_shown(&mut harness);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("· on-disk"))
+        .unwrap();
+    git(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+
+    let focus_result = repo.join(FOCUS_RESULT_FILE);
+    run_palette_command(&mut harness, "Test: Focus Discovered Workspace");
+    harness
+        .wait_until(|_| {
+            std::fs::read_to_string(&focus_result)
+                .ok()
+                .is_some_and(|result| result.contains("FOCUS_ERROR:"))
+        })
+        .unwrap_or_else(|_| panic!("focusWorkspace swallowed attach failure"));
+    assert_eq!(
+        canonical_dir(&harness.editor().active_window().root),
+        canonical_dir(&repo),
+        "failed focusWorkspace must leave the current workspace active",
+    );
+    assert_eq!(
+        harness.editor().session_count(),
+        1,
+        "failed attach must not leave a window behind",
     );
 }
 
@@ -504,8 +736,20 @@ fn space_selects_rows_and_shows_bulk_bar() {
 /// keyboard.
 #[test]
 fn bulk_delete_removes_selected_worktrees() {
-    let (_temp, repo, wt1, wt2) = set_up_repo_with_two_worktrees();
-    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    let (temp, repo, wt1, wt2) = set_up_repo_with_two_worktrees();
+    let dir_context = DirectoryContext::for_testing(temp.path());
+    let state_path = dir_context
+        .data_dir
+        .join("orchestrator/state/orchestrator.json");
+    let mut harness = EditorTestHarness::create(
+        160,
+        50,
+        HarnessOptions::new()
+            .with_working_dir(repo.clone())
+            .with_shared_dir_context(dir_context)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
     harness.tick_and_render().unwrap();
     wait_for_command(&mut harness, "Orchestrator: Open");
 
@@ -555,18 +799,24 @@ fn bulk_delete_removes_selected_worktrees() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
 
-    // Both worktree directories should be removed from disk.
+    // Both worktree directories should be removed from disk. Stop on a
+    // surfaced transaction failure too so the regression reports its durable
+    // state instead of waiting forever.
     harness
-        .wait_until(|_| !wt1.exists() && !wt2.exists())
-        .unwrap_or_else(|_| {
-            panic!(
-                "bulk delete should `git worktree remove` both worktrees.\n\
-                 wt1.exists()={} wt2.exists()={}\nScreen:\n{}",
-                wt1.exists(),
-                wt2.exists(),
-                harness.screen_to_string()
-            )
-        });
+        .wait_until(|h| {
+            (!wt1.exists() && !wt2.exists()) || h.screen_to_string().contains("delete failed")
+        })
+        .unwrap();
+    assert!(
+        !wt1.exists() && !wt2.exists(),
+        "bulk delete should `git worktree remove` both worktrees.\n\
+         wt1.exists()={} wt2.exists()={}\nState:\n{}\nScreen:\n{}",
+        wt1.exists(),
+        wt2.exists(),
+        std::fs::read_to_string(&state_path)
+            .unwrap_or_else(|error| format!("<unreadable: {error}>")),
+        harness.screen_to_string()
+    );
 }
 
 /// Build a repo with `n` linked worktrees `feat-1..feat-n`, plus the
@@ -824,6 +1074,58 @@ fn wait_dock_rows_of(harness: &mut EditorTestHarness, a: &str, b: &str) -> (usiz
     rows.unwrap()
 }
 
+fn attach_feature_x_from_dock(harness: &mut EditorTestHarness) {
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("feature-x") && s.contains("· on-disk")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "dock should reveal the on-disk `feature-x` worktree.\nScreen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("feature-x") && !s.contains("· on-disk")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "arrowing onto `feature-x` should attach it.\nScreen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+    harness
+        .wait_until(|h| h.editor().session_count() >= 2)
+        .unwrap();
+}
+
+fn confirm_delete_selected_dock_row(harness: &mut EditorTestHarness) {
+    harness.send_key(KeyCode::F(2), KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Delete"))
+        .unwrap();
+    for _ in 0..4 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Confirm Delete"))
+        .unwrap();
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+}
+
 /// Clicking a discovered (on-disk) worktree row in the *dock* opens it
 /// directly — it attaches a managed session at that worktree, the same
 /// outcome the Open dialog produces. There's no live window to switch
@@ -898,7 +1200,7 @@ fn dock_arrow_nav_opens_discovered_worktree() {
         eprintln!("skipping: no PTY available in this environment");
         return;
     }
-    let (_temp, repo, _wt) = set_up_repo_with_worktree();
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
     let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
     harness.tick_and_render().unwrap();
     wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
@@ -938,6 +1240,181 @@ fn dock_arrow_nav_opens_discovered_worktree() {
                 harness.screen_to_string()
             )
         });
+    assert_eq!(
+        canonical_dir(&harness.editor().active_window().root),
+        canonical_dir(&wt),
+        "arrow activation must resolve only after the attached worktree is the active window",
+    );
+}
+
+/// If navigation changes while an attach is settling, only the current row may
+/// become active. A completed request for an older highlight must not steal
+/// focus back from the user's latest selection.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn dock_attach_activation_follows_latest_selection() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, _wt1, wt2) = set_up_repo_with_two_worktrees();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
+    open_dock(&mut harness);
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("feature-x") && screen.contains("feature-y")
+        })
+        .unwrap();
+
+    // Start moving toward feature-x, then immediately make feature-y the
+    // authoritative selection before either async activation may commit.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| canonical_dir(&h.editor().active_window().root) == canonical_dir(&wt2))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the latest dock selection must own activation. Screen:\n{}",
+                harness.screen_to_string(),
+            )
+        });
+}
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn superseded_attach_flight_is_still_finalized() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, _wt1, wt2) = set_up_repo_with_two_worktrees();
+    install_focus_probe(&repo);
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo).unwrap();
+    harness.tick_and_render().unwrap();
+    open_orchestrator_dialog(&mut harness);
+    ensure_worktrees_shown(&mut harness);
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+
+    run_palette_command(&mut harness, "Test: Supersede Discovered Workspace Focus");
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .get_status_message()
+                .is_some_and(|status| status.contains("SUPERSEDED:false:true:1:true"))
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "superseded attach was not finalized exactly once: {:?}\n{}",
+                harness.editor().get_status_message(),
+                harness.screen_to_string(),
+            )
+        });
+    assert_eq!(
+        canonical_dir(&harness.editor().active_window().root),
+        canonical_dir(&wt2),
+    );
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn post_create_target_lease_loss_compensates_exact_workspace() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (temp, repo, wt) = set_up_repo_with_worktree();
+    install_focus_probe(&repo);
+    let dir_context = DirectoryContext::for_testing(&temp.path().join("data-home"));
+    let fault_fs = Arc::new(FailRetirementWriteFs::lose_target_lease_after_workspace(
+        dir_context.workspaces_dir(),
+        canonical_dir(&wt).to_string_lossy().into_owned(),
+    ));
+    let mut harness = EditorTestHarness::create(
+        160,
+        50,
+        HarnessOptions::new()
+            .with_working_dir(repo)
+            .with_shared_dir_context(dir_context.clone())
+            .with_filesystem(fault_fs.clone()),
+    )
+    .unwrap();
+    harness.tick_and_render().unwrap();
+    open_orchestrator_dialog(&mut harness);
+    ensure_worktrees_shown(&mut harness);
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    fault_fs.arm();
+
+    run_palette_command(&mut harness, "Test: Focus Discovered Workspace");
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .get_status_message()
+                .is_some_and(|status| status.contains("FOCUS_ERROR:"))
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "post-create lease loss did not reject: {:?}\n{}",
+                harness.editor().get_status_message(),
+                harness.screen_to_string(),
+            )
+        });
+    assert!(!fault_fs.is_armed(), "target lease fault was not exercised");
+    assert_eq!(
+        harness.editor().session_count(),
+        1,
+        "lease-lost attach leaked its created window",
+    );
+    assert!(
+        fresh::workspace::inspect_workspace_persistence_in(&dir_context, &wt)
+            .unwrap()
+            .is_empty(),
+        "lease-lost attach leaked its exact workspace persistence",
+    );
+}
+
+/// A click can race the dock's delayed arrow-navigation activation for the
+/// same discovered worktree. Both gestures must join one attach flight; even
+/// a late debounce after the first attach resolves must reuse the live window.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn dock_click_and_debounced_arrow_share_one_attach_flight() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, _wt) = set_up_repo_with_worktree();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
+    open_dock(&mut harness);
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("· on-disk"))
+        .unwrap();
+
+    let row = wait_dock_row_of(&mut harness, "· on-disk") as u16;
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.mouse_click(3, row).unwrap();
+    harness
+        .wait_until(|h| h.editor().session_count() >= 2)
+        .unwrap();
+
+    // Give the 30ms arrow debounce ample time to fire after the click path.
+    // A duplicate flight would materialize a third window.
+    harness.sleep(std::time::Duration::from_millis(250));
+    harness.tick_and_render().unwrap();
+    assert_eq!(
+        harness.editor().session_count(),
+        2,
+        "racing worktree activations created duplicate windows"
+    );
 }
 
 /// Opening a discovered worktree from the dock keeps it in the *same row*
@@ -1010,32 +1487,42 @@ fn dock_opening_worktree_keeps_its_row_position() {
     );
 }
 
-/// Archiving the *last* session — which is also the launch / in-place
-/// session (no dedicated worktree) — must not be refused. Every session
-/// is archivable now: the launch workspace is recorded at its own root and,
-/// because it's the only live window, a replacement terminal session is
-/// opened in its project first so the editor is never left empty.
-///
-/// Before the fix this was doubly blocked: `enterConfirm` refused both
-/// "no worktree to archive" and "last window", so the confirm step never
-/// even appeared.
+/// An in-place session does not own a movable worktree. Archive must stay
+/// unavailable and leave its durable workspace record untouched.
 #[test]
-#[cfg_attr(target_os = "windows", ignore)] // replacement spawns a Unix shell terminal.
-fn archive_last_in_place_session_opens_replacement() {
-    if !pty_available() {
-        eprintln!("skipping: no PTY available in this environment");
-        return;
-    }
-    // Only the launch workspace exists (the on-disk worktree is never
-    // attached here) — an in-place session with no dedicated worktree.
-    let (_temp, repo, _wt) = set_up_repo_with_worktree();
-    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+fn archive_in_place_session_is_unavailable_and_preserves_persistence() {
+    let (temp, repo, _wt) = set_up_repo_with_worktree();
+    let dir_context = DirectoryContext::for_testing(temp.path());
+    let mut harness = EditorTestHarness::create(
+        160,
+        50,
+        HarnessOptions::new()
+            .with_working_dir(repo.clone())
+            .with_shared_dir_context(dir_context)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
     harness.tick_and_render().unwrap();
     wait_for_command(&mut harness, "Orchestrator: Open");
 
+    // This independently persisted record would be removed by the archive
+    // transaction's root-wide persistence deletion if Archive were admitted.
+    let workspace_file = harness
+        .editor()
+        .dir_context()
+        .data_dir
+        .join("workspaces")
+        .join(format!(
+            "{}.in-place-archive-guard.json",
+            fresh::workspace::encode_path_for_filename(&repo),
+        ));
+    let mut persisted = fresh::workspace::Workspace::new(repo.clone());
+    persisted.stable_id = Some("in-place-archive-guard".to_string());
+    let persisted_bytes = serde_json::to_vec_pretty(&persisted).unwrap();
+    std::fs::create_dir_all(workspace_file.parent().unwrap()).unwrap();
+    std::fs::write(&workspace_file, &persisted_bytes).unwrap();
+
     open_orchestrator_dialog(&mut harness);
-    // The launch workspace is a trivial (empty) session, hidden by default;
-    // Alt+I reveals it so it can be selected.
     harness
         .send_key(KeyCode::Char('i'), KeyModifiers::ALT)
         .unwrap();
@@ -1048,13 +1535,52 @@ fn archive_last_in_place_session_opens_replacement() {
             )
         });
 
-    // Focus opens on Visit; Tab to the Archive button (Stop is disabled
-    // for the terminal-less launch workspace, so the cycle skips it:
-    // visit -> toggle-details -> archive). Activate it to open the
-    // confirm. Without the fix Archive is disabled (dropped from the Tab
-    // cycle) and the action is refused, so the confirm never shows.
-    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    let (archive_col, archive_row) = cell_text_position(&harness, "Archive")
+        .expect("in-place preview should render its disabled Archive action");
+    harness.mouse_click(archive_col, archive_row).unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        !harness.screen_to_string().contains("Confirm Archive"),
+        "disabled Archive must not admit an in-place session.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+    assert_eq!(
+        std::fs::read(&workspace_file).unwrap(),
+        persisted_bytes,
+        "refusing Archive must preserve the in-place workspace persistence"
+    );
+}
+
+/// Archiving moves a linked worktree under the private data directory. Git
+/// still lists that moved worktree, but refreshing discovery must not surface
+/// it as an attachable row.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn archiving_worktree_session_does_not_resurface_as_discovered() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
+    let archive_root = harness
+        .editor()
+        .dir_context()
+        .data_dir
+        .join("orchestrator/archives");
+
+    open_dock(&mut harness);
+    attach_feature_x_from_dock(&mut harness);
+    harness.send_key(KeyCode::F(2), KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Archive"))
+        .unwrap();
+    // Visit → Rename → Move → Archive.
+    for _ in 0..3 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
@@ -1062,30 +1588,52 @@ fn archive_last_in_place_session_opens_replacement() {
         .wait_until(|h| h.screen_to_string().contains("Confirm Archive"))
         .unwrap_or_else(|_| {
             panic!(
-                "archiving the launch workspace should reach the confirm step.\n\
-                 Screen:\n{}",
+                "Archive should open its confirmation panel.\nScreen:\n{}",
                 harness.screen_to_string()
             )
         });
-
-    // Confirm (Cancel is focused first; Tab -> Confirm Archive).
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
 
-    // The launch workspace is archived; because it was the only window, a
-    // replacement terminal session was opened in its project — so the
-    // editor still hosts a live session, now a *Terminal*.
+    let archive_prefix = archive_root.to_string_lossy().replace('\\', "/");
     harness
-        .wait_until(|h| h.screen_to_string().contains("Terminal"))
+        .wait_until(|_| {
+            !wt.exists()
+                && Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .current_dir(&repo)
+                    .output()
+                    .ok()
+                    .is_some_and(|output| {
+                        String::from_utf8_lossy(&output.stdout)
+                            .replace('\\', "/")
+                            .contains(archive_prefix.as_str())
+                    })
+        })
         .unwrap_or_else(|_| {
             panic!(
-                "archiving the last session should open a replacement terminal \
-                 session.\nScreen:\n{}",
+                "Archive should move feature-x under the archive root. wt.exists()={}\nScreen:\n{}",
+                wt.exists(),
                 harness.screen_to_string()
             )
         });
+
+    // Toggle the discovered-worktree view off and back on, forcing a fresh
+    // `git worktree list` scan after the move.
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        !harness.screen_to_string().contains("feature-x"),
+        "the archived worktree reappeared as a discovered row after refresh.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
 }
 
 /// End-to-end guard for deleting a *live* worktree session from the dock's
@@ -1120,78 +1668,8 @@ fn deleting_worktree_session_from_dock_does_not_resurrect_it() {
     wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
 
     open_dock(&mut harness);
-
-    // Alt+T reveals the discovered on-disk worktree below the base session.
-    harness
-        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
-        .unwrap();
-    harness
-        .wait_until(|h| {
-            let s = h.screen_to_string();
-            s.contains("feature-x") && s.contains("· on-disk")
-        })
-        .unwrap_or_else(|_| {
-            panic!(
-                "dock should reveal the on-disk `feature-x` worktree after Alt+T.\n\
-                 Screen:\n{}",
-                harness.screen_to_string()
-            )
-        });
-
-    // Arrow the highlight onto the on-disk row: the debounced live-switch
-    // attaches a managed session there (keeping the dock focused), so the
-    // row turns from `· on-disk` into a live, active `feature-x` session.
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness
-        .wait_until(|h| {
-            let s = h.screen_to_string();
-            s.contains("feature-x") && !s.contains("· on-disk")
-        })
-        .unwrap_or_else(|_| {
-            panic!(
-                "arrowing onto the dock's discovered worktree should open a live \
-                 session (row loses `· on-disk`).\nScreen:\n{}",
-                harness.screen_to_string()
-            )
-        });
-    // Confirm the attach really opened a second window before deleting it.
-    harness
-        .wait_until(|h| h.editor().session_count() >= 2)
-        .unwrap();
-
-    // Open the row's right-click context menu (F2 is its keyboard
-    // equivalent), then pick Delete: Visit / Rename / Move / Archive /
-    // Delete, so four Downs land on Delete.
-    harness.send_key(KeyCode::F(2), KeyModifiers::NONE).unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Delete"))
-        .unwrap_or_else(|_| {
-            panic!(
-                "F2 on the worktree row should open its context menu with a \
-                 Delete action.\nScreen:\n{}",
-                harness.screen_to_string()
-            )
-        });
-    for _ in 0..4 {
-        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    }
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Confirm Delete"))
-        .unwrap_or_else(|_| {
-            panic!(
-                "Delete should open the Confirm Delete pane.\nScreen:\n{}",
-                harness.screen_to_string()
-            )
-        });
-
-    // Confirm panel focuses Cancel first; Tab to `Confirm Delete`, activate.
-    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
+    attach_feature_x_from_dock(&mut harness);
+    confirm_delete_selected_dock_row(&mut harness);
 
     // The worktree is removed from disk and its row must be gone from the
     // dock — and stay gone. Without the fix the async-close snapshot lag
@@ -1221,5 +1699,58 @@ fn deleting_worktree_session_from_dock_does_not_resurrect_it() {
         "the deleted worktree row reappeared in the dock after a refresh.\n\
          Screen:\n{}",
         harness.screen_to_string()
+    );
+}
+
+/// A dormant persisted co-tenant is just as authoritative as a live sibling:
+/// deleting the managed owner must refuse before closing either workspace or
+/// removing their shared worktree.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn delete_refuses_a_persisted_worktree_co_tenant() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, wt) = set_up_repo_with_worktree();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
+    open_dock(&mut harness);
+    attach_feature_x_from_dock(&mut harness);
+
+    let workspace_dir = harness.editor().dir_context().data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let mut peer = fresh::workspace::Workspace::new(wt.clone());
+    peer.label = Some("persisted-peer".to_string());
+    peer.stable_id = Some("ws-persisted-peer".to_string());
+    let peer_file = workspace_dir.join(format!(
+        "{}.ws-persisted-peer.json",
+        fresh::workspace::encode_path_for_filename(&wt),
+    ));
+    std::fs::write(&peer_file, serde_json::to_vec_pretty(&peer).unwrap()).unwrap();
+
+    confirm_delete_selected_dock_row(&mut harness);
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .get_status_message()
+                .is_some_and(|message| message.contains("another workspace tenant"))
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "delete should refuse the persisted co-tenant.\nStatus: {:?}\nScreen:\n{}",
+                harness.editor().get_status_message(),
+                harness.screen_to_string()
+            )
+        });
+    assert!(wt.exists(), "the guarded worktree must remain on disk");
+    assert!(
+        peer_file.exists(),
+        "the dormant co-tenant snapshot must survive"
+    );
+    assert!(
+        harness.editor().session_count() >= 2,
+        "the live owner must remain open when delete is refused"
     );
 }

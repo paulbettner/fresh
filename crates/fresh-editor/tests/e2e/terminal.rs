@@ -14,6 +14,7 @@
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::{Config, TerminalMouseForwarding, TerminalShellConfig};
+use fresh::config_io::DirectoryContext;
 use fresh::services::terminal::TerminalState;
 use portable_pty::{native_pty_system, PtySize};
 
@@ -887,6 +888,13 @@ fn test_live_terminal_scrollback_output_and_key_behavior() {
         .active_window()
         .get_terminal_id(buffer_id)
         .expect("active buffer should be a terminal");
+    let log_path = harness
+        .editor()
+        .active_window()
+        .terminal_log_files
+        .get(&terminal_id)
+        .cloned()
+        .expect("live terminal must have a raw log");
     {
         let handle = harness
             .editor()
@@ -907,8 +915,23 @@ fn test_live_terminal_scrollback_output_and_key_behavior() {
     harness
         .editor_mut()
         .active_window_mut()
-        .send_terminal_input(b"printf '\\rANIMATED_STATUS_TICK'\n");
-    harness.wait_for_async_quiescence(3).unwrap();
+        .send_terminal_input(b"printf '%s%s\\n' 'ANIMATED_' 'STATUS_TICK'\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        harness.process_async_and_render().unwrap();
+        if std::fs::read(&log_path).is_ok_and(|bytes| {
+            bytes
+                .windows(b"ANIMATED_STATUS_TICK".len())
+                .any(|window| window == b"ANIMATED_STATUS_TICK")
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal output sentinel never reached the raw log"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 
     {
         let handle = harness
@@ -1568,6 +1591,7 @@ fn test_session_restore_terminal_active_buffer() {
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     // Create a test file
     let file1 = project_dir.join("test.txt");
@@ -1575,11 +1599,12 @@ fn test_session_restore_terminal_active_buffer() {
 
     // First session: open file, open terminal, terminal should be active
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1630,11 +1655,12 @@ fn test_session_restore_terminal_active_buffer() {
 
     // Second session: restore and verify terminal is still active
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context,
         )
         .unwrap();
 
@@ -3998,6 +4024,24 @@ fn test_mouse_forwarding_never_keeps_wheel_in_fresh_scrollback() {
     );
 }
 
+/// Wheel-down is not a request to enter history: with terminal mouse
+/// forwarding disabled it must leave the live PTY grid active.
+#[test]
+#[cfg(not(windows))]
+fn test_mouse_forwarding_never_wheel_down_keeps_live_terminal() {
+    let mut harness = harness_or_return!(80, 24);
+    harness.editor_mut().config_mut().terminal.mouse_forwarding = TerminalMouseForwarding::Never;
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    assert!(harness.editor().is_terminal_mode());
+
+    harness.mouse_scroll_down(10, 10).unwrap();
+    assert!(
+        harness.editor().is_terminal_mode(),
+        "wheel-down must not freeze a live terminal in scrollback"
+    );
+}
+
 /// `mouse_forwarding = "never"` also reserves plain drag gestures for Fresh,
 /// so a mouse-tracking child cannot swallow selection before Ctrl+C copies it.
 #[test]
@@ -4682,10 +4726,10 @@ fn test_terminal_buffers_always_grid_wrap() {
 // --- Drag-to-select exit conditions (implicit scrollback) -----------------
 //
 // A drag on the live grid parks the split in *implicit* scrollback so the
-// selection can exist (the grid has no selection model). Implicit scrollback
-// ends automatically: copying the selection or a bare click resumes the live
-// grid, while engaging with the scrollback as a view (scrolling) converts
-// the visit to an explicit one that only ends by the explicit rules.
+// selection can exist (the grid has no selection model). Mouse-up publishes
+// the selection but leaves it parked; an explicit Copy or a bare click resumes
+// the live grid. Scrolling converts the visit to an explicit one that only
+// ends by the explicit rules.
 
 /// Locate the top-left screen cell of the row that contains `needle`.
 fn screen_pos_of(harness: &EditorTestHarness, needle: &str) -> Option<(u16, u16)> {
@@ -4783,6 +4827,24 @@ fn test_terminal_drag_select_includes_pointer_cell() {
     );
 }
 
+/// Leftward drags use the same inclusive pointer-cell contract as rightward
+/// drags; reversing direction must not lose either endpoint.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_leftward_drag_select_includes_pointer_cell() {
+    let mut harness = harness_or_return!(120, 30);
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    let (col, row) = terminal_with_marker(&mut harness, "XSELECT_COPY_ME");
+
+    drag_select_row(&mut harness, col + 10, col, row).unwrap();
+
+    assert_eq!(
+        harness.editor_mut().clipboard_content_for_test(),
+        "XSELECT_COP",
+        "leftward mouse-up should publish the same inclusive range"
+    );
+}
+
 /// macOS terminal emulators reserve Cmd+C for their own native selection,
 /// while Fresh owns this drag through mouse reporting. Publishing the
 /// selection on mouse-up makes the host clipboard correct even though the
@@ -4850,6 +4912,7 @@ fn test_terminal_drag_select_past_line_end_includes_last_char() {
     let mut harness = harness_or_return!(120, 30);
     harness.editor_mut().set_clipboard_for_test(String::new());
     let marker = "XSELECT_PAST_EOL_9";
+
     let (col, row) = terminal_with_marker(&mut harness, marker);
 
     // Overshoot the 18-char marker by several columns.
@@ -4866,6 +4929,36 @@ fn test_terminal_drag_select_past_line_end_includes_last_char() {
     assert!(
         clip.contains(marker),
         "a drag past the end of the text must copy it whole (last char included), got {clip:?}"
+    );
+}
+/// Dragging on the tail of a very long terminal logical line must resolve the
+/// cell boundary without materializing that whole line on every mouse move.
+#[test]
+#[cfg(not(windows))]
+fn test_terminal_drag_selects_tail_of_very_long_line() {
+    let mut harness = harness_or_return!(120, 30);
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    let marker = "XLONG_DRAG_TAIL";
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(
+            b"head -c 131072 /dev/zero | tr '\\0' 'A'; printf '\\x58'LONG_DRAG_TAIL'\\n'\n",
+        );
+    harness
+        .wait_until(|h| screen_pos_of(h, marker).is_some())
+        .unwrap();
+    let (col, row) = screen_pos_of(&harness, marker).unwrap();
+
+    drag_select_row(&mut harness, col, col + 3, row).unwrap();
+    assert!(
+        harness
+            .editor_mut()
+            .clipboard_content_for_test()
+            .contains("XLON"),
+        "dragging the tail of a long logical line must preserve its endpoint"
     );
 }
 
@@ -5042,6 +5135,31 @@ fn test_terminal_double_click_selects_word_and_copy_resumes() {
     assert!(
         harness.editor().is_terminal_mode(),
         "copying the double-click selection should resume the live terminal"
+    );
+}
+
+/// Triple-click selects and immediately publishes the whole terminal line,
+/// replacing the word-only clipboard produced by the second click.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_triple_click_publishes_whole_line() {
+    let mut harness = harness_or_return!(120, 30);
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    let marker = "XTRIPLE LINE TARGET";
+    let (col, row) = terminal_with_marker(&mut harness, marker);
+
+    harness.mouse_click(col + 10, row).unwrap();
+    harness.mouse_click(col + 10, row).unwrap();
+    harness
+        .editor_mut()
+        .set_clipboard_for_test("word-only sentinel".into());
+    harness.mouse_click(col + 10, row).unwrap();
+
+    let clipboard = harness.editor_mut().clipboard_content_for_test();
+    assert_eq!(
+        clipboard.trim_end_matches(&['\r', '\n'][..]),
+        marker,
+        "the third click should replace the clipboard with the whole line"
     );
 }
 

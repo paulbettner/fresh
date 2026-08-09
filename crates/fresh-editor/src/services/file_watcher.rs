@@ -1,24 +1,21 @@
 //! Plugin-driven filesystem watching.
 //!
 //! Backs the `watchPath` / `unwatchPath` plugin API and the
-//! `path_changed` plugin hook. One process-wide `notify::Watcher`
-//! is shared across all plugin watchers; each `watchPath` call
-//! registers a path with `notify` and stores a per-call handle in
-//! [`FileWatcherManager`] so unwatching is a removal lookup
-//! rather than tearing down and rebuilding the watcher.
+//! `path_changed` plugin hook. One editor-local `notify::Watcher` is shared
+//! across that editor's plugin watches; each `watchPath` call registers a path
+//! and stores a per-call handle in [`FileWatcherManager`] so unwatching is a
+//! removal lookup rather than tearing down unrelated registrations.
 //!
 //! Events flow notify-thread → AsyncBridge → main loop →
 //! `path_changed` hook. The path is passed verbatim from
 //! `notify::Event::paths` (no canonicalisation, no debouncing —
 //! plugins decide their dedup policy).
 //!
-//! **Why not per-plugin watchers?** notify's backends (inotify on
-//! Linux, kqueue on BSD/macOS, ReadDirectoryChangesW on Windows)
-//! all have per-process file-descriptor / handle limits. A single
-//! shared `Watcher` reuses one fd per directory across plugins
-//! that happen to watch the same path, which matters once
-//! Orchestrator's collision radar is watching one path per worktree
-//! across N sessions.
+//! **Why not per-plugin watchers?** notify's backends (inotify on Linux,
+//! kqueue on BSD/macOS, ReadDirectoryChangesW on Windows) all have
+//! per-process file-descriptor / handle limits. Sharing within one editor
+//! avoids a watcher thread per plugin, while the manager-local callback map
+//! prevents events from crossing into another editor's AsyncBridge.
 
 use crate::services::async_bridge::{AsyncBridge, AsyncMessage, PathChangeKind};
 use notify::{
@@ -30,16 +27,29 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Allocate a process-globally-unique watch handle. The notify-callback
-/// lookup table ([`handle_map`]) is process-global, so handles must be
-/// unique across *every* [`FileWatcherManager`] in the process — not just
-/// within one. A per-manager counter (the old design) hands out `1, 2, …`
-/// in each manager, so two managers (e.g. two editor instances in one
-/// process, or two parallel tests) would collide on handle `1` and clobber
-/// each other's entry in the shared map, silently dropping events.
+/// Allocate a process-globally-unique opaque handle. Handles are exposed to
+/// plugins and may be compared across editor instances in tests, but callback
+/// routing remains private to the manager that registered the watch.
 fn alloc_global_handle() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Immutable authority that registered a filesystem watch. Events and
+/// unwatch requests must return through this exact plugin/window generation;
+/// a remote project replacement must not inherit a host watcher from the
+/// authority it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchOwner {
+    pub window_id: fresh_core::WindowId,
+    pub authority: fresh_core::api::AuthorityStamp,
+    pub plugin_instance_id: Option<fresh_core::api::PluginInstanceId>,
+}
+
+struct WatchRegistration {
+    path: PathBuf,
+    mode: RecursiveMode,
+    owner: WatchOwner,
 }
 
 /// Manages plugin-registered file watchers. Created on demand the
@@ -50,12 +60,14 @@ pub struct FileWatcherManager {
     /// The single shared notify `Watcher`. `None` until the first
     /// successful `watch` call wires up the AsyncBridge route.
     watcher: Option<RecommendedWatcher>,
-    /// `handle → (path, recursive)`. Used by `unwatch` to find
-    /// what `notify::Watcher::unwatch` should be called with;
-    /// also lets us forward only paths that are still watched
-    /// when notify fires events for a path that was just
-    /// unwatched (rare but possible — events are queued).
-    handles: HashMap<u64, (PathBuf, RecursiveMode)>,
+    /// `handle → registration`. Ownership is immutable so queued events and
+    /// guessed handle ids cannot escape the plugin/window/authority that
+    /// created the watch.
+    handles: HashMap<u64, WatchRegistration>,
+    /// Callback-visible registrations for this manager only. A process-global
+    /// map would route one editor's filesystem event into every other editor's
+    /// AsyncBridge.
+    callback_handles: Arc<Mutex<HandleMap>>,
 }
 
 impl FileWatcherManager {
@@ -63,6 +75,7 @@ impl FileWatcherManager {
         Self {
             watcher: None,
             handles: HashMap::new(),
+            callback_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -79,11 +92,23 @@ impl FileWatcherManager {
         bridge: &AsyncBridge,
         path: &Path,
         recursive: bool,
+        owner: WatchOwner,
     ) -> Result<u64, String> {
         if self.watcher.is_none() {
-            self.watcher = Some(build_watcher(bridge.clone())?);
+            self.watcher = Some(build_watcher(
+                bridge.clone(),
+                Arc::clone(&self.callback_handles),
+            )?);
         }
         let mode = if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        let effective_mode = if mode == RecursiveMode::Recursive
+            || self.handles.values().any(|registration| {
+                registration.path == path && registration.mode == RecursiveMode::Recursive
+            }) {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
@@ -93,31 +118,88 @@ impl FileWatcherManager {
             .as_mut()
             .expect("just constructed above if missing");
         watcher
-            .watch(path, mode)
+            .watch(path, effective_mode)
             .map_err(|e| format!("watchPath({}): {}", path.display(), e))?;
         let handle = alloc_global_handle();
-        self.handles.insert(handle, (path.to_path_buf(), mode));
-        // The notify event callback uses a shared `handles` map
-        // (set up below in `build_watcher`) to look up which
-        // handle owns each event. Update that here too — but the
-        // callback uses a clone-on-write Arc<Mutex<>> that we
-        // need to thread through. Pulled out into a closure below.
-        register_handle(handle, path);
+        self.handles.insert(
+            handle,
+            WatchRegistration {
+                path: path.to_path_buf(),
+                mode,
+                owner,
+            },
+        );
+        if let Ok(mut handles) = self.callback_handles.lock() {
+            handles.insert(handle, (path.to_path_buf(), mode));
+        }
         Ok(handle)
+    }
+
+    /// Return the immutable owner for a live handle.
+    pub fn owner(&self, handle: u64) -> Option<WatchOwner> {
+        self.handles
+            .get(&handle)
+            .map(|registration| registration.owner)
+    }
+
+    /// Drop a watcher only when the caller owns its exact registration.
+    pub fn unwatch_owned(&mut self, handle: u64, owner: WatchOwner) -> bool {
+        if self.owner(handle) != Some(owner) {
+            return false;
+        }
+        self.unwatch(handle);
+        true
+    }
+
+    /// Drop every watcher owned by a closing or authority-replaced window.
+    pub fn unwatch_window(&mut self, window_id: fresh_core::WindowId) {
+        let handles: Vec<_> = self
+            .handles
+            .iter()
+            .filter_map(|(handle, registration)| {
+                (registration.owner.window_id == window_id).then_some(*handle)
+            })
+            .collect();
+        for handle in handles {
+            self.unwatch(handle);
+        }
     }
 
     /// Drop a registered watcher. Unknown handles are ignored.
     pub fn unwatch(&mut self, handle: u64) {
-        if let Some((path, _mode)) = self.handles.remove(&handle) {
-            unregister_handle(handle);
+        if let Some(registration) = self.handles.remove(&handle) {
+            if let Ok(mut handles) = self.callback_handles.lock() {
+                handles.remove(&handle);
+            }
+            let remaining_mode = if self.handles.values().any(|candidate| {
+                candidate.path == registration.path && candidate.mode == RecursiveMode::Recursive
+            }) {
+                Some(RecursiveMode::Recursive)
+            } else if self
+                .handles
+                .values()
+                .any(|candidate| candidate.path == registration.path)
+            {
+                Some(RecursiveMode::NonRecursive)
+            } else {
+                None
+            };
             if let Some(w) = self.watcher.as_mut() {
-                if let Err(e) = w.unwatch(&path) {
+                if let Err(e) = w.unwatch(&registration.path) {
                     tracing::debug!(
-                        "unwatchPath({}): notify returned {}; \
-                         continuing — the editor's view is now consistent",
-                        path.display(),
+                        "unwatchPath({}): notify returned {}; continuing — the editor's view is now consistent",
+                        registration.path.display(),
                         e
                     );
+                }
+                if let Some(mode) = remaining_mode {
+                    if let Err(error) = w.watch(&registration.path, mode) {
+                        tracing::warn!(
+                            "failed to preserve remaining watchPath({}): {}",
+                            registration.path.display(),
+                            error
+                        );
+                    }
                 }
             }
         }
@@ -145,41 +227,14 @@ impl Default for FileWatcherManager {
 //   to the event path.
 // - Emit one `PathChanged` per (handle, path) pair.
 //
-// We store the handle map in a process-global `Arc<Mutex<>>`
-// because `notify::Watcher`'s callback closure must be `'static`
-// and the manager itself owns the handles HashMap. Sharing via a
-// global is the simplest option that doesn't require restructuring
-// FileWatcherManager into an `Arc<Mutex<>>` (which would force
-// every editor caller through `lock()`).
+// The callback gets this manager's own `Arc<Mutex<HandleMap>>`: notify needs
+// `'static` ownership, but callback routing must remain editor-local.
 // ---------------------------------------------------------------
 
 /// Type alias kept short for readability. Stores `(path, recursive)`
 /// keyed by handle — the source of truth for the notify callback's
 /// path-prefix lookups.
 type HandleMap = HashMap<u64, (PathBuf, RecursiveMode)>;
-
-fn handle_map() -> &'static Mutex<HandleMap> {
-    use std::sync::OnceLock;
-    static MAP: OnceLock<Mutex<HandleMap>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_handle(handle: u64, path: &Path) {
-    if let Ok(mut map) = handle_map().lock() {
-        // The recursive flag is recovered from the manager's own
-        // map; here we store an arbitrary mode — the lookup uses
-        // the manager's mode. (Could simplify by removing this
-        // mode from the global map; left for future readers who
-        // want the global-only fast-path.)
-        map.insert(handle, (path.to_path_buf(), RecursiveMode::Recursive));
-    }
-}
-
-fn unregister_handle(handle: u64) {
-    if let Ok(mut map) = handle_map().lock() {
-        map.remove(&handle);
-    }
-}
 
 fn matches_handle(watch_path: &Path, recursive: RecursiveMode, event_path: &Path) -> bool {
     match recursive {
@@ -215,7 +270,10 @@ fn classify_kind(kind: &EventKind) -> PathChangeKind {
     }
 }
 
-fn build_watcher(bridge: AsyncBridge) -> Result<RecommendedWatcher, String> {
+fn build_watcher(
+    bridge: AsyncBridge,
+    handles: Arc<Mutex<HandleMap>>,
+) -> Result<RecommendedWatcher, String> {
     let bridge = Arc::new(bridge);
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let event = match res {
@@ -226,7 +284,7 @@ fn build_watcher(bridge: AsyncBridge) -> Result<RecommendedWatcher, String> {
             }
         };
         let kind = classify_kind(&event.kind);
-        let map = match handle_map().lock() {
+        let map = match handles.lock() {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -300,5 +358,59 @@ mod tests {
             classify_kind(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
             PathChangeKind::Rename
         ));
+    }
+
+    #[test]
+    fn watcher_registration_is_manager_local_and_exactly_owned() {
+        let handle = alloc_global_handle();
+        let owner = WatchOwner {
+            window_id: fresh_core::WindowId(7),
+            authority: fresh_core::api::AuthorityStamp {
+                id: 11,
+                generation: 3,
+            },
+            plugin_instance_id: Some(fresh_core::api::PluginInstanceId::fresh()),
+        };
+        let mut manager = FileWatcherManager::new();
+        manager.callback_handles.lock().unwrap().insert(
+            handle,
+            (PathBuf::from("/repo"), RecursiveMode::NonRecursive),
+        );
+        manager.handles.insert(
+            handle,
+            WatchRegistration {
+                path: PathBuf::from("/repo"),
+                mode: RecursiveMode::NonRecursive,
+                owner,
+            },
+        );
+
+        let other_manager = FileWatcherManager::new();
+        assert!(!other_manager
+            .callback_handles
+            .lock()
+            .unwrap()
+            .contains_key(&handle));
+        assert!(matches!(
+            manager.callback_handles.lock().unwrap().get(&handle),
+            Some((path, RecursiveMode::NonRecursive)) if path == Path::new("/repo")
+        ));
+
+        let wrong_owner = WatchOwner {
+            authority: fresh_core::api::AuthorityStamp {
+                id: 11,
+                generation: 4,
+            },
+            ..owner
+        };
+        assert!(!manager.unwatch_owned(handle, wrong_owner));
+        assert_eq!(manager.owner(handle), Some(owner));
+        manager.unwatch_window(owner.window_id);
+        assert!(manager.owner(handle).is_none());
+        assert!(!manager
+            .callback_handles
+            .lock()
+            .unwrap()
+            .contains_key(&handle));
     }
 }

@@ -13,8 +13,102 @@ use crate::model::event::BufferId;
 use anyhow::Result as AnyhowResult;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+pub(crate) enum CapturedMouseRoute {
+    Fresh,
+    Terminal(AnyhowResult<bool>),
+}
+
+fn captured_button_event(kind: MouseEventKind) -> Option<(MouseButton, bool)> {
+    match kind {
+        MouseEventKind::Drag(button) => Some((button, false)),
+        MouseEventKind::Up(button) => Some((button, true)),
+        _ => None,
+    }
+}
+
+fn clamped_rect_offset(rect: Rect, col: u16, row: u16) -> Option<(u16, u16)> {
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    Some((
+        col.saturating_sub(rect.x).min(rect.width - 1),
+        row.saturating_sub(rect.y).min(rect.height - 1),
+    ))
+}
+
+fn terminal_grid_cell_end_in_buffer(buffer: &crate::model::buffer::Buffer, pos: usize) -> usize {
+    let (line, _) = buffer.position_to_line_col(pos);
+    // Terminal capture writes LF line endings. The next line start therefore
+    // locates this line's stored newline without copying a possibly enormous
+    // logical line on every drag event.
+    let content_end = buffer
+        .line_start_offset(line + 1)
+        .map(|next_start| next_start.saturating_sub(1))
+        .unwrap_or_else(|| buffer.len());
+    if pos >= content_end {
+        content_end
+    } else {
+        buffer.next_grapheme_boundary(pos).min(content_end)
+    }
+}
 
 impl Window {
+    /// Route a drag/release through the owner captured by its matching press.
+    /// PTY-owned continuations bypass current modifiers, overlays, and pointer
+    /// hit-testing; Fresh-owned continuations are explicitly withheld from the
+    /// PTY. A release consumes the capture.
+    pub(crate) fn route_captured_mouse_event(
+        &mut self,
+        mouse_event: &MouseEvent,
+    ) -> Option<CapturedMouseRoute> {
+        let (button, release) = captured_button_event(mouse_event.kind)?;
+        let owner = self.mouse_state.mouse_gesture_owner(button)?;
+
+        match owner {
+            super::types::MouseGestureOwner::Fresh => {
+                if release {
+                    self.mouse_state.finish_mouse_gesture(button);
+                }
+                Some(CapturedMouseRoute::Fresh)
+            }
+            super::types::MouseGestureOwner::Terminal {
+                split_id,
+                terminal_id,
+                content_rect,
+            } => {
+                let current_rect = self.terminal_content_area_for_capture(split_id, terminal_id);
+                if release || current_rect.is_none() {
+                    self.mouse_state.finish_mouse_gesture(button);
+                }
+                if let Some(current_rect) = current_rect {
+                    return Some(CapturedMouseRoute::Terminal(
+                        self.forward_mouse_to_terminal(
+                            terminal_id,
+                            mouse_event.column,
+                            mouse_event.row,
+                            current_rect,
+                            *mouse_event,
+                        ),
+                    ));
+                }
+
+                let result = clamped_rect_offset(content_rect, mouse_event.column, mouse_event.row)
+                    .map(|(col, row)| {
+                        self.send_terminal_mouse_to(
+                            terminal_id,
+                            col,
+                            row,
+                            TerminalMouseEventKind::Up(convert_button(button)),
+                            crossterm::event::KeyModifiers::NONE,
+                        );
+                        true
+                    })
+                    .unwrap_or(false);
+                Some(CapturedMouseRoute::Terminal(Ok(result)))
+            }
+        }
+    }
+
     /// Check if mouse event should be forwarded to the terminal.
     /// Returns true if the event was forwarded (and handled).
     /// `forwarding` is the configured `terminal.mouse_forwarding` policy.
@@ -25,6 +119,13 @@ impl Window {
         mouse_event: MouseEvent,
         forwarding: crate::config::TerminalMouseForwarding,
     ) -> Option<AnyhowResult<bool>> {
+        // Drag/release reports are valid only when a matching press captured
+        // this PTY. `Editor::handle_mouse` routes those before overlays; an
+        // orphan continuation must never start a partial PTY gesture.
+        if captured_button_event(mouse_event.kind).is_some() {
+            return None;
+        }
+
         // Only forward if the focused split is a live terminal.
         if !self.focused_terminal_live() {
             return None;
@@ -53,16 +154,13 @@ impl Window {
             return None;
         }
 
-        // Find terminal buffer at this position.
-        let (buffer_id, content_rect) = self.get_terminal_content_area_at_position(col, row)?;
-
-        // `send_terminal_mouse` writes to the *focused* terminal and makes the
-        // coordinates relative to `content_rect`, so both must describe the
-        // same pane. If the pointer is over a *different* terminal pane than
-        // the focused one, forwarding would inject that pane's mouse reports
-        // into the focused child's stdin — a child that may never have enabled
-        // mouse reporting at all (sinelaw/fresh#2745). Only the focused
-        // terminal receives the mouse.
+        let (split_id, buffer_id, content_rect) =
+            self.get_terminal_content_area_at_position(col, row)?;
+        let terminal_id = self.get_terminal_id(buffer_id)?;
+        // A new pointer-hit press belongs only to the focused terminal. If the
+        // pointer is over another terminal pane, forwarding would inject its
+        // coordinates into the wrong child's stdin; only an already-captured
+        // continuation may bypass this focus check.
         if buffer_id != self.active_buffer() {
             return None;
         }
@@ -114,8 +212,17 @@ impl Window {
             return None;
         }
 
+        if let MouseEventKind::Down(button) = mouse_event.kind {
+            self.mouse_state.capture_terminal_mouse_gesture(
+                button,
+                split_id,
+                terminal_id,
+                content_rect,
+            );
+        }
+
         // Forward the event.
-        Some(self.forward_mouse_to_terminal(col, row, content_rect, mouse_event))
+        Some(self.forward_mouse_to_terminal(terminal_id, col, row, content_rect, mouse_event))
     }
 
     /// Whether the inner program of `buffer_id`'s terminal enabled any
@@ -173,25 +280,33 @@ impl Window {
         if !self.focused_terminal_live() {
             return None;
         }
-        let (buffer_id, content_rect) = self.get_terminal_content_area_at_position(col, row)?;
+        let (_, buffer_id, content_rect) = self.get_terminal_content_area_at_position(col, row)?;
         // Detection runs even for alternate-screen / mouse-reporting programs:
         // this is only reached for Ctrl-held gestures (see the callers in
         // `terminal_link.rs`, both Ctrl-gated), which `try_forward_mouse_to_terminal`
         // deliberately withholds from the PTY so a path shown by vim/less/htop or
         // any mouse-capturing program is still Ctrl-hoverable and Ctrl-clickable.
-        let term_col = col.saturating_sub(content_rect.x) as usize;
+        let grid_col = col.saturating_sub(content_rect.x) as usize;
         let term_row = row.saturating_sub(content_rect.y);
 
         let terminal_id = self.get_terminal_id(buffer_id)?;
         let handle = self.terminal_manager.get(terminal_id)?;
-        let (line, cwd) = {
+        let (line, text_col, cwd) = {
             let state = handle.state.lock().ok()?;
-            let line: String = state.get_line(term_row).iter().map(|c| c.c).collect();
+            let cells = state.get_line(term_row);
+            let mut line = String::new();
+            let mut text_col = 0;
+            for (cell_col, cell) in cells.iter().enumerate() {
+                if cell_col < grid_col && !cell.wide_spacer {
+                    text_col += 1 + cell.zerowidth.len();
+                }
+                cell.append_text_to(&mut line);
+            }
             let cwd = state.cwd().map(|p| p.to_path_buf());
-            (line, cwd)
+            (line, text_col, cwd)
         };
 
-        let link = crate::services::terminal::path_link::detect_link_at(&line, term_col)?;
+        let link = crate::services::terminal::path_link::detect_link_at(&line, text_col)?;
         Some((buffer_id, term_row, link, cwd))
     }
 
@@ -285,25 +400,37 @@ impl Window {
         Some((active, link, cwd))
     }
 
-    /// Get the terminal buffer and its content area if the mouse position is over a terminal buffer.
-    /// Returns the buffer ID and content rect if found.
+    /// Get the terminal split, buffer, and painted content area under the pointer.
     fn get_terminal_content_area_at_position(
         &self,
         col: u16,
         row: u16,
-    ) -> Option<(BufferId, Rect)> {
-        for (_, buffer_id, content_rect, _, _, _) in &self.layout_cache.split_areas {
-            // Check if position is within content area.
+    ) -> Option<(crate::model::event::LeafId, BufferId, Rect)> {
+        for (split_id, buffer_id, content_rect, _, _, _) in &self.layout_cache.split_areas {
             if col >= content_rect.x
                 && col < content_rect.x + content_rect.width
                 && row >= content_rect.y
                 && row < content_rect.y + content_rect.height
                 && self.is_terminal_buffer(*buffer_id)
             {
-                return Some((*buffer_id, *content_rect));
+                return Some((*split_id, *buffer_id, *content_rect));
             }
         }
         None
+    }
+
+    fn terminal_content_area_for_capture(
+        &self,
+        split_id: crate::model::event::LeafId,
+        terminal_id: crate::services::terminal::TerminalId,
+    ) -> Option<Rect> {
+        self.layout_cache.split_areas.iter().find_map(
+            |(candidate_split, buffer_id, content_rect, _, _, _)| {
+                (*candidate_split == split_id
+                    && self.get_terminal_id(*buffer_id) == Some(terminal_id))
+                .then_some(*content_rect)
+            },
+        )
     }
 
     /// Scroll the focused live terminal under the pointer while preserving
@@ -317,7 +444,7 @@ impl Window {
         if !self.focused_terminal_live() {
             return false;
         }
-        let Some((buffer_id, _)) = self.get_terminal_content_area_at_position(col, row) else {
+        let Some((_, buffer_id, _)) = self.get_terminal_content_area_at_position(col, row) else {
             return false;
         };
         if buffer_id != self.active_buffer() {
@@ -336,25 +463,77 @@ impl Window {
         true
     }
 
-    /// Forward a mouse event to the terminal PTY.
-    /// Converts screen coordinates to terminal-relative coordinates and sends the event.
+    /// Forward a mouse event to the captured terminal PTY. The terminal id is
+    /// captured on Down, rather than recovered from whichever buffer is active
+    /// when a later Drag/Up reaches us.
     fn forward_mouse_to_terminal(
-        &mut self,
+        &self,
+        terminal_id: crate::services::terminal::TerminalId,
         col: u16,
         row: u16,
         content_rect: Rect,
         mouse_event: MouseEvent,
     ) -> AnyhowResult<bool> {
-        // Convert to terminal-relative coordinates (0-based from content area).
-        let term_col = col.saturating_sub(content_rect.x);
-        let term_row = row.saturating_sub(content_rect.y);
+        // Captured releases can arrive outside the pane; terminal protocols
+        // still require an in-grid coordinate. The same clamp keeps drags at
+        // the nearest edge, and zero-sized geometry safely emits nothing.
+        let Some((term_col, term_row)) = clamped_rect_offset(content_rect, col, row) else {
+            return Ok(false);
+        };
 
-        // Send to terminal.
-        let kind = convert_kind(mouse_event.kind);
-        self.send_terminal_mouse(term_col, term_row, kind, mouse_event.modifiers);
-
-        // Terminal renders itself, so we need to trigger a render.
+        self.send_terminal_mouse_to(
+            terminal_id,
+            term_col,
+            term_row,
+            convert_kind(mouse_event.kind),
+            mouse_event.modifiers,
+        );
         Ok(true)
+    }
+
+    fn retire_mouse_gesture_owner(
+        &self,
+        button: MouseButton,
+        owner: super::types::MouseGestureOwner,
+        col: u16,
+        row: u16,
+    ) {
+        let super::types::MouseGestureOwner::Terminal {
+            split_id,
+            terminal_id,
+            content_rect,
+        } = owner
+        else {
+            return;
+        };
+        let content_rect = self
+            .terminal_content_area_for_capture(split_id, terminal_id)
+            .unwrap_or(content_rect);
+        let Some((col, row)) = clamped_rect_offset(content_rect, col, row) else {
+            return;
+        };
+        self.send_terminal_mouse_to(
+            terminal_id,
+            col,
+            row,
+            TerminalMouseEventKind::Up(convert_button(button)),
+            crossterm::event::KeyModifiers::NONE,
+        );
+    }
+
+    pub(crate) fn cancel_mouse_gesture(&mut self, button: MouseButton, col: u16, row: u16) {
+        if let Some(owner) = self.mouse_state.finish_mouse_gesture(button) {
+            self.retire_mouse_gesture_owner(button, owner, col, row);
+        }
+    }
+
+    /// Every press delivered to a PTY must be terminated, even when focus or
+    /// its visible buffer changes before the OS sends the matching release.
+    pub(crate) fn cancel_terminal_mouse_gestures(&mut self) {
+        let (col, row) = self.mouse_state.last_position.unwrap_or((0, 0));
+        for (button, owner) in self.mouse_state.take_mouse_gestures() {
+            self.retire_mouse_gesture_owner(button, owner, col, row);
+        }
     }
 }
 
@@ -426,6 +605,44 @@ mod convert_kind_tests {
             TerminalMouseEventKind::ScrollDown
         );
     }
+
+    #[test]
+    fn captured_terminal_coordinates_clamp_to_visible_rect() {
+        let rect = Rect::new(10, 20, 5, 3);
+        assert_eq!(clamped_rect_offset(rect, 0, 0), Some((0, 0)));
+        assert_eq!(clamped_rect_offset(rect, 99, 99), Some((4, 2)));
+        assert_eq!(clamped_rect_offset(Rect::new(0, 0, 0, 3), 0, 0), None);
+        assert_eq!(clamped_rect_offset(Rect::new(0, 0, 3, 0), 0, 0), None);
+    }
+
+    #[test]
+    fn only_drag_and_release_are_captured_continuations() {
+        assert_eq!(
+            captured_button_event(MouseEventKind::Drag(MouseButton::Left)),
+            Some((MouseButton::Left, false))
+        );
+        assert_eq!(
+            captured_button_event(MouseEventKind::Up(MouseButton::Left)),
+            Some((MouseButton::Left, true))
+        );
+        assert_eq!(
+            captured_button_event(MouseEventKind::Down(MouseButton::Left)),
+            None
+        );
+    }
+
+    #[test]
+    fn blank_terminal_cells_do_not_select_the_stored_newline() {
+        use crate::model::filesystem::StdFileSystem;
+        use std::sync::Arc;
+
+        let buffer = crate::model::buffer::Buffer::from_bytes(
+            "e\u{301}\nnext".as_bytes().to_vec(),
+            Arc::new(StdFileSystem),
+        );
+        assert_eq!(terminal_grid_cell_end_in_buffer(&buffer, 0), 3);
+        assert_eq!(terminal_grid_cell_end_in_buffer(&buffer, 3), 3);
+    }
 }
 
 impl super::Editor {
@@ -472,16 +689,14 @@ impl super::Editor {
         let (Some(anchor_start), Some(head_start)) = (anchor_start, head_start) else {
             return Ok(());
         };
+        let anchor_end = self.terminal_grid_cell_end(buffer_id, anchor_start);
         let (anchor, head) = if head_start >= anchor_start {
             (
                 anchor_start,
                 self.terminal_grid_cell_end(buffer_id, head_start),
             )
         } else {
-            (
-                self.terminal_grid_cell_end(buffer_id, anchor_start),
-                head_start,
-            )
+            (anchor_end, head_start)
         };
 
         if let Some(view_state) = self
@@ -500,6 +715,7 @@ impl super::Editor {
         ms.dragging_text_selection = true;
         ms.drag_selection_split = Some(split_id);
         ms.drag_selection_anchor = Some(anchor);
+        ms.terminal_drag_anchor_end = Some(anchor_end);
         Ok(())
     }
 
@@ -592,7 +808,30 @@ impl super::Editor {
             cursor.anchor = None;
         }
         self.handle_action(crate::input::keybindings::Action::SelectLine)?;
+        self.arm_terminal_selection_publication(split_id);
         Ok(())
+    }
+
+    pub(super) fn arm_terminal_selection_publication(
+        &mut self,
+        split_id: crate::model::event::LeafId,
+    ) {
+        let Some(anchor) = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .and_then(|(_, vs)| vs.get(&split_id))
+            .map(|vs| vs.cursors.primary().selection_start())
+        else {
+            return;
+        };
+
+        let ms = &mut self.active_window_mut().mouse_state;
+        ms.dragging_text_selection = true;
+        ms.drag_selection_split = Some(split_id);
+        ms.drag_selection_anchor = Some(anchor);
+        ms.drag_selection_by_words = false;
+        ms.drag_selection_word_end = None;
     }
 
     /// Drop a *live* terminal grid split into read-only scrollback for a
@@ -652,11 +891,11 @@ impl super::Editor {
         let vs = view_states.get(&split_id)?;
         let state = win.buffers.get(&buffer_id)?;
         let (top_line, _) = state.buffer.position_to_line_col(vs.viewport.top_byte());
-        let grid_row = row.saturating_sub(content_rect.y) as usize;
+        let (grid_col, grid_row) = clamped_rect_offset(content_rect, col, row)?;
+        let grid_row = grid_row as usize;
         // Account for horizontal scroll (a pinned view starts at 0, but an
         // explicit scrollback view may have been scrolled right).
-        let grid_col =
-            col.saturating_sub(content_rect.x) as usize + vs.viewport.left_column as usize;
+        let grid_col = grid_col as usize + vs.viewport.left_column as usize;
 
         // Grid-wrapped scroll-back (fresh#2649): visual rows are exact-column
         // wrap segments of the logical lines, so walk the segments from the
@@ -719,25 +958,10 @@ impl super::Editor {
     /// Return the byte boundary after the terminal cell that starts at `pos`.
     /// Empty cells past the rendered line stay collapsed at the line end.
     pub(super) fn terminal_grid_cell_end(&self, buffer_id: BufferId, pos: usize) -> usize {
-        let Some(state) = self
-            .windows
+        self.windows
             .get(&self.active_window)
             .and_then(|w| w.buffers.get(&buffer_id))
-        else {
-            return pos;
-        };
-        let (line, col) = state.buffer.position_to_line_col(pos);
-        let Some(bytes) = state.buffer.get_line(line) else {
-            return pos;
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let trimmed = text.trim_end_matches(['\n', '\r']);
-        if col >= trimmed.len() {
-            return pos;
-        }
-        state.buffer.line_col_to_position(
-            line,
-            crate::primitives::grapheme::next_grapheme_boundary(trimmed, col),
-        )
+            .map(|state| terminal_grid_cell_end_in_buffer(&state.buffer, pos))
+            .unwrap_or(pos)
     }
 }

@@ -61,7 +61,9 @@ impl Editor {
         // BEFORE the hook so the handler sees the new active buffer.
         #[cfg(feature = "plugins")]
         self.update_plugin_state_snapshot();
-        self.plugin_manager.read().unwrap().run_hook(
+        let owner = self.active_window;
+        self.run_plugin_hook_for_window(
+            owner,
             "buffer_activated",
             crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
         );
@@ -117,6 +119,9 @@ impl Window {
         if self.active_buffer() == buffer_id {
             return false;
         }
+
+        self.cancel_terminal_mouse_gestures();
+        self.mouse_state.clear_drag_state();
 
         // Dismiss transient popups and clear hover state when switching buffers
         self.on_editor_focus_lost();

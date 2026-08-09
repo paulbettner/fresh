@@ -46,7 +46,7 @@ pub(crate) use lsp_state::{LspMessageEntry, LspProgressInfo};
 pub use lsp_uri::{file_path_to_lsp_uri, file_path_to_lsp_uri_with_translation, LspUri};
 
 // mouse re-exports
-pub(crate) use mouse::MouseState;
+pub(crate) use mouse::{MouseClickTarget, MouseGestureOwner, MouseState};
 
 // search_state re-exports
 pub(super) use search_state::EventLineInfo;

@@ -12,13 +12,12 @@
 //! resolve without any chroot.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Once};
+use std::sync::Once;
 
+use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::FileSystem;
 use fresh::services::authority::{connect_kube_authority, RemoteAgentSpec};
-use fresh::services::env_provider::EnvProvider;
 use fresh::services::remote::{KubeConnection, KubeTarget, RemoteFileSystem};
-use fresh::services::workspace_trust::WorkspaceTrust;
 
 static PATH_INIT: Once = Once::new();
 
@@ -126,15 +125,16 @@ fn agent_channel_survives_dropping_the_attach_runtime() {
     // `editor_rt` models the editor's per-instance runtime: the attach runs on
     // it, and the attach-restart then drops it.
     let editor_rt = multi_thread_rt();
-    let (authority, _keepalive) = editor_rt
+    let (authority, _keepalive, identity) = editor_rt
         .block_on(connect_kube_authority(
             target(&ws),
             vec![],
-            Arc::new(WorkspaceTrust::permissive()),
-            Arc::new(EnvProvider::inactive()),
+            None,
+            DirectoryContext::for_testing(workspace.path()),
             None,
         ))
         .expect("connect over fake kubectl");
+    assert_eq!(identity.canonical_root, ws.canonicalize().unwrap());
 
     // Channel is live right after connect.
     authority
@@ -195,15 +195,16 @@ fn attach_spec_payload_parses_and_connects_through_fake_kubectl() {
     let (target, base_env) = spec.into_kube_target();
 
     let rt = multi_thread_rt();
-    let (authority, _keepalive) = rt
+    let (authority, _keepalive, identity) = rt
         .block_on(connect_kube_authority(
             target,
             base_env,
-            Arc::new(WorkspaceTrust::permissive()),
-            Arc::new(EnvProvider::inactive()),
+            None,
+            DirectoryContext::for_testing(workspace.path()),
             None,
         ))
         .expect("connect from parsed attach spec");
+    assert_eq!(identity.canonical_root, ws.canonicalize().unwrap());
 
     assert!(authority.display_label.starts_with("k8s:"));
     assert_eq!(authority.terminal_wrapper.command, "kubectl");
@@ -226,20 +227,18 @@ fn kube_authority_spawns_one_shot_and_lsp_through_fake_kubectl() {
     let ws = workspace.path().to_path_buf();
     let rt = multi_thread_rt();
 
-    let trust = std::sync::Arc::new(WorkspaceTrust::permissive());
-    let env = std::sync::Arc::new(EnvProvider::inactive());
-
     // Assemble the full authority over the fake cluster. `base_env` is the
     // captured in-pod probe applied to LSP spawns / command_exists.
-    let (authority, _keepalive) = rt
+    let (authority, _keepalive, identity) = rt
         .block_on(connect_kube_authority(
             target(&ws),
             vec![("E2E_BASE".to_string(), "base".to_string())],
-            std::sync::Arc::clone(&trust),
-            std::sync::Arc::clone(&env),
+            None,
+            DirectoryContext::for_testing(workspace.path()),
             None,
         ))
         .expect("connect_kube_authority over fake kubectl");
+    assert_eq!(identity.canonical_root, ws.canonicalize().unwrap());
 
     // The authority is shaped correctly.
     assert_eq!(authority.terminal_wrapper.command, "kubectl");

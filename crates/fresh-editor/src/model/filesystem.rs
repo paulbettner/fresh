@@ -512,7 +512,9 @@ pub trait FileSystem: Send + Sync {
     /// Recursively remove a directory and all its contents
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
         for entry in self.read_dir(path)? {
-            if entry.is_dir() {
+            if entry.is_symlink() {
+                self.remove_file(&entry.path)?;
+            } else if entry.is_dir() {
                 self.remove_dir_all(&entry.path)?;
             } else {
                 self.remove_file(&entry.path)?;
@@ -521,11 +523,21 @@ pub trait FileSystem: Send + Sync {
         self.remove_dir(path)
     }
 
-    /// Recursively copy a directory and all its contents to dst
+    /// Recursively copy a directory and all its contents to dst.
+    ///
+    /// The abstraction cannot recreate symlinks, so refusing them is the only
+    /// safe behavior: copying their targets would let a descendant escape the
+    /// source tree and silently turn a link into unrelated file contents.
     fn copy_dir_all(&self, src: &Path, dst: &Path) -> io::Result<()> {
         self.create_dir_all(dst)?;
         for entry in self.read_dir(src)? {
             let dst_child = dst.join(&entry.name);
+            if entry.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to copy symlink {}", entry.path.display()),
+                ));
+            }
             if entry.is_dir() {
                 self.copy_dir_all(&entry.path, &dst_child)?;
             } else {
@@ -676,6 +688,21 @@ pub trait FileSystem: Send + Sync {
     /// drive event-driven reconnect handling (respawning embedded terminals)
     /// instead of polling `is_remote_connected()`.
     fn remote_reconnect_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
+    /// Monotonic transport hot-swap generation for the backing remote channel.
+    /// Paired with `remote_reconnect_notify` to distinguish duplicate delivery
+    /// from a later reconnect. `None` for local or synthetic filesystems.
+    fn remote_reconnect_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Shared generation counter paired with `remote_reconnect_notify`. The
+    /// counter can outlive a forwarder task without retaining the filesystem.
+    fn remote_reconnect_generation_counter(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
         None
     }
 
@@ -2819,5 +2846,43 @@ mod tests {
             exit_code, 0,
             "child reported file NOT writable (exit_code={exit_code}); ACL was ignored",
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recursive_copy_refuses_descendant_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let outside = temp.path().join("outside");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("escape")).unwrap();
+
+        let error = StdFileSystem
+            .copy_dir_all(&source, &destination)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!destination.join("escape/secret").exists());
+        assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"outside");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recursive_remove_unlinks_descendant_symlinks_without_following_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("escape")).unwrap();
+
+        StdFileSystem.remove_dir_all(&source).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
     }
 }

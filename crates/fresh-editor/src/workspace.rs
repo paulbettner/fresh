@@ -24,9 +24,10 @@
 //! This ensures the workspace file is never left in a corrupted state.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::input::input_history::get_data_dir;
@@ -77,6 +78,11 @@ pub struct Workspace {
     /// Open terminal workspaces (for restoration)
     #[serde(default)]
     pub terminals: Vec<SerializedTerminalWorkspace>,
+    /// Terminal index of the OMP companion currently owned by the orchestrator
+    /// session. The index, rather than the process-local terminal id, survives
+    /// terminal-id remapping during workspace restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_agent_terminal: Option<usize>,
 
     /// External files open in the workspace (files outside working_dir)
     /// These are stored as absolute paths since they can't be made relative
@@ -140,19 +146,92 @@ pub struct Workspace {
     pub stable_id: Option<String>,
 }
 
-/// Mint a new durable workspace identity: creation-time nanoseconds plus a
-/// process-local sequence number, so two windows created in the same
-/// instant (e.g. a test spawning windows in a loop) can never collide.
-/// Deliberately dependency-free (same approach as the recovery service's
-/// `generate_buffer_id`).
+/// Mint a process-reserved, store-checked durable workspace identity.
+///
+/// UUID entropy makes cross-process collisions vanishingly unlikely; the
+/// reservation set closes deterministic/injected same-process collisions and
+/// the workspace scan prevents adopting an identity already published by a
+/// different Fresh process.
 pub fn generate_stable_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("ws-{:x}-{:x}", nanos, SEQ.fetch_add(1, Ordering::Relaxed))
+    generate_stable_id_with(|| format!("ws-{}", uuid::Uuid::new_v4().simple()))
+}
+
+fn generate_stable_id_with(mut candidate: impl FnMut() -> String) -> String {
+    static RESERVED: LazyLock<Mutex<HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let reserved = &*RESERVED;
+    loop {
+        let id = candidate();
+        if id.is_empty() {
+            continue;
+        }
+        let mut ids = reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ids.contains(&id) || stable_id_published(&id) {
+            continue;
+        }
+        ids.insert(id.clone());
+        return id;
+    }
+}
+
+fn stable_id_published(stable_id: &str) -> bool {
+    let Ok(dir) = get_workspaces_dir() else {
+        return false;
+    };
+    stable_id_published_in(&dir, stable_id)
+}
+
+fn stable_id_published_in(workspaces_dir: &Path, stable_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(workspaces_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|value| {
+                value
+                    .get("stable_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(stable_id)
+    })
+}
+
+fn stable_id_claimed_by_other_in(
+    workspaces_dir: &Path,
+    stable_id: &str,
+    working_dir: &Path,
+) -> bool {
+    let expected = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
+    let Ok(entries) = std::fs::read_dir(workspaces_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return false;
+        };
+        if value.get("stable_id").and_then(|id| id.as_str()) != Some(stable_id) {
+            return false;
+        }
+        let Some(root) = value
+            .get("working_dir")
+            .and_then(|root| root.as_str())
+            .map(PathBuf::from)
+        else {
+            return true;
+        };
+        root.canonicalize().unwrap_or(root) != expected
+    })
 }
 
 /// Skip-serialize predicate so workspace files for ordinary local sessions
@@ -520,20 +599,30 @@ pub struct SerializedTerminalWorkspace {
     pub rows: u16,
     pub log_path: PathBuf,
     pub backing_path: PathBuf,
-    /// Argv this terminal was spawned with (e.g. an Orchestrator agent
-    /// command), or `None` for a plain shell. Persisted so a restored
-    /// session re-runs its agent instead of coming back as a bare shell —
-    /// the live PTY is ephemeral and isn't otherwise reproducible. Absent
-    /// in workspaces written before this field existed.
+    /// Append-only rendered scrollback. `backing_path` is a separately replaced
+    /// visible checkpoint; older workspaces omit this and are migrated once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_path: Option<PathBuf>,
+    /// Exact append-only history length used to build `backing_path`. Restore
+    /// promotes that checkpoint only until later append-only history overtakes
+    /// it; newer history remains authoritative. Absent in older workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing_history_end: Option<u64>,
+    /// Immutable checkpoint publication identity. Each successful full save
+    /// writes a fresh checkpoint path and records the same generation here;
+    /// failed saves leave the previously published pair authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_generation: Option<String>,
+    /// Clean argv for a fresh relaunch of this terminal, or an empty vector for
+    /// the durable plain-shell marker. Initial launch-only provisioning ids and
+    /// prompts are deliberately excluded. The historical schema field remains
+    /// named `command`. Absent in older workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
-    /// Agent-resume spec: how to *rejoin* this terminal's agent session on
-    /// restore, as opposed to re-running its launch `command`. The
-    /// Orchestrator sets this so a session launched with
-    /// `claude --session-id <id>` resumes via `claude --resume <id>` (or
-    /// `claude --continue`). When present and resume is enabled, restore
-    /// runs this argv instead of `command`; otherwise it falls back to
-    /// `command`. Absent in older workspaces and for plain terminals.
+    /// Agent-resume spec: how to *rejoin* this terminal's agent session. OMP's
+    /// exact authenticated resume wins regardless of the generic preference;
+    /// ordinary agents use it only when resume is enabled and otherwise fall
+    /// back to the clean `command` relaunch argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_resume: Option<AgentResume>,
     /// Set when this terminal's process had already quit at save time.
@@ -569,7 +658,8 @@ pub struct SerializedTerminalWorkspace {
     #[serde(default, skip_serializing_if = "is_false")]
     pub script_access: bool,
     /// Descriptive companion marker. Capability secrets and live state are
-    /// deliberately excluded from workspace persistence.
+    /// deliberately excluded from workspace persistence. A markerless legacy
+    /// exact OMP resume may be promoted only by local unambiguous restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion: Option<fresh_core::api::TerminalCompanion>,
 }
@@ -842,11 +932,18 @@ pub fn decode_filename_to_path(encoded: &str) -> Option<PathBuf> {
 /// `windows.json` migration. Reads must NOT assume this name — see
 /// [`find_workspace_file_by_root`].
 pub fn get_workspace_path(working_dir: &Path) -> io::Result<PathBuf> {
+    Ok(get_workspace_path_in_dir(
+        &get_workspaces_dir()?,
+        working_dir,
+    ))
+}
+
+fn get_workspace_path_in_dir(workspaces_dir: &Path, working_dir: &Path) -> PathBuf {
     let canonical = working_dir
         .canonicalize()
         .unwrap_or_else(|_| working_dir.to_path_buf());
     let filename = format!("{}.json", encode_path_for_filename(&canonical));
-    Ok(get_workspaces_dir()?.join(filename))
+    workspaces_dir.join(filename)
 }
 
 /// Make a stable id filename-safe. The minted alphabet (`ws-<hex>-<hex>`)
@@ -866,6 +963,707 @@ fn sanitize_stable_id(stable_id: &str) -> String {
         .collect()
 }
 
+#[derive(Debug)]
+struct WorkspaceRootLockInner {
+    _file: std::fs::File,
+}
+
+/// Process-reentrant, host-wide lock for every persistence mutation at one
+/// canonical workspace root. A retained lifecycle owner keeps the same
+/// underlying file lock alive while ordinary saves/deletes in this process
+/// re-enter through the shared `Arc`; another Fresh process cannot publish at
+/// that root until the final owner releases it.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceRootLock {
+    _inner: Arc<WorkspaceRootLockInner>,
+}
+
+static WORKSPACE_ROOT_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<WorkspaceRootLockInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WORKSPACE_ROOT_OWNERS: LazyLock<Mutex<HashMap<String, (PathBuf, WorkspaceRootLock)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn canonical_workspace_root(root: &Path) -> PathBuf {
+    if let Ok(canonical) = root.canonicalize() {
+        return canonical;
+    }
+
+    // Lifecycle operations may rename the owned root before replay. Resolve the
+    // nearest surviving ancestor so the same path keeps the same lock identity
+    // even after its final component no longer exists (notably /var -> /private/var
+    // on macOS).
+    let mut suffix = Vec::new();
+    let mut ancestor = root;
+    while let Some(name) = ancestor.file_name() {
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        if let Ok(mut canonical) = parent.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        ancestor = parent;
+    }
+    root.to_path_buf()
+}
+
+fn workspace_root_lock_path(workspaces_dir: &Path, root: &Path) -> PathBuf {
+    workspaces_dir.join(format!(
+        ".root-{}.lock",
+        encode_path_for_filename(&canonical_workspace_root(root))
+    ))
+}
+
+fn workspace_root_lock_in(
+    workspaces_dir: &Path,
+    root: &Path,
+    wait: bool,
+) -> io::Result<WorkspaceRootLock> {
+    std::fs::create_dir_all(workspaces_dir)?;
+    let root = canonical_workspace_root(root);
+    let mut locks = WORKSPACE_ROOT_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = locks.get(&root).and_then(Weak::upgrade) {
+        return Ok(WorkspaceRootLock { _inner: existing });
+    }
+    locks.remove(&root);
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(workspace_root_lock_path(workspaces_dir, &root))?;
+    if wait {
+        file.lock()?;
+    } else {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "workspace root is owned by another publisher: {}",
+                        root.display()
+                    ),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    let inner = Arc::new(WorkspaceRootLockInner { _file: file });
+    locks.insert(root, Arc::downgrade(&inner));
+    Ok(WorkspaceRootLock { _inner: inner })
+}
+
+pub(crate) fn lock_workspace_root(
+    dir_context: &crate::config_io::DirectoryContext,
+    root: &Path,
+) -> io::Result<WorkspaceRootLock> {
+    workspace_root_lock_in(&dir_context.workspaces_dir(), root, true)
+}
+
+fn validate_workspace_owner_id(owner_id: &str) -> io::Result<()> {
+    if owner_id.is_empty()
+        || !owner_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace owner id must contain only ASCII letters, digits, '-' or '_'",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn acquire_workspace_root_ownership(
+    dir_context: &crate::config_io::DirectoryContext,
+    root: &Path,
+    owner_id: &str,
+) -> io::Result<()> {
+    validate_workspace_owner_id(owner_id)?;
+    let root = canonical_workspace_root(root);
+    {
+        let owners = WORKSPACE_ROOT_OWNERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((owned_root, _)) = owners.get(owner_id) {
+            return if *owned_root == root {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "workspace owner id is already bound to another root",
+                ))
+            };
+        }
+        if owners.values().any(|(owned_root, _)| *owned_root == root) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "workspace root is already owned by another lifecycle",
+            ));
+        }
+    }
+
+    let guard = workspace_root_lock_in(&dir_context.workspaces_dir(), &root, false)?;
+    let mut owners = WORKSPACE_ROOT_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if owners.values().any(|(owned_root, _)| *owned_root == root) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "workspace root is already owned by another lifecycle",
+        ));
+    }
+    owners.insert(owner_id.to_string(), (root, guard));
+    Ok(())
+}
+
+pub(crate) fn release_workspace_root_ownership(owner_id: &str) -> io::Result<()> {
+    validate_workspace_owner_id(owner_id)?;
+    WORKSPACE_ROOT_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(owner_id);
+    Ok(())
+}
+
+fn workspace_root_ownership(owner_id: &str) -> io::Result<(PathBuf, WorkspaceRootLock)> {
+    validate_workspace_owner_id(owner_id)?;
+    WORKSPACE_ROOT_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(owner_id)
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workspace lifecycle owner is not active",
+            )
+        })
+}
+
+fn require_workspace_root_ownership(owner_id: &str, root: &Path) -> io::Result<WorkspaceRootLock> {
+    let (owned_root, guard) = workspace_root_ownership(owner_id)?;
+    if owned_root == canonical_workspace_root(root) {
+        Ok(guard)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace lifecycle does not own the requested root",
+        ))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceArtifactQuarantine {
+    stable_id: Option<String>,
+    #[serde(default)]
+    source_root: Option<PathBuf>,
+    #[serde(default)]
+    restored_to: Option<PathBuf>,
+    had_artifacts: bool,
+}
+
+fn workspace_artifact_quarantine_dir(
+    dir_context: &crate::config_io::DirectoryContext,
+    owner_id: &str,
+) -> PathBuf {
+    dir_context
+        .data_dir
+        .join("workspace-artifact-quarantine")
+        .join(owner_id)
+}
+
+fn workspace_artifact_source(
+    dir_context: &crate::config_io::DirectoryContext,
+    root: &Path,
+    stable_id: Option<&str>,
+) -> PathBuf {
+    stable_id.map_or_else(
+        || dir_context.terminal_dir_for(root),
+        |stable_id| terminal_artifacts_dir(dir_context, root, stable_id),
+    )
+}
+
+/// Move an exact terminal-artifact namespace into a durable lifecycle stage.
+/// The prepared manifest is published before the rename, so retry after a crash
+/// deterministically completes the same move. The caller must retain root
+/// ownership until it chooses restore, retained archive, or delete-only purge.
+pub(crate) fn quarantine_workspace_artifacts(
+    dir_context: &crate::config_io::DirectoryContext,
+    root: &Path,
+    stable_id: Option<&str>,
+    owner_id: &str,
+) -> io::Result<()> {
+    let _ownership = require_workspace_root_ownership(owner_id, root)?;
+    let root_identity = canonical_workspace_root(root);
+    if stable_id == Some("") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace stable id must not be empty",
+        ));
+    }
+    let stage = workspace_artifact_quarantine_dir(dir_context, owner_id);
+    let manifest_path = stage.join("manifest.json");
+    let payload = stage.join("artifacts");
+    let source = workspace_artifact_source(dir_context, root, stable_id);
+
+    if manifest_path.exists() {
+        let manifest: WorkspaceArtifactQuarantine =
+            serde_json::from_slice(&std::fs::read(&manifest_path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if manifest
+            .source_root
+            .as_ref()
+            .is_some_and(|source_root| canonical_workspace_root(source_root) != root_identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace artifact owner id is already bound to another root",
+            ));
+        }
+        if manifest.stable_id.as_deref() != stable_id {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace artifact owner id is already bound to another identity",
+            ));
+        }
+        if manifest.restored_to.is_some() {
+            return Ok(());
+        }
+        return match (manifest.had_artifacts, source.exists(), payload.exists()) {
+            (false, false, false) | (true, false, true) => Ok(()),
+            (true, true, false) => durable_rename(&source, &payload),
+            _ => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace artifact quarantine is ambiguous",
+            )),
+        };
+    }
+
+    std::fs::create_dir_all(&stage)?;
+    let manifest = WorkspaceArtifactQuarantine {
+        stable_id: stable_id.map(str::to_owned),
+        source_root: Some(root.to_path_buf()),
+        restored_to: None,
+        had_artifacts: source.exists(),
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+    atomic_write_workspace_with(&manifest_path, &bytes, |_| Ok(()), sync_workspace_parent)?;
+    if manifest.had_artifacts {
+        durable_rename(&source, &payload)?;
+    }
+    Ok(())
+}
+
+/// Restore a staged artifact namespace, optionally at a new root after a
+/// collision-safe archive move. Success consumes the payload but retains a
+/// small durable completion receipt so replay after a crash is idempotent.
+pub(crate) fn restore_workspace_artifacts(
+    dir_context: &crate::config_io::DirectoryContext,
+    target_root: &Path,
+    stable_id: Option<&str>,
+    owner_id: &str,
+) -> io::Result<()> {
+    let (owned_root, _ownership) = workspace_root_ownership(owner_id)?;
+    let stage = workspace_artifact_quarantine_dir(dir_context, owner_id);
+    let manifest_path = stage.join("manifest.json");
+    let mut manifest: WorkspaceArtifactQuarantine =
+        serde_json::from_slice(&std::fs::read(&manifest_path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if manifest
+        .source_root
+        .as_ref()
+        .is_some_and(|source_root| canonical_workspace_root(source_root) != owned_root)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace artifact quarantine belongs to another root ownership",
+        ));
+    }
+    if manifest.stable_id.as_deref() != stable_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace artifact identity does not match its quarantine",
+        ));
+    }
+    let target_identity = canonical_workspace_root(target_root);
+    let _target_lock = if target_identity == owned_root {
+        None
+    } else {
+        let target_owned_elsewhere = WORKSPACE_ROOT_OWNERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|(candidate_owner, (candidate_root, _))| {
+                candidate_owner != owner_id && *candidate_root == target_identity
+            });
+        if target_owned_elsewhere {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "workspace artifact restore target is owned by another lifecycle",
+            ));
+        }
+        Some(workspace_root_lock_in(
+            &dir_context.workspaces_dir(),
+            &target_identity,
+            false,
+        )?)
+    };
+    if let Some(restored_to) = manifest.restored_to.as_ref() {
+        if canonical_workspace_root(restored_to) != target_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace artifact quarantine was already restored to another root",
+            ));
+        }
+        if !manifest.had_artifacts {
+            return Ok(());
+        }
+        let payload = stage.join("artifacts");
+        let destination = workspace_artifact_source(dir_context, restored_to, stable_id);
+        return match (payload.exists(), destination.exists()) {
+            (false, true) => Ok(()),
+            (true, false) => {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                durable_rename(&payload, &destination)
+            }
+            (true, true) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "completed workspace artifact restore is ambiguous",
+            )),
+            (false, false) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "completed workspace artifact restore is missing its payload and destination",
+            )),
+        };
+    }
+    let payload = stage.join("artifacts");
+    let destination = workspace_artifact_source(dir_context, target_root, stable_id);
+    match (
+        manifest.had_artifacts,
+        payload.exists(),
+        destination.exists(),
+    ) {
+        (false, false, false) | (true, false, true) => {}
+        (true, true, false) => {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            durable_rename(&payload, &destination)?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace artifact restore is ambiguous",
+            ));
+        }
+    }
+    manifest.restored_to = Some(target_root.to_path_buf());
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+    atomic_write_workspace_with(&manifest_path, &bytes, |_| Ok(()), sync_workspace_parent)
+}
+
+/// Permanently discard a staged namespace. Lifecycle callers use this only
+/// after committed Delete; Archive deliberately retains the stage.
+pub(crate) fn purge_workspace_artifact_quarantine(
+    dir_context: &crate::config_io::DirectoryContext,
+    owner_id: &str,
+) -> io::Result<()> {
+    let (owned_root, _ownership) = workspace_root_ownership(owner_id)?;
+    let stage = workspace_artifact_quarantine_dir(dir_context, owner_id);
+    if stage.exists() {
+        let manifest: WorkspaceArtifactQuarantine =
+            serde_json::from_slice(&std::fs::read(stage.join("manifest.json"))?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if manifest
+            .source_root
+            .as_ref()
+            .is_some_and(|source_root| canonical_workspace_root(source_root) != owned_root)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workspace artifact quarantine belongs to another root ownership",
+            ));
+        }
+    }
+    match std::fs::remove_dir_all(&stage) {
+        Ok(()) => sync_workspace_parent(&stage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+/// Local transcript directory for one durable workspace identity. The project
+/// root remains a readable locator, while `stable_id` prevents co-tenant
+/// windows at that root from opening/truncating each other's terminal files.
+pub fn terminal_artifacts_dir(
+    dir_context: &crate::config_io::DirectoryContext,
+    working_dir: &Path,
+    stable_id: &str,
+) -> PathBuf {
+    let root = dir_context.terminal_dir_for(working_dir);
+    if stable_id.is_empty() {
+        root
+    } else {
+        root.join(sanitize_stable_id(stable_id))
+    }
+}
+
+/// Remove terminal artifacts for one durable workspace identity, then durably
+/// publish the directory removal. Missing artifacts are already forgotten.
+pub(crate) fn delete_terminal_artifacts_by_id(
+    dir_context: &crate::config_io::DirectoryContext,
+    working_dir: &Path,
+    stable_id: &str,
+) -> io::Result<()> {
+    let _root_lock = lock_workspace_root(dir_context, working_dir)?;
+    delete_terminal_artifact_directory(&terminal_artifacts_dir(dir_context, working_dir, stable_id))
+}
+
+/// Remove every terminal-artifact co-tenant at one root. The caller must first
+/// prove that no live or draining window still owns the root.
+pub(crate) fn delete_terminal_artifacts_for_root(
+    dir_context: &crate::config_io::DirectoryContext,
+    working_dir: &Path,
+) -> io::Result<()> {
+    let _root_lock = lock_workspace_root(dir_context, working_dir)?;
+    delete_terminal_artifact_directory(&dir_context.terminal_dir_for(working_dir))
+}
+
+fn delete_terminal_artifact_directory(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => sync_workspace_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// One local terminal artifact ownership move performed by workspace
+/// extraction. The pair is journaled before the first rename so startup can
+/// deterministically roll a prepared move back or finish a committed one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TerminalArtifactRelocation {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    /// Source-authoritative files remain in place until source metadata no
+    /// longer advertises them. This includes lock pathnames and the immutable
+    /// serialized checkpoint. Older journals moved everything in one phase,
+    /// so absent means an ordinary pre-cutover artifact.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub after_source_cutover: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub(crate) enum TerminalExtractionPhase {
+    Prepared,
+    Committed {
+        source_after: Workspace,
+        target_after: Workspace,
+    },
+}
+
+/// Durable extraction intent. `source_before` is the authoritative rollback
+/// snapshot until `phase` atomically changes to `Committed`; after that the two
+/// post-cutover snapshots are authoritative and recovery only finishes forward.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TerminalExtractionIntent {
+    pub id: String,
+    pub source_before: Workspace,
+    pub target_root: PathBuf,
+    pub target_stable_id: String,
+    pub artifacts: Vec<TerminalArtifactRelocation>,
+    pub phase: TerminalExtractionPhase,
+}
+
+impl TerminalExtractionIntent {
+    pub(crate) fn prepared(
+        source_before: Workspace,
+        target_root: PathBuf,
+        target_stable_id: String,
+        artifacts: Vec<TerminalArtifactRelocation>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_before,
+            target_root,
+            target_stable_id,
+            artifacts,
+            phase: TerminalExtractionPhase::Prepared,
+        }
+    }
+}
+
+fn terminal_extraction_dir(dir_context: &crate::config_io::DirectoryContext) -> PathBuf {
+    dir_context.data_dir.join("terminal-extractions")
+}
+
+pub(crate) fn terminal_extraction_intent_path(
+    dir_context: &crate::config_io::DirectoryContext,
+    id: &str,
+) -> PathBuf {
+    terminal_extraction_dir(dir_context).join(format!("{id}.json"))
+}
+
+pub(crate) fn persist_terminal_extraction_intent(
+    dir_context: &crate::config_io::DirectoryContext,
+    intent: &TerminalExtractionIntent,
+) -> io::Result<PathBuf> {
+    let path = terminal_extraction_intent_path(dir_context, &intent.id);
+    std::fs::create_dir_all(path.parent().expect("extraction intent has parent"))?;
+    let bytes = serde_json::to_vec_pretty(intent).map_err(io::Error::other)?;
+    atomic_write_workspace_with(&path, &bytes, |_| Ok(()), sync_workspace_parent)?;
+    Ok(path)
+}
+
+pub(crate) fn clear_terminal_extraction_intent(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_workspace_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Recover every extraction journal before workspace discovery. Prepared
+/// transactions restore the exact source snapshot; committed transactions
+/// finish publishing both post-cutover snapshots. A failed rename leaves the
+/// journal and every surviving artifact in place for the next startup.
+pub(crate) fn recover_terminal_extractions(
+    dir_context: &crate::config_io::DirectoryContext,
+) -> io::Result<()> {
+    let dir = terminal_extraction_dir(dir_context);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut first_error = None;
+    for entry in entries {
+        let result =
+            entry.and_then(|entry| recover_terminal_extraction(dir_context, &entry.path()));
+        if let Err(error) = result {
+            tracing::error!("terminal extraction recovery deferred: {error}");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn recover_terminal_extraction(
+    dir_context: &crate::config_io::DirectoryContext,
+    path: &Path,
+) -> io::Result<()> {
+    let intent: TerminalExtractionIntent = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut roots = vec![
+        intent.source_before.working_dir.clone(),
+        intent.target_root.clone(),
+    ];
+    roots.sort();
+    roots.dedup();
+    let _root_locks = roots
+        .iter()
+        .map(|root| lock_workspace_root(dir_context, root))
+        .collect::<io::Result<Vec<_>>>()?;
+    match &intent.phase {
+        TerminalExtractionPhase::Prepared => {
+            for move_ in intent.artifacts.iter().rev() {
+                restore_relocated_artifact(move_)?;
+            }
+            intent
+                .source_before
+                .save_in(dir_context)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Workspace::delete_by_id_in(dir_context, &intent.target_root, &intent.target_stable_id)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let target_dir =
+                terminal_artifacts_dir(dir_context, &intent.target_root, &intent.target_stable_id);
+            match std::fs::remove_dir(&target_dir) {
+                Ok(()) => sync_workspace_parent(&target_dir)?,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        TerminalExtractionPhase::Committed {
+            source_after,
+            target_after,
+        } => {
+            for move_ in &intent.artifacts {
+                finish_relocated_artifact(move_)?;
+            }
+            target_after
+                .save_in(dir_context)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            source_after
+                .save_in(dir_context)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+    }
+    clear_terminal_extraction_intent(path)
+}
+
+fn restore_relocated_artifact(move_: &TerminalArtifactRelocation) -> io::Result<()> {
+    match (move_.source.exists(), move_.destination.exists()) {
+        (true, false) => Ok(()),
+        (false, true) => durable_rename(&move_.destination, &move_.source),
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "both extraction artifact locations exist: {} and {}",
+                move_.source.display(),
+                move_.destination.display()
+            ),
+        )),
+        (false, false) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "extraction artifact missing from both {} and {}",
+                move_.source.display(),
+                move_.destination.display()
+            ),
+        )),
+    }
+}
+
+fn finish_relocated_artifact(move_: &TerminalArtifactRelocation) -> io::Result<()> {
+    match (move_.source.exists(), move_.destination.exists()) {
+        (false, true) => Ok(()),
+        (true, false) => durable_rename(&move_.source, &move_.destination),
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "both committed extraction artifact locations exist: {} and {}",
+                move_.source.display(),
+                move_.destination.display()
+            ),
+        )),
+        (false, false) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "committed extraction artifact missing from both {} and {}",
+                move_.source.display(),
+                move_.destination.display()
+            ),
+        )),
+    }
+}
+
 /// Workspace file path for a workspace with a durable id:
 /// `workspaces/<encoded-root>.<stable_id>.json`.
 ///
@@ -875,6 +1673,18 @@ fn sanitize_stable_id(stable_id: &str) -> String {
 /// siblings). Content (`working_dir` inside the file) stays authoritative
 /// wherever names collide.
 pub fn workspace_path_for(working_dir: &Path, stable_id: &str) -> io::Result<PathBuf> {
+    Ok(workspace_path_for_in_dir(
+        &get_workspaces_dir()?,
+        working_dir,
+        stable_id,
+    ))
+}
+
+fn workspace_path_for_in_dir(
+    workspaces_dir: &Path,
+    working_dir: &Path,
+    stable_id: &str,
+) -> PathBuf {
     let canonical = working_dir
         .canonicalize()
         .unwrap_or_else(|_| working_dir.to_path_buf());
@@ -883,7 +1693,7 @@ pub fn workspace_path_for(working_dir: &Path, stable_id: &str) -> io::Result<Pat
         encode_path_for_filename(&canonical),
         sanitize_stable_id(stable_id)
     );
-    Ok(get_workspaces_dir()?.join(filename))
+    workspaces_dir.join(filename)
 }
 
 /// Identity fields of a candidate workspace file for one directory.
@@ -899,7 +1709,11 @@ struct WorkspaceFileIdentity {
 /// vs `/a.b`), so each candidate's recorded `working_dir` is verified
 /// before it counts. Unparseable files are skipped (a torn write just
 /// means "not a workspace").
-fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileIdentity>> {
+
+fn candidate_files_for_root_in_dir(
+    workspaces_dir: &Path,
+    working_dir: &Path,
+) -> io::Result<Vec<WorkspaceFileIdentity>> {
     let target = working_dir
         .canonicalize()
         .unwrap_or_else(|_| working_dir.to_path_buf());
@@ -907,8 +1721,7 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
     let legacy_name = format!("{encoded}.json");
     let id_prefix = format!("{encoded}.");
 
-    let dir = get_workspaces_dir()?;
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(workspaces_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -927,12 +1740,6 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
             continue;
         };
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-            // A name-matching file that won't parse is a corrupt (or
-            // foreign) workspace snapshot. It's dropped from the candidate
-            // set — `load` then reports "no session" and the editor starts
-            // fresh rather than erroring — but surface it, or a damaged sole
-            // workspace file vanishes into a silent empty start with no clue
-            // why the layout was lost.
             tracing::warn!(
                 "Ignoring unparseable workspace file {:?} while resolving {:?}",
                 path,
@@ -940,7 +1747,6 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
             );
             continue;
         };
-        // Authoritative check: the file must itself claim this directory.
         let claimed = val
             .get("working_dir")
             .and_then(|v| v.as_str())
@@ -948,12 +1754,6 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
         let Some(claimed) = claimed else {
             continue;
         };
-        // Compare canonical-to-canonical, but accept a verbatim raw match
-        // too. A one-sided `canonicalize` failure (a symlink that resolves
-        // for the lookup path but not for the stored string, or vice versa)
-        // would otherwise leave one side canonical and the other raw and
-        // drop a file whose recorded `working_dir` equals the lookup path
-        // exactly — losing a valid saved session.
         let claimed_canonical = claimed.canonicalize().unwrap_or_else(|_| claimed.clone());
         if claimed_canonical != target && claimed != working_dir {
             continue;
@@ -968,6 +1768,240 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
         });
     }
     Ok(found)
+}
+
+/// Strict host-side persistence inventory for lifecycle transactions. A file
+/// whose name may belong to `working_dir` is never silently skipped when its
+/// contents are unreadable or ambiguous; the caller must preserve everything
+/// rather than proceed from an incomplete deletion guard.
+pub fn inspect_workspace_persistence(
+    working_dir: &Path,
+) -> Result<Vec<fresh_core::api::WorkspacePersistenceFile>, WorkspaceError> {
+    inspect_workspace_persistence_in_dir(&get_workspaces_dir()?, working_dir)
+}
+
+pub fn inspect_workspace_persistence_in(
+    dir_context: &crate::config_io::DirectoryContext,
+    working_dir: &Path,
+) -> Result<Vec<fresh_core::api::WorkspacePersistenceFile>, WorkspaceError> {
+    inspect_workspace_persistence_in_dir(&dir_context.workspaces_dir(), working_dir)
+}
+
+fn inspect_workspace_persistence_in_dir(
+    workspaces_dir: &Path,
+    working_dir: &Path,
+) -> Result<Vec<fresh_core::api::WorkspacePersistenceFile>, WorkspaceError> {
+    let target = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
+    let encoded = encode_path_for_filename(&target);
+    let legacy_name = format!("{encoded}.json");
+    let id_prefix = format!("{encoded}.");
+    let entries = match std::fs::read_dir(workspaces_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name != legacy_name && !(name.starts_with(&id_prefix) && name.ends_with(".json")) {
+            continue;
+        }
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)?;
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        let claimed = value
+            .get("working_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("workspace file {} has no working_dir", path.display()),
+                )
+            })?;
+        let claimed_canonical = claimed.canonicalize().unwrap_or_else(|_| claimed.clone());
+        if claimed_canonical != target && claimed != working_dir {
+            continue;
+        }
+        let workspace: Workspace = serde_json::from_value(value)?;
+        if workspace.version > WORKSPACE_VERSION {
+            return Err(WorkspaceError::VersionTooNew {
+                version: workspace.version,
+                max_supported: WORKSPACE_VERSION,
+            });
+        }
+        match &workspace.stable_id {
+            None if name != legacy_name => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "id-keyed workspace file {} has no stable id",
+                        path.display()
+                    ),
+                )
+                .into());
+            }
+            Some(_) if name == legacy_name => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy workspace file {} carries a stable id",
+                        path.display()
+                    ),
+                )
+                .into());
+            }
+            Some(stable_id) => {
+                let expected = workspace_path_for_in_dir(workspaces_dir, working_dir, stable_id);
+                if expected.file_name() != path.file_name() {
+                    return Err(WorkspaceError::IdentityMismatch {
+                        expected: stable_id.clone(),
+                        found: workspace.stable_id.clone(),
+                    });
+                }
+            }
+            None => {}
+        }
+        files.push(fresh_core::api::WorkspacePersistenceFile {
+            path: path.to_string_lossy().into_owned(),
+            content,
+            stable_id: workspace.stable_id,
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn create_attempt_marker(workspace: &Workspace) -> Option<&str> {
+    workspace
+        .session_plugin_state
+        .get("orchestrator")?
+        .get("create_attempt")?
+        .as_str()
+}
+
+fn created_workspace_identity(workspace: &Workspace) -> Result<(String, String), WorkspaceError> {
+    let workspace_id = workspace.stable_id.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a created workspace marker has no durable stable id",
+        )
+    })?;
+    Ok((
+        workspace.working_dir.to_string_lossy().into_owned(),
+        workspace_id,
+    ))
+}
+
+fn select_created_workspace(
+    marked: Vec<Workspace>,
+    hinted: Vec<Workspace>,
+) -> Result<Option<(String, String)>, WorkspaceError> {
+    let candidates = if marked.is_empty() { hinted } else { marked };
+    match candidates.len() {
+        0 => Ok(None),
+        1 => created_workspace_identity(&candidates[0]).map(Some),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workspace create-attempt inventory is ambiguous",
+        )
+        .into()),
+    }
+}
+
+fn inspect_workspace_create_attempt_strict_in_dir(
+    workspaces_dir: &Path,
+    attempt_id: &str,
+    root_hint: Option<&Path>,
+    workspace_id_hint: Option<&str>,
+) -> Result<Option<(String, String)>, WorkspaceError> {
+    if let Some(root) = root_hint {
+        let files = inspect_workspace_persistence_in_dir(workspaces_dir, root)?;
+        let mut marked = Vec::new();
+        let mut hinted = Vec::new();
+        for file in files {
+            let workspace: Workspace = serde_json::from_str(&file.content)?;
+            if create_attempt_marker(&workspace) == Some(attempt_id) {
+                marked.push(workspace);
+            } else if workspace_id_hint.is_some_and(|id| workspace.stable_id.as_deref() == Some(id))
+            {
+                hinted.push(workspace);
+            }
+        }
+        return select_created_workspace(marked, hinted);
+    }
+
+    let entries = match std::fs::read_dir(workspaces_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut marked = Vec::new();
+    let mut hinted = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let workspace: Workspace = serde_json::from_str(&content)?;
+        if workspace.version > WORKSPACE_VERSION {
+            return Err(WorkspaceError::VersionTooNew {
+                version: workspace.version,
+                max_supported: WORKSPACE_VERSION,
+            });
+        }
+        let expected = match workspace.stable_id.as_deref() {
+            Some(stable_id) => {
+                workspace_path_for_in_dir(workspaces_dir, &workspace.working_dir, stable_id)
+            }
+            None => get_workspace_path_in_dir(workspaces_dir, &workspace.working_dir),
+        };
+        if expected.file_name() != path.file_name() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("workspace file {} has ambiguous identity", path.display()),
+            )
+            .into());
+        }
+        if create_attempt_marker(&workspace) == Some(attempt_id) {
+            marked.push(workspace);
+        } else if workspace_id_hint.is_some_and(|id| workspace.stable_id.as_deref() == Some(id)) {
+            hinted.push(workspace);
+        }
+    }
+    select_created_workspace(marked, hinted)
+}
+
+/// Locate one create attempt without ever collapsing an incomplete persistence
+/// scan into "not found". The tagged result is consumed directly by the bundled
+/// Orchestrator's Retry/Dismiss recovery paths.
+pub fn inspect_workspace_create_attempt_in(
+    dir_context: &crate::config_io::DirectoryContext,
+    attempt_id: &str,
+    root_hint: Option<&Path>,
+    workspace_id_hint: Option<&str>,
+) -> fresh_core::api::WorkspaceCreateAttemptInventory {
+    match inspect_workspace_create_attempt_strict_in_dir(
+        &dir_context.workspaces_dir(),
+        attempt_id,
+        root_hint,
+        workspace_id_hint,
+    ) {
+        Ok(Some((root, workspace_id))) => {
+            fresh_core::api::WorkspaceCreateAttemptInventory::Found { root, workspace_id }
+        }
+        Ok(None) => fresh_core::api::WorkspaceCreateAttemptInventory::NotFound,
+        Err(error) => fresh_core::api::WorkspaceCreateAttemptInventory::Error {
+            message: error.to_string(),
+        },
+    }
 }
 
 /// Ranking key used to arbitrate between multiple workspace files that
@@ -992,8 +2026,22 @@ pub fn workspace_freshness_rank(saved_at: u64, has_stable_id: bool) -> (u64, boo
 /// claims the directory the freshest snapshot wins — see
 /// [`workspace_freshness_rank`].
 pub fn find_workspace_file_by_root(working_dir: &Path) -> io::Result<Option<PathBuf>> {
+    find_workspace_file_by_root_in_dir(&get_workspaces_dir()?, working_dir)
+}
+
+pub fn find_workspace_file_by_root_in(
+    dir_context: &crate::config_io::DirectoryContext,
+    working_dir: &Path,
+) -> io::Result<Option<PathBuf>> {
+    find_workspace_file_by_root_in_dir(&dir_context.workspaces_dir(), working_dir)
+}
+
+fn find_workspace_file_by_root_in_dir(
+    workspaces_dir: &Path,
+    working_dir: &Path,
+) -> io::Result<Option<PathBuf>> {
     let mut best: Option<WorkspaceFileIdentity> = None;
-    for ident in candidate_files_for_root(working_dir)? {
+    for ident in candidate_files_for_root_in_dir(workspaces_dir, working_dir)? {
         let newer = match &best {
             None => true,
             Some(b) => {
@@ -1023,8 +2071,18 @@ pub fn get_session_workspaces_dir() -> io::Result<PathBuf> {
 pub enum WorkspaceError {
     Io(anyhow::Error),
     Json(serde_json::Error),
-    WorkdirMismatch { expected: PathBuf, found: PathBuf },
-    VersionTooNew { version: u32, max_supported: u32 },
+    WorkdirMismatch {
+        expected: PathBuf,
+        found: PathBuf,
+    },
+    IdentityMismatch {
+        expected: String,
+        found: Option<String>,
+    },
+    VersionTooNew {
+        version: u32,
+        max_supported: u32,
+    },
 }
 
 impl std::fmt::Display for WorkspaceError {
@@ -1036,6 +2094,13 @@ impl std::fmt::Display for WorkspaceError {
                 write!(
                     f,
                     "Working directory mismatch: expected {:?}, found {:?}",
+                    expected, found
+                )
+            }
+            Self::IdentityMismatch { expected, found } => {
+                write!(
+                    f,
+                    "Workspace identity mismatch: expected {:?}, found {:?}",
                     expected, found
                 )
             }
@@ -1081,6 +2146,105 @@ impl From<serde_json::Error> for WorkspaceError {
     }
 }
 
+fn unique_workspace_temp(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace.json");
+    path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+fn sync_workspace_parent(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("workspace path has no parent directory"))?;
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        // `replace_workspace_temp` uses MOVEFILE_WRITE_THROUGH, Windows'
+        // durable-publication boundary for the renamed directory entry.
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Atomically rename a file or directory and make the directory-entry change
+/// durable before callers publish metadata that names the destination.
+#[cfg(not(windows))]
+pub(crate) fn durable_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)?;
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| io::Error::other("rename source has no parent directory"))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("rename destination has no parent directory"))?;
+    std::fs::File::open(source_parent)?.sync_all()?;
+    if destination_parent != source_parent {
+        std::fs::File::open(destination_parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn durable_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn replace_workspace_temp(temp: &Path, target: &Path) -> io::Result<()> {
+    durable_rename(temp, target)
+}
+
+fn atomic_write_workspace_with(
+    path: &Path,
+    content: &[u8],
+    after_temp_sync: impl FnOnce(&Path) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let temp = unique_workspace_temp(path);
+    let publication = (|| -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        after_temp_sync(&temp)?;
+        replace_workspace_temp(&temp, path)?;
+        sync_parent(path)
+    })();
+    if publication.is_err() {
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = std::fs::remove_file(&temp);
+    }
+    publication
+}
 impl Workspace {
     /// Load workspace for a working directory (if exists).
     ///
@@ -1088,30 +2252,74 @@ impl Workspace {
     /// file (filenames are stable-id-keyed; legacy files are root-keyed) —
     /// see [`find_workspace_file_by_root`].
     pub fn load(working_dir: &Path) -> Result<Option<Workspace>, WorkspaceError> {
-        let Some(path) = find_workspace_file_by_root(working_dir)? else {
+        Self::load_in_dir(&get_workspaces_dir()?, working_dir)
+    }
+
+    pub fn load_in(
+        dir_context: &crate::config_io::DirectoryContext,
+        working_dir: &Path,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        Self::load_in_dir(&dir_context.workspaces_dir(), working_dir)
+    }
+
+    fn load_in_dir(
+        workspaces_dir: &Path,
+        working_dir: &Path,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        let Some(path) = find_workspace_file_by_root_in_dir(workspaces_dir, working_dir)? else {
             tracing::debug!("No workspace file found for {:?}", working_dir);
             return Ok(None);
         };
         Self::load_from_path(&path, working_dir)
     }
 
-    /// Load the workspace with a specific durable identity at `working_dir`
-    /// (`workspaces/<encoded-root>.<stable_id>.json`). Unlike [`Self::load`],
-    /// which resolves the freshest file for a root, this targets one exact
-    /// co-tenant — the way each window restores *its own* persisted layout when
-    /// several workspaces share a root. Falls back to the root-keyed lookup
-    /// when the id-keyed file is absent (a legacy snapshot the window adopts).
+    /// Load one exact durable co-tenant identity at `working_dir`.
+    /// A missing exact file may adopt only the legacy root-keyed, id-less
+    /// snapshot; an id-bearing sibling is never a fallback.
     pub fn load_by_id(
         working_dir: &Path,
         stable_id: &str,
     ) -> Result<Option<Workspace>, WorkspaceError> {
-        let path = workspace_path_for(working_dir, stable_id)?;
+        Self::load_by_id_in_dir(&get_workspaces_dir()?, working_dir, stable_id)
+    }
+
+    pub fn load_by_id_in(
+        dir_context: &crate::config_io::DirectoryContext,
+        working_dir: &Path,
+        stable_id: &str,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        Self::load_by_id_in_dir(&dir_context.workspaces_dir(), working_dir, stable_id)
+    }
+
+    fn load_by_id_in_dir(
+        workspaces_dir: &Path,
+        working_dir: &Path,
+        stable_id: &str,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        let path = workspace_path_for_in_dir(workspaces_dir, working_dir, stable_id);
         if path.exists() {
-            return Self::load_from_path(&path, working_dir);
+            let workspace = Self::load_from_path(&path, working_dir)?;
+            if let Some(workspace) = &workspace {
+                if workspace.stable_id.as_deref() != Some(stable_id) {
+                    return Err(WorkspaceError::IdentityMismatch {
+                        expected: stable_id.to_string(),
+                        found: workspace.stable_id.clone(),
+                    });
+                }
+            }
+            return Ok(workspace);
         }
-        // No id-keyed file yet: the window may be adopting a legacy root-keyed
-        // snapshot (its next save re-keys it under this id).
-        Self::load(working_dir)
+
+        let legacy = get_workspace_path_in_dir(workspaces_dir, working_dir);
+        let workspace = Self::load_from_path(&legacy, working_dir)?;
+        match workspace {
+            Some(workspace) if workspace.stable_id.is_none() => Ok(Some(workspace)),
+            Some(workspace) => Err(WorkspaceError::IdentityMismatch {
+                expected: stable_id.to_string(),
+                found: workspace.stable_id,
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Read, parse, and validate a workspace file at `path`, checking it
@@ -1201,68 +2409,89 @@ impl Workspace {
             })
     }
 
-    /// Save workspace to file using atomic write (temp file + rename)
+    /// Save workspace with a durable atomic replacement.
     ///
-    /// This ensures the workspace file is never left in a corrupted state:
-    /// 1. Write to a temporary file in the same directory
-    /// 2. Sync to disk (fsync)
-    /// 3. Atomically rename to the final path
+    /// 1. Create a caller-unique temp in the same directory with `create_new`.
+    /// 2. Write and sync the complete snapshot.
+    /// 3. Atomically rename it to the final path.
+    /// 4. Sync the parent directory before reporting success.
     pub fn save(&self) -> Result<(), WorkspaceError> {
-        // Storage is keyed by the durable workspace id (with the encoded
-        // root as a filename-level locator); only snapshots that never
-        // passed through a `Window` (no `stable_id`) fall back to the
-        // legacy root-derived name.
+        self.save_in_dir(&get_workspaces_dir()?)
+    }
+
+    pub fn save_in(
+        &self,
+        dir_context: &crate::config_io::DirectoryContext,
+    ) -> Result<(), WorkspaceError> {
+        self.save_in_dir(&dir_context.workspaces_dir())
+    }
+
+    fn save_in_dir(&self, workspaces_dir: &Path) -> Result<(), WorkspaceError> {
+        let _root_lock = workspace_root_lock_in(workspaces_dir, &self.working_dir, true)?;
         let path = match &self.stable_id {
-            Some(id) => workspace_path_for(&self.working_dir, id)?,
-            None => get_workspace_path(&self.working_dir)?,
+            Some(id) => workspace_path_for_in_dir(workspaces_dir, &self.working_dir, id),
+            None => get_workspace_path_in_dir(workspaces_dir, &self.working_dir),
         };
         tracing::debug!("Saving workspace to {:?}", path);
 
-        // Ensure directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Serialize to JSON
+        let _identity_lock = if let Some(id) = &self.stable_id {
+            let lock_path =
+                workspaces_dir.join(format!(".stable-id-{}.lock", sanitize_stable_id(id)));
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(lock_path)?;
+            lock.lock()?;
+            match Self::load_from_path(&path, &self.working_dir)? {
+                Some(existing) if existing.stable_id.as_deref() != Some(id.as_str()) => {
+                    return Err(WorkspaceError::IdentityMismatch {
+                        expected: id.clone(),
+                        found: existing.stable_id,
+                    });
+                }
+                Some(_) => {}
+                None if stable_id_claimed_by_other_in(workspaces_dir, id, &self.working_dir) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("workspace stable id {id:?} is already claimed by another root"),
+                    )
+                    .into());
+                }
+                None => {}
+            }
+            Some(lock)
+        } else {
+            None
+        };
+
         let content = serde_json::to_string_pretty(self)?;
         tracing::trace!("Workspace JSON size: {} bytes", content.len());
 
-        // Write atomically: temp file + rename
-        let temp_path = path.with_extension("json.tmp");
-
-        // Write to temp file
-        {
-            let mut file = std::fs::File::create(&temp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?; // Ensure data is on disk before rename
-        }
-
-        // Atomic rename
-        std::fs::rename(&temp_path, &path)?;
+        atomic_write_workspace_with(&path, content.as_bytes(), |_| Ok(()), sync_workspace_parent)?;
         tracing::info!("Workspace saved to {:?}", path);
 
-        // Migration completion: retire ONLY the legacy root-keyed file this
-        // window re-keyed away from. A rival `<root>.<otherid>.json` is NOT a
-        // duplicate now — workspaces may co-tenant one root (a tab extracted
-        // into its own window over the same project), each keyed by its own
-        // durable id — so a sibling id-file is a live peer, not stale, and must
-        // not be swept. The legacy id-less file has no such peer: it is the
-        // single pre-migration snapshot, superseded the moment any id-keyed
-        // file lands (write-new then delete-old, so a crash between leaves both
-        // and lookup arbitration picks the newest). Best-effort; `NotFound`
-        // (another co-tenant already retired it) is not an error.
         if self.stable_id.is_some() {
-            if let Ok(legacy) = get_workspace_path(&self.working_dir) {
-                if legacy != path && legacy.exists() {
-                    tracing::info!(
-                        "Retiring legacy workspace file {:?} (re-keyed to {:?})",
-                        legacy,
-                        path
-                    );
-                    if let Err(e) = std::fs::remove_file(&legacy) {
-                        if e.kind() != io::ErrorKind::NotFound {
-                            tracing::debug!("Could not retire legacy workspace file: {e}");
+            let legacy = get_workspace_path_in_dir(workspaces_dir, &self.working_dir);
+            if legacy != path && legacy.exists() {
+                tracing::info!(
+                    "Retiring legacy workspace file {:?} (re-keyed to {:?})",
+                    legacy,
+                    path
+                );
+                match std::fs::remove_file(&legacy) {
+                    Ok(()) => {
+                        if let Err(error) = sync_workspace_parent(&legacy) {
+                            tracing::debug!("Could not sync retired legacy workspace: {error}");
                         }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::debug!("Could not retire legacy workspace file: {error}");
                     }
                 }
             }
@@ -1277,24 +2506,43 @@ impl Workspace {
     /// single session that shares its root with others, use
     /// [`Self::delete_by_id`] instead so its peers survive.
     ///
-    /// Best-effort per file: a `NotFound` (another process — e.g. a
-    /// concurrent checkpoint retiring the legacy file — unlinked it between
-    /// our scan and our `remove_file`) is not an error, and any other
-    /// per-file failure is recorded but does not abort the loop. Aborting on
-    /// the first error was a resurrection bug: it could leave a snapshot
-    /// behind for the next boot to rediscover. The first hard error (if any)
-    /// is returned after every candidate has been attempted.
+    /// Inventory is strict: unreadable or malformed name-matching files abort
+    /// before the first unlink, so a lifecycle transaction never proceeds from
+    /// an incomplete view of what must be forgotten. Once admitted, every file
+    /// is attempted and the first hard error is returned after the sweep.
     pub fn delete(working_dir: &Path) -> Result<(), WorkspaceError> {
+        Self::delete_in_dir(&get_workspaces_dir()?, working_dir)
+    }
+
+    pub fn delete_in(
+        dir_context: &crate::config_io::DirectoryContext,
+        working_dir: &Path,
+    ) -> Result<(), WorkspaceError> {
+        Self::delete_in_dir(&dir_context.workspaces_dir(), working_dir)
+    }
+
+    fn delete_in_dir(workspaces_dir: &Path, working_dir: &Path) -> Result<(), WorkspaceError> {
+        let _root_lock = workspace_root_lock_in(workspaces_dir, working_dir, true)?;
+        let admitted = inspect_workspace_persistence_in_dir(workspaces_dir, working_dir)?;
         let mut first_err: Option<io::Error> = None;
-        for ident in candidate_files_for_root(working_dir)? {
-            if let Err(e) = std::fs::remove_file(&ident.path) {
-                if e.kind() == io::ErrorKind::NotFound {
-                    continue;
+        let mut removed = false;
+        for file in admitted {
+            let path = PathBuf::from(file.path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to delete workspace file {:?}: {e}", path);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
                 }
-                tracing::warn!("Failed to delete workspace file {:?}: {e}", ident.path);
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+            }
+        }
+        if removed {
+            let path = get_workspace_path_in_dir(workspaces_dir, working_dir);
+            if let Err(error) = sync_workspace_parent(&path) {
+                first_err.get_or_insert(error);
             }
         }
         match first_err {
@@ -1305,15 +2553,41 @@ impl Workspace {
 
     /// Delete a single workspace identity's file
     /// (`workspaces/<encoded-root>.<stable_id>.json`), leaving any co-tenant
-    /// workspaces on the same root untouched. Used when one session is closed
-    /// or killed. Best-effort: `NotFound` is success (already gone).
+    /// workspaces on the same root untouched. The content identity is validated
+    /// before unlinking, so a corrupt or misnamed file is preserved for explicit
+    /// recovery rather than deleted under the caller's requested identity.
+    /// `NotFound` is success (already gone).
     pub fn delete_by_id(working_dir: &Path, stable_id: &str) -> Result<(), WorkspaceError> {
-        let path = workspace_path_for(working_dir, stable_id)?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        Self::delete_by_id_in_dir(&get_workspaces_dir()?, working_dir, stable_id)
+    }
+
+    pub fn delete_by_id_in(
+        dir_context: &crate::config_io::DirectoryContext,
+        working_dir: &Path,
+        stable_id: &str,
+    ) -> Result<(), WorkspaceError> {
+        Self::delete_by_id_in_dir(&dir_context.workspaces_dir(), working_dir, stable_id)
+    }
+
+    fn delete_by_id_in_dir(
+        workspaces_dir: &Path,
+        working_dir: &Path,
+        stable_id: &str,
+    ) -> Result<(), WorkspaceError> {
+        let _root_lock = workspace_root_lock_in(workspaces_dir, working_dir, true)?;
+        let path = workspace_path_for_in_dir(workspaces_dir, working_dir, stable_id);
+        let Some(workspace) = Self::load_from_path(&path, working_dir)? else {
+            return Ok(());
+        };
+        if workspace.stable_id.as_deref() != Some(stable_id) {
+            return Err(WorkspaceError::IdentityMismatch {
+                expected: stable_id.to_string(),
+                found: workspace.stable_id,
+            });
         }
+        std::fs::remove_file(&path)?;
+        sync_workspace_parent(&path)?;
+        Ok(())
     }
 
     /// Create a new workspace with current timestamp
@@ -1336,6 +2610,7 @@ impl Workspace {
             search_options: SearchOptions::default(),
             bookmarks: HashMap::new(),
             terminals: Vec::new(),
+            tracked_agent_terminal: None,
             external_files: Vec::new(),
             read_only_files: Vec::new(),
             unnamed_buffers: Vec::new(),
@@ -1388,6 +2663,341 @@ mod tests {
         let filename = path1.file_name().unwrap().to_str().unwrap();
         assert!(filename.ends_with(".json"));
         assert!(filename.starts_with("home_user_project"));
+    }
+
+    #[test]
+    fn stable_id_generation_retries_a_reserved_candidate() {
+        let first = format!("test-ws-{}", uuid::Uuid::new_v4().simple());
+        let second = format!("test-ws-{}", uuid::Uuid::new_v4().simple());
+        assert_eq!(generate_stable_id_with(|| first.clone()), first);
+
+        let mut attempts = 0;
+        let generated = generate_stable_id_with(|| {
+            attempts += 1;
+            if attempts == 1 {
+                first.clone()
+            } else {
+                second.clone()
+            }
+        });
+
+        assert_eq!(generated, second);
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn terminal_artifacts_are_namespaced_by_stable_id() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let root = temp.path().join("shared-root");
+
+        let first = terminal_artifacts_dir(&dir_context, &root, "ws-a");
+        let second = terminal_artifacts_dir(&dir_context, &root, "ws-b");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
+        assert_eq!(first.file_name().unwrap(), "ws-a");
+        assert_eq!(second.file_name().unwrap(), "ws-b");
+    }
+
+    #[test]
+    fn deleting_one_terminal_artifact_namespace_preserves_its_sibling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let root = temp.path().join("shared-root");
+        let first = terminal_artifacts_dir(&dir_context, &root, "ws-a");
+        let second = terminal_artifacts_dir(&dir_context, &root, "ws-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("terminal.txt"), b"first").unwrap();
+        std::fs::write(second.join("terminal.txt"), b"second").unwrap();
+
+        delete_terminal_artifacts_by_id(&dir_context, &root, "ws-a").unwrap();
+
+        assert!(!first.exists());
+        assert_eq!(
+            std::fs::read(second.join("terminal.txt")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn artifact_quarantine_retargets_after_owned_root_move() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let root = temp.path().join("project");
+        let archived_root = temp.path().join("project-archived");
+        std::fs::create_dir_all(&root).unwrap();
+        let stable_id = "ws-retarget";
+        let sibling_id = "ws-sibling";
+        let artifacts = terminal_artifacts_dir(&dir_context, &root, stable_id);
+        let sibling = terminal_artifacts_dir(&dir_context, &root, sibling_id);
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(artifacts.join("terminal.txt"), b"retargeted").unwrap();
+        std::fs::write(sibling.join("terminal.txt"), b"sibling").unwrap();
+        let owner = format!("test-{}", uuid::Uuid::new_v4().simple());
+
+        acquire_workspace_root_ownership(&dir_context, &root, &owner).unwrap();
+        quarantine_workspace_artifacts(&dir_context, &root, Some(stable_id), &owner).unwrap();
+        std::fs::rename(&root, &archived_root).unwrap();
+        restore_workspace_artifacts(&dir_context, &archived_root, Some(stable_id), &owner).unwrap();
+        // Crash replay may restart the lifecycle from quarantine; the retained
+        // completion receipt makes both calls exact no-ops.
+        quarantine_workspace_artifacts(&dir_context, &root, Some(stable_id), &owner).unwrap();
+        restore_workspace_artifacts(&dir_context, &archived_root, Some(stable_id), &owner).unwrap();
+        release_workspace_root_ownership(&owner).unwrap();
+
+        assert_eq!(
+            std::fs::read(
+                terminal_artifacts_dir(&dir_context, &archived_root, stable_id)
+                    .join("terminal.txt")
+            )
+            .unwrap(),
+            b"retargeted"
+        );
+        assert_eq!(
+            std::fs::read(sibling.join("terminal.txt")).unwrap(),
+            b"sibling"
+        );
+    }
+
+    #[test]
+    fn completed_artifact_restore_replays_a_surviving_payload() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let source_root = temp.path().join("source");
+        let target_root = temp.path().join("target");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&target_root).unwrap();
+        let stable_id = "ws-replay";
+        let source = terminal_artifacts_dir(&dir_context, &source_root, stable_id);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("terminal.txt"), b"recoverable").unwrap();
+        let owner = format!("test-{}", uuid::Uuid::new_v4().simple());
+
+        acquire_workspace_root_ownership(&dir_context, &source_root, &owner).unwrap();
+        quarantine_workspace_artifacts(&dir_context, &source_root, Some(stable_id), &owner)
+            .unwrap();
+        restore_workspace_artifacts(&dir_context, &target_root, Some(stable_id), &owner).unwrap();
+
+        let stage = workspace_artifact_quarantine_dir(&dir_context, &owner);
+        let payload = stage.join("artifacts");
+        let destination = terminal_artifacts_dir(&dir_context, &target_root, stable_id);
+        durable_rename(&destination, &payload).unwrap();
+        assert!(!destination.exists());
+        assert!(payload.exists());
+
+        restore_workspace_artifacts(&dir_context, &target_root, Some(stable_id), &owner).unwrap();
+        release_workspace_root_ownership(&owner).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("terminal.txt")).unwrap(),
+            b"recoverable"
+        );
+        assert!(!payload.exists());
+    }
+
+    #[test]
+    fn root_ownership_rejects_a_second_lifecycle() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let root = temp.path().join("shared-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = format!("first-{}", uuid::Uuid::new_v4().simple());
+        let second = format!("second-{}", uuid::Uuid::new_v4().simple());
+
+        acquire_workspace_root_ownership(&dir_context, &root, &first).unwrap();
+        let error = acquire_workspace_root_ownership(&dir_context, &root, &second).unwrap_err();
+        release_workspace_root_ownership(&first).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn quarantine_purge_rejects_rebound_owner_id() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let original_root = temp.path().join("original");
+        let unrelated_root = temp.path().join("unrelated");
+        std::fs::create_dir_all(&original_root).unwrap();
+        std::fs::create_dir_all(&unrelated_root).unwrap();
+        let owner = format!("owner-{}", uuid::Uuid::new_v4().simple());
+
+        acquire_workspace_root_ownership(&dir_context, &original_root, &owner).unwrap();
+        quarantine_workspace_artifacts(&dir_context, &original_root, Some("ws-a"), &owner).unwrap();
+        release_workspace_root_ownership(&owner).unwrap();
+        acquire_workspace_root_ownership(&dir_context, &unrelated_root, &owner).unwrap();
+        let error = purge_workspace_artifact_quarantine(&dir_context, &owner).unwrap_err();
+        release_workspace_root_ownership(&owner).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn prepared_extraction_keeps_its_journal_until_ambiguous_moves_are_reversible() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let source_root = temp.path().join("source-root");
+        let target_root = temp.path().join("target-root");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&target_root).unwrap();
+        let source_id = format!("source-{}", uuid::Uuid::new_v4().simple());
+        let target_id = format!("target-{}", uuid::Uuid::new_v4().simple());
+        let source = terminal_artifacts_dir(&dir_context, &source_root, &source_id)
+            .join("terminal.history.txt");
+        let destination = terminal_artifacts_dir(&dir_context, &target_root, &target_id)
+            .join("terminal.history.txt");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"source-copy").unwrap();
+        std::fs::write(&destination, b"moved-copy").unwrap();
+
+        let mut source_before = Workspace::new(source_root.clone());
+        source_before.stable_id = Some(source_id.clone());
+        let intent = TerminalExtractionIntent::prepared(
+            source_before,
+            target_root.clone(),
+            target_id,
+            vec![TerminalArtifactRelocation {
+                source: source.clone(),
+                destination: destination.clone(),
+                after_source_cutover: false,
+            }],
+        );
+        let journal = persist_terminal_extraction_intent(&dir_context, &intent).unwrap();
+
+        let error = recover_terminal_extractions(&dir_context).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(journal.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source-copy");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"moved-copy");
+
+        std::fs::remove_file(&source).unwrap();
+        recover_terminal_extractions(&dir_context).unwrap();
+        assert!(!journal.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"moved-copy");
+        assert!(!destination.exists());
+        assert!(
+            Workspace::load_by_id_in(&dir_context, &source_root, &source_id)
+                .unwrap()
+                .is_some()
+        );
+
+        Workspace::delete(&source_root).unwrap();
+    }
+
+    #[test]
+    fn prepared_recovery_reverses_a_crash_after_source_cutover() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_context = crate::config_io::DirectoryContext::for_testing(temp.path());
+        let source_root = temp.path().join("source-root");
+        let target_root = temp.path().join("target-root");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&target_root).unwrap();
+        let source_id = format!("source-{}", uuid::Uuid::new_v4().simple());
+        let target_id = format!("target-{}", uuid::Uuid::new_v4().simple());
+        let source_dir = terminal_artifacts_dir(&dir_context, &source_root, &source_id);
+        let target_dir = terminal_artifacts_dir(&dir_context, &target_root, &target_id);
+        let moved_source = source_dir.join("terminal.txt");
+        let moved_destination = target_dir.join("terminal.txt");
+        let deferred_source = source_dir.join("terminal.history.txt");
+        let deferred_destination = target_dir.join("terminal.history.txt");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(&moved_destination, b"moved-before-cutover").unwrap();
+        std::fs::write(&deferred_source, b"source-authoritative").unwrap();
+
+        let mut source_before = Workspace::new(source_root.clone());
+        source_before.stable_id = Some(source_id.clone());
+        source_before.label = Some("before".to_string());
+        let mut source_after = source_before.clone();
+        source_after.label = Some("after".to_string());
+        source_after.save_in(&dir_context).unwrap();
+        let intent = TerminalExtractionIntent::prepared(
+            source_before,
+            target_root,
+            target_id,
+            vec![
+                TerminalArtifactRelocation {
+                    source: moved_source.clone(),
+                    destination: moved_destination.clone(),
+                    after_source_cutover: false,
+                },
+                TerminalArtifactRelocation {
+                    source: deferred_source.clone(),
+                    destination: deferred_destination.clone(),
+                    after_source_cutover: true,
+                },
+            ],
+        );
+        persist_terminal_extraction_intent(&dir_context, &intent).unwrap();
+
+        recover_terminal_extractions(&dir_context).unwrap();
+
+        assert_eq!(
+            std::fs::read(&moved_source).unwrap(),
+            b"moved-before-cutover"
+        );
+        assert!(!moved_destination.exists());
+        assert_eq!(
+            std::fs::read(&deferred_source).unwrap(),
+            b"source-authoritative"
+        );
+        assert!(!deferred_destination.exists());
+        assert_eq!(
+            Workspace::load_by_id_in(&dir_context, &source_root, &source_id)
+                .unwrap()
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("before")
+        );
+    }
+    #[test]
+    fn committed_extraction_preserves_both_locations_when_forward_state_is_ambiguous() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        std::fs::write(&source, b"new-source").unwrap();
+        std::fs::write(&destination, b"committed-destination").unwrap();
+        let relocation = TerminalArtifactRelocation {
+            source: source.clone(),
+            destination: destination.clone(),
+            after_source_cutover: false,
+        };
+
+        let error = finish_relocated_artifact(&relocation).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-source");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"committed-destination"
+        );
+
+        std::fs::remove_file(&destination).unwrap();
+        finish_relocated_artifact(&relocation).unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"new-source");
+    }
+
+    #[test]
+    fn delete_by_id_keeps_co_tenant_siblings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("shared-root");
+        std::fs::create_dir(&root).unwrap();
+        let mut first = Workspace::new(root.clone());
+        first.stable_id = Some("ws-delete-a".into());
+        let mut second = Workspace::new(root.clone());
+        second.stable_id = Some("ws-delete-b".into());
+        first.save().unwrap();
+        second.save().unwrap();
+
+        Workspace::delete_by_id(&root, "ws-delete-a").unwrap();
+
+        assert!(!workspace_path_for(&root, "ws-delete-a").unwrap().exists());
+        assert!(workspace_path_for(&root, "ws-delete-b").unwrap().exists());
+        Workspace::delete(&root).unwrap();
     }
 
     #[test]
@@ -1797,7 +3407,7 @@ mod tests {
             "rows":24,
             "log_path":"terminal.log",
             "backing_path":"terminal.txt",
-            "command":["omp","hello"],
+            "command":["omp","launch"],
             "agent_resume":{"argv":["omp","--resume","00000000-0000-0000-0000-000000000000"]}
         }"#;
         let legacy_terminal: SerializedTerminalWorkspace =
@@ -1811,5 +3421,88 @@ mod tests {
         assert!(!json.contains("secret"));
         assert!(!json.contains("token"));
         assert!(!json.contains("snapshot"));
+    }
+
+    #[test]
+    fn concurrent_workspace_publishers_use_unique_temps_and_sync_parent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("workspace.json");
+        let barrier = Arc::new(Barrier::new(3));
+        let (temp_tx, temp_rx) = mpsc::channel();
+        let parent_syncs = Arc::new(AtomicUsize::new(0));
+
+        let spawn = |content: &'static [u8]| {
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            let temp_tx = temp_tx.clone();
+            let parent_syncs = Arc::clone(&parent_syncs);
+            std::thread::spawn(move || {
+                atomic_write_workspace_with(
+                    &target,
+                    content,
+                    |temp| {
+                        temp_tx.send(temp.to_path_buf()).unwrap();
+                        barrier.wait();
+                        Ok(())
+                    },
+                    |published| {
+                        parent_syncs.fetch_add(1, Ordering::SeqCst);
+                        sync_workspace_parent(published)
+                    },
+                )
+            })
+        };
+
+        let first = spawn(br#"{"writer":"first"}"#);
+        let second = spawn(br#"{"writer":"second"}"#);
+        barrier.wait();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let temps = [temp_rx.recv().unwrap(), temp_rx.recv().unwrap()];
+        assert_eq!(temps.len(), 2);
+        assert_ne!(
+            temps[0], temps[1],
+            "publishers must never share a temp alias"
+        );
+        assert!(temps.iter().all(|temp| !temp.exists()));
+        assert_eq!(parent_syncs.load(Ordering::SeqCst), 2);
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert!(
+            final_bytes == br#"{"writer":"first"}"# || final_bytes == br#"{"writer":"second"}"#,
+            "the final must be one complete publication, got {final_bytes:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_publication_fault_keeps_previous_final_and_cleans_own_temp() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("workspace.json");
+        std::fs::write(&target, b"previous").unwrap();
+        let (attempted_temp_tx, attempted_temp_rx) = mpsc::channel();
+
+        let error = atomic_write_workspace_with(
+            &target,
+            b"replacement",
+            move |temp| {
+                attempted_temp_tx.send(temp.to_path_buf()).unwrap();
+                Err(io::Error::other("injected failure before publication"))
+            },
+            |_| panic!("parent sync must not run before a successful rename"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous");
+        let temp = attempted_temp_rx.recv().unwrap();
+        assert!(
+            !temp.exists(),
+            "a failed publisher cleans only its own temp"
+        );
     }
 }

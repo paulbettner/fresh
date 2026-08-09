@@ -12,8 +12,9 @@ use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{TransformOptions, Transformer};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Transpile TypeScript source code to JavaScript
 pub fn transpile_typescript(source: &str, filename: &str) -> Result<String> {
@@ -326,82 +327,165 @@ struct ReexportBinding {
     source_path: String,
 }
 
-/// Bundle a module and all its local imports into a single file with proper scoping
-/// Each module is wrapped in an IIFE that only exposes its exports
-pub fn bundle_module(entry_path: &Path) -> Result<String> {
-    let mut modules: Vec<ModuleMetadata> = Vec::new();
-    let mut visited = HashSet::new();
-    let mut path_to_var: std::collections::HashMap<PathBuf, String> =
-        std::collections::HashMap::new();
+trait ModuleSource {
+    fn key(&self, path: &Path) -> Result<PathBuf>;
+    fn read_to_string(&self, path: &Path) -> Result<String>;
+    fn resolve_import(&self, import_path: &str, parent_dir: &Path) -> Result<PathBuf>;
+}
 
-    // First pass: collect all modules in dependency order
-    collect_modules(entry_path, &mut visited, &mut modules, &mut path_to_var)?;
+struct DiskModules;
 
-    // Second pass: generate scoped output
-    let mut output = String::new();
-
-    for (i, module) in modules.iter().enumerate() {
-        let is_entry = i == modules.len() - 1;
-        output.push_str(&generate_scoped_module(module, &path_to_var, is_entry)?);
-        output.push('\n');
+impl ModuleSource for DiskModules {
+    fn key(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
     }
 
+    fn read_to_string(&self, path: &Path) -> Result<String> {
+        std::fs::read_to_string(path)
+            .map_err(|error| anyhow!("Failed to read {}: {error}", path.display()))
+    }
+
+    fn resolve_import(&self, import_path: &str, parent_dir: &Path) -> Result<PathBuf> {
+        resolve_import(import_path, parent_dir)
+    }
+}
+
+struct EmbeddedModules<'a> {
+    files: &'a HashMap<PathBuf, Arc<[u8]>>,
+}
+
+impl EmbeddedModules<'_> {
+    fn normalized(path: &Path) -> Result<PathBuf> {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(component) => normalized.push(component),
+                Component::ParentDir if normalized.pop() => {}
+                _ => return Err(anyhow!("module path escapes the embedded root")),
+            }
+        }
+        Ok(normalized)
+    }
+}
+
+impl ModuleSource for EmbeddedModules<'_> {
+    fn key(&self, path: &Path) -> Result<PathBuf> {
+        let path = Self::normalized(path)?;
+        self.files
+            .contains_key(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| anyhow!("Embedded module is absent: {}", path.display()))
+    }
+
+    fn read_to_string(&self, path: &Path) -> Result<String> {
+        let path = self.key(path)?;
+        let bytes = self.files.get(&path).expect("key verified above");
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|error| anyhow!("Embedded module {} is not UTF-8: {error}", path.display()))
+    }
+
+    fn resolve_import(&self, import_path: &str, parent_dir: &Path) -> Result<PathBuf> {
+        let base = Self::normalized(&parent_dir.join(import_path))?;
+        for candidate in [
+            base.clone(),
+            base.with_extension("ts"),
+            base.with_extension("js"),
+            base.join("index.ts"),
+            base.join("index.js"),
+        ] {
+            if self.files.contains_key(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        Err(anyhow!(
+            "Cannot resolve embedded import '{}' from {}",
+            import_path,
+            parent_dir.display()
+        ))
+    }
+}
+
+/// Bundle a module and all its local imports into one scoped script.
+pub fn bundle_module(entry_path: &Path) -> Result<String> {
+    bundle_module_with(entry_path, &DiskModules)
+}
+
+/// Bundle from a host-attested immutable source map instead of rereading disk.
+pub fn bundle_module_from_sources(
+    entry_path: &Path,
+    files: &HashMap<PathBuf, Arc<[u8]>>,
+) -> Result<String> {
+    bundle_module_with(entry_path, &EmbeddedModules { files })
+}
+
+fn bundle_module_with(entry_path: &Path, source: &impl ModuleSource) -> Result<String> {
+    let mut modules = Vec::new();
+    let mut visited = HashSet::new();
+    let mut path_to_var = HashMap::new();
+    collect_modules(
+        entry_path,
+        source,
+        &mut visited,
+        &mut modules,
+        &mut path_to_var,
+    )?;
+
+    let mut output = String::new();
+    for (index, module) in modules.iter().enumerate() {
+        output.push_str(&generate_scoped_module(
+            module,
+            source,
+            &path_to_var,
+            index == modules.len() - 1,
+        )?);
+        output.push('\n');
+    }
     Ok(output)
 }
 
-/// Collect all modules in dependency order (dependencies first)
+/// Collect all modules in dependency order (dependencies first).
 fn collect_modules(
     path: &Path,
+    source: &impl ModuleSource,
     visited: &mut HashSet<PathBuf>,
     modules: &mut Vec<ModuleMetadata>,
-    path_to_var: &mut std::collections::HashMap<PathBuf, String>,
+    path_to_var: &mut HashMap<PathBuf, String>,
 ) -> Result<()> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if visited.contains(&canonical) {
-        return Ok(()); // Already processed (circular import protection)
-    }
-    visited.insert(canonical.clone());
-
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
-
-    // Extract module metadata using AST
-    let (imports, exports, reexports) = extract_module_bindings(&source);
-
-    let parent_dir = path.parent().unwrap_or(Path::new("."));
-
-    // Collect dependencies first (topological order)
-    for import in &imports {
-        if import.source_path.starts_with("./") || import.source_path.starts_with("../") {
-            let resolved = resolve_import(&import.source_path, parent_dir)?;
-            collect_modules(&resolved, visited, modules, path_to_var)?;
-        }
-    }
-    for reexport in &reexports {
-        if reexport.source_path.starts_with("./") || reexport.source_path.starts_with("../") {
-            let resolved = resolve_import(&reexport.source_path, parent_dir)?;
-            collect_modules(&resolved, visited, modules, path_to_var)?;
-        }
+    let key = source.key(path)?;
+    if !visited.insert(key.clone()) {
+        return Ok(());
     }
 
-    // Generate variable name for this module
-    let var_name = path_to_module_var(path);
-    path_to_var.insert(canonical.clone(), var_name.clone());
+    let module_source = source.read_to_string(&key)?;
+    let (imports, exports, reexports) = extract_module_bindings(&module_source);
+    let parent_dir = key.parent().unwrap_or(Path::new("."));
 
-    // Strip imports/exports and transpile
-    let stripped = strip_imports_and_exports(&source);
-    let filename = path.to_str().unwrap_or("unknown.ts");
-    let transpiled = transpile_typescript(&stripped, filename)?;
+    for dependency in imports
+        .iter()
+        .map(|binding| binding.source_path.as_str())
+        .chain(reexports.iter().map(|binding| binding.source_path.as_str()))
+        .filter(|path| path.starts_with("./") || path.starts_with("../"))
+    {
+        let resolved = source.resolve_import(dependency, parent_dir)?;
+        collect_modules(&resolved, source, visited, modules, path_to_var)?;
+    }
+
+    let var_name = path_to_module_var(&key);
+    path_to_var.insert(key.clone(), var_name.clone());
+    let stripped = strip_imports_and_exports(&module_source);
+    let filename = key.to_str().unwrap_or("unknown.ts");
+    let code = transpile_typescript(&stripped, filename)?;
 
     modules.push(ModuleMetadata {
-        path: canonical,
+        path: key,
         var_name,
         imports,
         exports,
         reexports,
-        code: transpiled,
+        code,
     });
-
     Ok(())
 }
 
@@ -430,7 +514,8 @@ fn path_to_module_var(path: &Path) -> String {
 /// Generate scoped module code wrapped in IIFE
 fn generate_scoped_module(
     module: &ModuleMetadata,
-    path_to_var: &std::collections::HashMap<PathBuf, String>,
+    source: &impl ModuleSource,
+    path_to_var: &HashMap<PathBuf, String>,
     is_entry: bool,
 ) -> Result<String> {
     let mut code = String::new();
@@ -444,7 +529,8 @@ fn generate_scoped_module(
 
     // Generate import destructuring from dependencies
     for import in &module.imports {
-        if let Some(dep_var) = resolve_import_to_var(&import.source_path, &module.path, path_to_var)
+        if let Some(dep_var) =
+            resolve_import_to_var(&import.source_path, &module.path, source, path_to_var)
         {
             if import.is_namespace {
                 // import * as X from "./y"
@@ -496,7 +582,7 @@ fn generate_scoped_module(
         // Re-exports
         for reexport in &module.reexports {
             if let Some(dep_var) =
-                resolve_import_to_var(&reexport.source_path, &module.path, path_to_var)
+                resolve_import_to_var(&reexport.source_path, &module.path, source, path_to_var)
             {
                 match (&reexport.exported_name, &reexport.source_name) {
                     (Some(exported), Some(source)) => {
@@ -528,21 +614,19 @@ fn generate_scoped_module(
 
 /// Resolve an import source path to the dependency's variable name
 fn resolve_import_to_var(
-    source_path: &str,
+    import_path: &str,
     importer_path: &Path,
-    path_to_var: &std::collections::HashMap<PathBuf, String>,
+    source: &impl ModuleSource,
+    path_to_var: &HashMap<PathBuf, String>,
 ) -> Option<String> {
-    if !source_path.starts_with("./") && !source_path.starts_with("../") {
-        return None; // External import, not bundled
+    if !import_path.starts_with("./") && !import_path.starts_with("../") {
+        return None;
     }
 
     let parent_dir = importer_path.parent().unwrap_or(Path::new("."));
-    if let Ok(resolved) = resolve_import(source_path, parent_dir) {
-        let canonical = resolved.canonicalize().unwrap_or(resolved);
-        path_to_var.get(&canonical).cloned()
-    } else {
-        None
-    }
+    let resolved = source.resolve_import(import_path, parent_dir).ok()?;
+    let key = source.key(&resolved).ok()?;
+    path_to_var.get(&key).cloned()
 }
 
 /// Extract import/export bindings from source using AST
@@ -1187,5 +1271,25 @@ import { helper } from "./lib/utils";
         let alpha_pos = result.iter().position(|s| s == "alpha").unwrap();
         let gamma_pos = result.iter().position(|s| s == "gamma").unwrap();
         assert!(alpha_pos < gamma_pos);
+    }
+    #[test]
+    fn bundles_from_attested_sources_without_disk() {
+        let files = HashMap::from([
+            (
+                PathBuf::from("entry.ts"),
+                Arc::<[u8]>::from(
+                    &b"import { value } from './dep'; globalThis.answer = value;"[..],
+                ),
+            ),
+            (
+                PathBuf::from("dep.ts"),
+                Arc::<[u8]>::from(&b"export const value: number = 42;"[..]),
+            ),
+        ]);
+
+        let bundled = bundle_module_from_sources(Path::new("entry.ts"), &files).unwrap();
+        assert!(bundled.contains("const value = 42"));
+        assert!(bundled.contains("globalThis.answer = value"));
+        assert!(!bundled.contains("from './dep'"));
     }
 }

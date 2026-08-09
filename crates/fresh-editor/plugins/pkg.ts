@@ -66,7 +66,11 @@ const fsLocal = {
 const CONFIG_DIR = editor.getConfigDir();
 const PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "plugins", "packages");
 const THEMES_PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "themes", "packages");
-const LANGUAGES_PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "languages", "packages");
+const LANGUAGES_PACKAGES_DIR = editor.pathJoin(
+  CONFIG_DIR,
+  "languages",
+  "packages",
+);
 const BUNDLES_PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "bundles", "packages");
 const INDEX_DIR = editor.pathJoin(PACKAGES_DIR, ".index");
 const CACHE_DIR = editor.pathJoin(PACKAGES_DIR, ".cache");
@@ -148,6 +152,8 @@ interface PackageManifest {
     min_version?: string;
     min_api_version?: number;
     entry?: string;
+    /** Legacy alias retained for older package manifests. */
+    main?: string;
     themes?: Array<{
       file: string;
       name: string;
@@ -285,14 +291,18 @@ function hashString(str: string): string {
  * Run a git command without prompting for credentials.
  * Uses git config options to prevent interactive prompts (cross-platform).
  */
-async function gitCommand(args: string[]): Promise<{ exit_code: number; stdout: string; stderr: string }> {
+async function gitCommand(
+  args: string[],
+): Promise<{ exit_code: number; stdout: string; stderr: string }> {
   // Use git config options to disable credential prompts (works on Windows and Unix)
   // -c credential.helper= disables credential helper
   // -c core.askPass= disables askpass program
   const gitArgs = [
-    "-c", "credential.helper=",
-    "-c", "core.askPass=",
-    ...args
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.askPass=",
+    ...args,
   ];
   const result = await editor.spawnProcess("git", gitArgs);
   return result;
@@ -464,22 +474,36 @@ async function syncRegistry(): Promise<void> {
     if (fsLocal.fileExists(indexPath)) {
       // Update existing
       editor.setStatus(`Updating registry: ${source}...`);
-      const result = await gitCommand(["-C", `${indexPath}`, "pull", "--ff-only"]);
+      const result = await gitCommand([
+        "-C",
+        `${indexPath}`,
+        "pull",
+        "--ff-only",
+      ]);
       if (result.exit_code === 0) {
         synced++;
       } else {
         const errorMsg = result.stderr.includes("Could not resolve host")
           ? "Network error"
-          : result.stderr.includes("Authentication") || result.stderr.includes("403")
+          : result.stderr.includes("Authentication") ||
+              result.stderr.includes("403")
           ? "Authentication failed (check if repo is public)"
           : result.stderr.split("\n")[0] || "Unknown error";
         errors.push(`${source}: ${errorMsg}`);
-        editor.warn(`[pkg] Failed to update registry ${source}: ${result.stderr}`);
+        editor.warn(
+          `[pkg] Failed to update registry ${source}: ${result.stderr}`,
+        );
       }
     } else {
       // Clone new
       editor.setStatus(`Cloning registry: ${source}...`);
-      const result = await gitCommand(["clone", "--depth", "1", `${source}`, `${indexPath}`]);
+      const result = await gitCommand([
+        "clone",
+        "--depth",
+        "1",
+        `${source}`,
+        `${indexPath}`,
+      ]);
       if (result.exit_code === 0) {
         synced++;
       } else {
@@ -487,11 +511,14 @@ async function syncRegistry(): Promise<void> {
           ? "Network error"
           : result.stderr.includes("not found") || result.stderr.includes("404")
           ? "Repository not found"
-          : result.stderr.includes("Authentication") || result.stderr.includes("403")
+          : result.stderr.includes("Authentication") ||
+              result.stderr.includes("403")
           ? "Authentication failed (check if repo is public)"
           : result.stderr.split("\n")[0] || "Unknown error";
         errors.push(`${source}: ${errorMsg}`);
-        editor.warn(`[pkg] Failed to clone registry ${source}: ${result.stderr}`);
+        editor.warn(
+          `[pkg] Failed to clone registry ${source}: ${result.stderr}`,
+        );
       }
     }
   }
@@ -502,7 +529,11 @@ async function syncRegistry(): Promise<void> {
   }
 
   if (errors.length > 0) {
-    editor.setStatus(`Registry: ${synced}/${sources.length} synced. Errors: ${errors.join("; ")}`);
+    editor.setStatus(
+      `Registry: ${synced}/${sources.length} synced. Errors: ${
+        errors.join("; ")
+      }`,
+    );
   } else {
     editor.setStatus(`Registry synced (${synced}/${sources.length} sources)`);
   }
@@ -518,31 +549,44 @@ function loadRegistry(type: "plugins" | "themes" | "languages"): RegistryData {
   const merged: RegistryData = {
     schema_version: 1,
     updated: new Date().toISOString(),
-    packages: {}
+    packages: {},
   };
 
   for (const source of sources) {
     // Try git index first
-    const indexPath = editor.pathJoin(INDEX_DIR, hashString(source), `${type}.json`);
+    const indexPath = editor.pathJoin(
+      INDEX_DIR,
+      hashString(source),
+      `${type}.json`,
+    );
     editor.debug(`[pkg] checking index path: ${indexPath}`);
     let data = readJsonFile<RegistryData>(indexPath);
 
     // Fall back to cache if index not available
     if (!data?.packages) {
-      const cachePath = editor.pathJoin(CACHE_DIR, `${hashString(source)}_${type}.json`);
+      const cachePath = editor.pathJoin(
+        CACHE_DIR,
+        `${hashString(source)}_${type}.json`,
+      );
       data = readJsonFile<RegistryData>(cachePath);
       if (data?.packages) {
         editor.debug(`[pkg] using cached data for ${type}`);
       }
     }
 
-    editor.debug(`[pkg] data loaded: ${data ? 'yes' : 'no'}, packages: ${data?.packages ? Object.keys(data.packages).length : 0}`);
+    editor.debug(
+      `[pkg] data loaded: ${data ? "yes" : "no"}, packages: ${
+        data?.packages ? Object.keys(data.packages).length : 0
+      }`,
+    );
     if (data?.packages) {
       Object.assign(merged.packages, data.packages);
     }
   }
 
-  editor.debug(`[pkg] total merged packages: ${Object.keys(merged.packages).length}`);
+  editor.debug(
+    `[pkg] total merged packages: ${Object.keys(merged.packages).length}`,
+  );
   return merged;
 }
 
@@ -557,7 +601,10 @@ async function cacheRegistry(): Promise<void> {
     const sourceHash = hashString(source);
     for (const type of ["plugins", "themes", "languages"] as const) {
       const indexPath = editor.pathJoin(INDEX_DIR, sourceHash, `${type}.json`);
-      const cachePath = editor.pathJoin(CACHE_DIR, `${sourceHash}_${type}.json`);
+      const cachePath = editor.pathJoin(
+        CACHE_DIR,
+        `${sourceHash}_${type}.json`,
+      );
 
       const data = readJsonFile<RegistryData>(indexPath);
       if (data?.packages && Object.keys(data.packages).length > 0) {
@@ -579,7 +626,10 @@ function isRegistrySynced(): boolean {
       return true;
     }
     // Check cache
-    const cachePath = editor.pathJoin(CACHE_DIR, `${hashString(source)}_plugins.json`);
+    const cachePath = editor.pathJoin(
+      CACHE_DIR,
+      `${hashString(source)}_plugins.json`,
+    );
     if (fsLocal.fileExists(cachePath)) {
       return true;
     }
@@ -594,11 +644,16 @@ function isRegistrySynced(): boolean {
 /**
  * Get list of installed packages
  */
-function getInstalledPackages(type: "plugin" | "theme" | "language" | "bundle"): InstalledPackage[] {
-  const packagesDir = type === "plugin" ? PACKAGES_DIR
-                    : type === "theme" ? THEMES_PACKAGES_DIR
-                    : type === "bundle" ? BUNDLES_PACKAGES_DIR
-                    : LANGUAGES_PACKAGES_DIR;
+function getInstalledPackages(
+  type: "plugin" | "theme" | "language" | "bundle",
+): InstalledPackage[] {
+  const packagesDir = type === "plugin"
+    ? PACKAGES_DIR
+    : type === "theme"
+    ? THEMES_PACKAGES_DIR
+    : type === "bundle"
+    ? BUNDLES_PACKAGES_DIR
+    : LANGUAGES_PACKAGES_DIR;
   const packages: InstalledPackage[] = [];
 
   if (!fsLocal.fileExists(packagesDir)) {
@@ -629,8 +684,13 @@ function getInstalledPackages(type: "plugin" | "theme" | "language" | "bundle"):
 
         // Check for .fresh-source.json (local path or monorepo installs)
         if (!source) {
-          const freshSourcePath = editor.pathJoin(pkgPath, ".fresh-source.json");
-          const freshSource = readJsonFile<{ local_path?: string; original_url?: string }>(freshSourcePath);
+          const freshSourcePath = editor.pathJoin(
+            pkgPath,
+            ".fresh-source.json",
+          );
+          const freshSource = readJsonFile<
+            { local_path?: string; original_url?: string }
+          >(freshSourcePath);
           if (freshSource?.local_path) {
             localSource = freshSource.local_path;
             source = freshSource.original_url || freshSource.local_path;
@@ -673,14 +733,17 @@ interface ValidationResult {
  * 2. package.json has required fields (name, type)
  * 3. Entry file exists (for plugins)
  */
-function validatePackage(packageDir: string, packageName: string): ValidationResult {
+function validatePackage(
+  packageDir: string,
+  packageName: string,
+): ValidationResult {
   const manifestPath = editor.pathJoin(packageDir, "package.json");
 
   // Check package.json exists
   if (!fsLocal.fileExists(manifestPath)) {
     return {
       valid: false,
-      error: `Missing package.json - expected at ${manifestPath}`
+      error: `Missing package.json - expected at ${manifestPath}`,
     };
   }
 
@@ -689,7 +752,7 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
   if (!manifest) {
     return {
       valid: false,
-      error: "Invalid package.json - could not parse JSON"
+      error: "Invalid package.json - could not parse JSON",
     };
   }
 
@@ -697,21 +760,26 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
   if (!manifest.name) {
     return {
       valid: false,
-      error: "Invalid package.json - missing 'name' field"
+      error: "Invalid package.json - missing 'name' field",
     };
   }
 
   if (!manifest.type) {
     return {
       valid: false,
-      error: "Invalid package.json - missing 'type' field (should be 'plugin', 'theme', 'language', or 'bundle')"
+      error:
+        "Invalid package.json - missing 'type' field (should be 'plugin', 'theme', 'language', or 'bundle')",
     };
   }
 
-  if (manifest.type !== "plugin" && manifest.type !== "theme" && manifest.type !== "language" && manifest.type !== "bundle") {
+  if (
+    manifest.type !== "plugin" && manifest.type !== "theme" &&
+    manifest.type !== "language" && manifest.type !== "bundle"
+  ) {
     return {
       valid: false,
-      error: `Invalid package.json - 'type' must be 'plugin', 'theme', 'language', or 'bundle', got '${manifest.type}'`
+      error:
+        `Invalid package.json - 'type' must be 'plugin', 'theme', 'language', or 'bundle', got '${manifest.type}'`,
     };
   }
 
@@ -721,15 +789,16 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
     if (manifest.fresh.min_api_version > currentApi) {
       editor.warn(
         `[pkg] Package '${packageName}' requires plugin API version ${manifest.fresh.min_api_version}, ` +
-        `but this editor only supports version ${currentApi}. Some features may not work. ` +
-        `Update Fresh to get the latest plugin API.`
+          `but this editor only supports version ${currentApi}. Some features may not work. ` +
+          `Update Fresh to get the latest plugin API.`,
       );
     }
   }
 
   // For plugins, validate entry file exists
   if (manifest.type === "plugin") {
-    const entryFile = manifest.fresh?.entry || manifest.fresh?.main || `${manifest.name}.ts`;
+    const entryFile = manifest.fresh?.entry || manifest.fresh?.main ||
+      `${manifest.name}.ts`;
     const entryPath = editor.pathJoin(packageDir, entryFile);
 
     if (!fsLocal.fileExists(entryPath)) {
@@ -741,7 +810,8 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 
       return {
         valid: false,
-        error: `Missing entry file '${entryFile}' - check fresh.entry in package.json`
+        error:
+          `Missing entry file '${entryFile}' - check fresh.entry in package.json`,
       };
     }
 
@@ -750,20 +820,27 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 
   // For language packs, validate at least one component is defined
   if (manifest.type === "language") {
-    if (!manifest.fresh?.grammar && !manifest.fresh?.language && !manifest.fresh?.lsp) {
+    if (
+      !manifest.fresh?.grammar && !manifest.fresh?.language &&
+      !manifest.fresh?.lsp
+    ) {
       return {
         valid: false,
-        error: "Language package must define at least one of: grammar, language, or lsp"
+        error:
+          "Language package must define at least one of: grammar, language, or lsp",
       };
     }
 
     // Validate grammar file exists if specified
     if (manifest.fresh?.grammar?.file) {
-      const grammarPath = editor.pathJoin(packageDir, manifest.fresh.grammar.file);
+      const grammarPath = editor.pathJoin(
+        packageDir,
+        manifest.fresh.grammar.file,
+      );
       if (!fsLocal.fileExists(grammarPath)) {
         return {
           valid: false,
-          error: `Grammar file not found: ${manifest.fresh.grammar.file}`
+          error: `Grammar file not found: ${manifest.fresh.grammar.file}`,
         };
       }
     }
@@ -773,14 +850,18 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 
   // For bundles, validate at least one language, plugin, or theme is defined
   if (manifest.type === "bundle") {
-    const hasLanguages = manifest.fresh?.languages && manifest.fresh.languages.length > 0;
-    const hasPlugins = manifest.fresh?.plugins && manifest.fresh.plugins.length > 0;
-    const hasThemes = manifest.fresh?.themes && manifest.fresh.themes.length > 0;
+    const hasLanguages = manifest.fresh?.languages &&
+      manifest.fresh.languages.length > 0;
+    const hasPlugins = manifest.fresh?.plugins &&
+      manifest.fresh.plugins.length > 0;
+    const hasThemes = manifest.fresh?.themes &&
+      manifest.fresh.themes.length > 0;
 
     if (!hasLanguages && !hasPlugins && !hasThemes) {
       return {
         valid: false,
-        error: "Bundle package must define at least one language, plugin, or theme"
+        error:
+          "Bundle package must define at least one language, plugin, or theme",
       };
     }
 
@@ -790,7 +871,7 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
         if (!lang.id) {
           return {
             valid: false,
-            error: "Bundle language entry missing required 'id' field"
+            error: "Bundle language entry missing required 'id' field",
           };
         }
         // Validate grammar file exists if specified
@@ -799,7 +880,8 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
           if (!fsLocal.fileExists(grammarPath)) {
             return {
               valid: false,
-              error: `Grammar file not found for language '${lang.id}': ${lang.grammar.file}`
+              error:
+                `Grammar file not found for language '${lang.id}': ${lang.grammar.file}`,
             };
           }
         }
@@ -812,7 +894,7 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
         if (!plugin.entry) {
           return {
             valid: false,
-            error: "Bundle plugin entry missing required 'entry' field"
+            error: "Bundle plugin entry missing required 'entry' field",
           };
         }
         const entryPath = editor.pathJoin(packageDir, plugin.entry);
@@ -822,7 +904,7 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
           if (!fsLocal.fileExists(jsEntryPath)) {
             return {
               valid: false,
-              error: `Plugin entry file not found: ${plugin.entry}`
+              error: `Plugin entry file not found: ${plugin.entry}`,
             };
           }
         }
@@ -851,8 +933,8 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 async function installPackage(
   url: string,
   name?: string,
-  _type?: "plugin" | "theme" | "language" | "bundle",  // Ignored - type is auto-detected from manifest
-  version?: string
+  _type?: "plugin" | "theme" | "language" | "bundle", // Ignored - type is auto-detected from manifest
+  version?: string,
 ): Promise<boolean> {
   const parsed = parsePackageUrl(url);
   const packageName = name || parsed.name;
@@ -886,11 +968,11 @@ async function installPackage(
  */
 async function installFromDirectFile(
   url: string,
-  packageName: string
+  packageName: string,
 ): Promise<boolean> {
   const tempFile = editor.pathJoin(
     editor.getTempDir(),
-    `fresh-pkg-file-${hashString(url)}-${Date.now()}.json`
+    `fresh-pkg-file-${hashString(url)}-${Date.now()}.json`,
   );
 
   editor.setStatus(`Downloading ${url}...`);
@@ -940,7 +1022,7 @@ async function installFromDirectFile(
 
   if (!looksLikeTheme) {
     editor.setStatus(
-      `Unrecognized file format at ${url} - direct file install currently supports Fresh theme JSON only`
+      `Unrecognized file format at ${url} - direct file install currently supports Fresh theme JSON only`,
     );
     fsLocal.removePath(tempFile);
     return false;
@@ -983,7 +1065,9 @@ async function installFromDirectFile(
       themes: [{ file: themeFileName, name: themeName ?? safeName }],
     },
   };
-  if (!await writeJsonFile(editor.pathJoin(targetDir, "package.json"), manifest)) {
+  if (
+    !await writeJsonFile(editor.pathJoin(targetDir, "package.json"), manifest)
+  ) {
     editor.setStatus(`Failed to write package manifest`);
     fsLocal.removePath(tempFile);
     fsLocal.removePath(targetDir);
@@ -1008,10 +1092,13 @@ async function installFromDirectFile(
 async function installFromRepo(
   repoUrl: string,
   packageName: string,
-  version?: string
+  version?: string,
 ): Promise<boolean> {
   // Clone to temp directory first to detect package type
-  const tempDir = editor.pathJoin(editor.getTempDir(), `fresh-pkg-clone-${hashString(repoUrl)}-${Date.now()}`);
+  const tempDir = editor.pathJoin(
+    editor.getTempDir(),
+    `fresh-pkg-clone-${hashString(repoUrl)}-${Date.now()}`,
+  );
 
   const cloneArgs = ["clone"];
   if (!version || version === "latest") {
@@ -1022,11 +1109,13 @@ async function installFromRepo(
   const result = await gitCommand(cloneArgs);
 
   if (result.exit_code !== 0) {
-    const errorMsg = result.stderr.includes("not found") || result.stderr.includes("404")
-      ? "Repository not found"
-      : result.stderr.includes("Authentication") || result.stderr.includes("403")
-      ? "Access denied (repository may be private)"
-      : result.stderr.split("\n")[0] || "Clone failed";
+    const errorMsg =
+      result.stderr.includes("not found") || result.stderr.includes("404")
+        ? "Repository not found"
+        : result.stderr.includes("Authentication") ||
+            result.stderr.includes("403")
+        ? "Access denied (repository may be private)"
+        : result.stderr.split("\n")[0] || "Clone failed";
     editor.setStatus(`Failed to install ${packageName}: ${errorMsg}`);
     return false;
   }
@@ -1035,7 +1124,9 @@ async function installFromRepo(
   if (version && version !== "latest") {
     const checkoutResult = await checkoutVersion(tempDir, version);
     if (!checkoutResult) {
-      editor.setStatus(`Installed ${packageName} but failed to checkout version ${version}`);
+      editor.setStatus(
+        `Installed ${packageName} but failed to checkout version ${version}`,
+      );
     }
   }
 
@@ -1056,10 +1147,13 @@ async function installFromRepo(
 
   // Determine correct target directory based on actual package type
   const actualType = manifest?.type || "plugin";
-  const correctPackagesDir = actualType === "plugin" ? PACKAGES_DIR
-                           : actualType === "theme" ? THEMES_PACKAGES_DIR
-                           : actualType === "bundle" ? BUNDLES_PACKAGES_DIR
-                           : LANGUAGES_PACKAGES_DIR;
+  const correctPackagesDir = actualType === "plugin"
+    ? PACKAGES_DIR
+    : actualType === "theme"
+    ? THEMES_PACKAGES_DIR
+    : actualType === "bundle"
+    ? BUNDLES_PACKAGES_DIR
+    : LANGUAGES_PACKAGES_DIR;
   const correctTargetDir = editor.pathJoin(correctPackagesDir, packageName);
 
   // Check if already installed in correct location
@@ -1072,7 +1166,9 @@ async function installFromRepo(
   // Ensure correct directory exists and move from temp
   ensureDir(correctPackagesDir);
   if (!fsLocal.renamePath(tempDir, correctTargetDir)) {
-    editor.setStatus(`Failed to install ${packageName}: could not move package to target directory`);
+    editor.setStatus(
+      `Failed to install ${packageName}: could not move package to target directory`,
+    );
     fsLocal.removePath(tempDir);
     return false;
   }
@@ -1080,20 +1176,41 @@ async function installFromRepo(
   // Dynamically load plugins, reload themes, load language packs, or load bundles
   if (manifest?.type === "plugin" && validation.entryPath) {
     // Update entry path to new location
-    const newEntryPath = validation.entryPath.replace(tempDir, correctTargetDir);
+    const newEntryPath = validation.entryPath.replace(
+      tempDir,
+      correctTargetDir,
+    );
     await editor.loadPlugin(newEntryPath);
-    editor.setStatus(`Installed and activated ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed and activated ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else if (manifest?.type === "theme") {
     editor.reloadThemes();
-    editor.setStatus(`Installed theme ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed theme ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else if (manifest?.type === "language") {
     await loadLanguagePack(correctTargetDir, manifest);
-    editor.setStatus(`Installed language pack ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed language pack ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else if (manifest?.type === "bundle") {
     await loadBundle(correctTargetDir, manifest);
-    editor.setStatus(`Installed bundle ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed bundle ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else {
-    editor.setStatus(`Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`,
+    );
   }
   return true;
 }
@@ -1109,7 +1226,7 @@ async function installFromRepo(
  */
 async function installFromLocalPath(
   parsed: ParsedPackageUrl,
-  packageName: string
+  packageName: string,
 ): Promise<boolean> {
   // Resolve the full source path
   let sourcePath = parsed.repoUrl;
@@ -1150,10 +1267,13 @@ async function installFromLocalPath(
 
   // Determine correct target directory based on actual package type
   const actualType = manifest.type || "plugin";
-  const correctPackagesDir = actualType === "plugin" ? PACKAGES_DIR
-                           : actualType === "theme" ? THEMES_PACKAGES_DIR
-                           : actualType === "bundle" ? BUNDLES_PACKAGES_DIR
-                           : LANGUAGES_PACKAGES_DIR;
+  const correctPackagesDir = actualType === "plugin"
+    ? PACKAGES_DIR
+    : actualType === "theme"
+    ? THEMES_PACKAGES_DIR
+    : actualType === "bundle"
+    ? BUNDLES_PACKAGES_DIR
+    : LANGUAGES_PACKAGES_DIR;
   const correctTargetDir = editor.pathJoin(correctPackagesDir, packageName);
 
   // Check if already installed in correct location
@@ -1185,26 +1305,45 @@ async function installFromLocalPath(
   // Store the source path for reference
   const sourceInfo = {
     local_path: sourcePath,
-    original_url: parsed.subpath ? `${parsed.repoUrl}#${parsed.subpath}` : parsed.repoUrl,
-    installed_at: new Date().toISOString()
+    original_url: parsed.subpath
+      ? `${parsed.repoUrl}#${parsed.subpath}`
+      : parsed.repoUrl,
+    installed_at: new Date().toISOString(),
   };
-  await writeJsonFile(editor.pathJoin(correctTargetDir, ".fresh-source.json"), sourceInfo);
+  await writeJsonFile(
+    editor.pathJoin(correctTargetDir, ".fresh-source.json"),
+    sourceInfo,
+  );
 
   // Dynamically load plugins, reload themes, load language packs, or load bundles
   if (manifest.type === "plugin" && validation.entryPath) {
     await editor.loadPlugin(validation.entryPath);
-    editor.setStatus(`Installed and activated ${packageName} v${manifest.version || "unknown"}`);
+    editor.setStatus(
+      `Installed and activated ${packageName} v${
+        manifest.version || "unknown"
+      }`,
+    );
   } else if (manifest.type === "theme") {
     editor.reloadThemes();
-    editor.setStatus(`Installed theme ${packageName} v${manifest.version || "unknown"}`);
+    editor.setStatus(
+      `Installed theme ${packageName} v${manifest.version || "unknown"}`,
+    );
   } else if (manifest.type === "language") {
     await loadLanguagePack(correctTargetDir, manifest);
-    editor.setStatus(`Installed language pack ${packageName} v${manifest.version || "unknown"}`);
+    editor.setStatus(
+      `Installed language pack ${packageName} v${
+        manifest.version || "unknown"
+      }`,
+    );
   } else if (manifest.type === "bundle") {
     await loadBundle(correctTargetDir, manifest);
-    editor.setStatus(`Installed bundle ${packageName} v${manifest.version || "unknown"}`);
+    editor.setStatus(
+      `Installed bundle ${packageName} v${manifest.version || "unknown"}`,
+    );
   } else {
-    editor.setStatus(`Installed ${packageName} v${manifest.version || "unknown"}`);
+    editor.setStatus(
+      `Installed ${packageName} v${manifest.version || "unknown"}`,
+    );
   }
   return true;
 }
@@ -1221,9 +1360,12 @@ async function installFromLocalPath(
 async function installFromMonorepo(
   parsed: ParsedPackageUrl,
   packageName: string,
-  version?: string
+  version?: string,
 ): Promise<boolean> {
-  const tempDir = editor.pathJoin(editor.getTempDir(), `fresh-pkg-${hashString(parsed.repoUrl)}-${Date.now()}`);
+  const tempDir = editor.pathJoin(
+    editor.getTempDir(),
+    `fresh-pkg-${hashString(parsed.repoUrl)}-${Date.now()}`,
+  );
 
   try {
     // Clone the full repo to temp
@@ -1236,9 +1378,11 @@ async function installFromMonorepo(
 
     const cloneResult = await gitCommand(cloneArgs);
     if (cloneResult.exit_code !== 0) {
-      const errorMsg = cloneResult.stderr.includes("not found") || cloneResult.stderr.includes("404")
+      const errorMsg = cloneResult.stderr.includes("not found") ||
+          cloneResult.stderr.includes("404")
         ? "Repository not found"
-        : cloneResult.stderr.includes("Authentication") || cloneResult.stderr.includes("403")
+        : cloneResult.stderr.includes("Authentication") ||
+            cloneResult.stderr.includes("403")
         ? "Access denied (repository may be private)"
         : cloneResult.stderr.split("\n")[0] || "Clone failed";
       editor.setStatus(`Failed to clone repository: ${errorMsg}`);
@@ -1261,7 +1405,9 @@ async function installFromMonorepo(
     // Validate package structure (validates against subpath dir)
     const validation = validatePackage(subpathDir, packageName);
     if (!validation.valid) {
-      editor.warn(`[pkg] Invalid package '${packageName}': ${validation.error}`);
+      editor.warn(
+        `[pkg] Invalid package '${packageName}': ${validation.error}`,
+      );
       editor.setStatus(`Failed to install ${packageName}: ${validation.error}`);
       fsLocal.removePath(tempDir);
       return false;
@@ -1274,10 +1420,13 @@ async function installFromMonorepo(
 
     // Determine correct target directory based on actual package type
     const actualType = manifest?.type || "plugin";
-    const correctPackagesDir = actualType === "plugin" ? PACKAGES_DIR
-                             : actualType === "theme" ? THEMES_PACKAGES_DIR
-                             : actualType === "bundle" ? BUNDLES_PACKAGES_DIR
-                             : LANGUAGES_PACKAGES_DIR;
+    const correctPackagesDir = actualType === "plugin"
+      ? PACKAGES_DIR
+      : actualType === "theme"
+      ? THEMES_PACKAGES_DIR
+      : actualType === "bundle"
+      ? BUNDLES_PACKAGES_DIR
+      : LANGUAGES_PACKAGES_DIR;
     const correctTargetDir = editor.pathJoin(correctPackagesDir, packageName);
 
     // Check if already installed
@@ -1303,27 +1452,51 @@ async function installFromMonorepo(
       repository: parsed.repoUrl,
       subpath: parsed.subpath,
       installed_from: `${parsed.repoUrl}#${parsed.subpath}`,
-      installed_at: new Date().toISOString()
+      installed_at: new Date().toISOString(),
     };
-    await writeJsonFile(editor.pathJoin(correctTargetDir, ".fresh-source.json"), sourceInfo);
+    await writeJsonFile(
+      editor.pathJoin(correctTargetDir, ".fresh-source.json"),
+      sourceInfo,
+    );
 
     // Dynamically load plugins, reload themes, load language packs, or load bundles
     if (manifest?.type === "plugin" && validation.entryPath) {
       // Update entry path to new location
-      const newEntryPath = validation.entryPath.replace(subpathDir, correctTargetDir);
+      const newEntryPath = validation.entryPath.replace(
+        subpathDir,
+        correctTargetDir,
+      );
       await editor.loadPlugin(newEntryPath);
-      editor.setStatus(`Installed and activated ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed and activated ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else if (manifest?.type === "theme") {
       editor.reloadThemes();
-      editor.setStatus(`Installed theme ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed theme ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else if (manifest?.type === "language") {
       await loadLanguagePack(correctTargetDir, manifest);
-      editor.setStatus(`Installed language pack ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed language pack ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else if (manifest?.type === "bundle") {
       await loadBundle(correctTargetDir, manifest);
-      editor.setStatus(`Installed bundle ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed bundle ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else {
-      editor.setStatus(`Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`,
+      );
     }
     return true;
   } finally {
@@ -1335,12 +1508,18 @@ async function installFromMonorepo(
 /**
  * Load a language pack (register grammar, language config, and LSP server)
  */
-async function loadLanguagePack(packageDir: string, manifest: PackageManifest): Promise<void> {
+async function loadLanguagePack(
+  packageDir: string,
+  manifest: PackageManifest,
+): Promise<void> {
   const langId = manifest.name;
 
   // Register grammar if present
   if (manifest.fresh?.grammar) {
-    const grammarPath = editor.pathJoin(packageDir, manifest.fresh.grammar.file);
+    const grammarPath = editor.pathJoin(
+      packageDir,
+      manifest.fresh.grammar.file,
+    );
     const extensions = manifest.fresh.grammar.extensions || [];
     editor.registerGrammar(langId, grammarPath, extensions);
   }
@@ -1356,10 +1535,12 @@ async function loadLanguagePack(packageDir: string, manifest: PackageManifest): 
       tabSize: lang.tabSize ?? null,
       autoIndent: lang.autoIndent ?? null,
       showWhitespaceTabs: lang.showWhitespaceTabs ?? null,
-      formatter: lang.formatter ? {
-        command: lang.formatter.command,
-        args: lang.formatter.args ?? [],
-      } : null,
+      formatter: lang.formatter
+        ? {
+          command: lang.formatter.command,
+          args: lang.formatter.args ?? [],
+        }
+        : null,
     });
   }
 
@@ -1382,7 +1563,10 @@ async function loadLanguagePack(packageDir: string, manifest: PackageManifest): 
 /**
  * Load a bundle package (register all languages and load all plugins)
  */
-async function loadBundle(packageDir: string, manifest: PackageManifest): Promise<void> {
+async function loadBundle(
+  packageDir: string,
+  manifest: PackageManifest,
+): Promise<void> {
   const bundleName = manifest.name;
   editor.debug(`[pkg] Loading bundle: ${bundleName}`);
 
@@ -1410,10 +1594,12 @@ async function loadBundle(packageDir: string, manifest: PackageManifest): Promis
           tabSize: langConfig.tabSize ?? null,
           autoIndent: langConfig.autoIndent ?? null,
           showWhitespaceTabs: langConfig.showWhitespaceTabs ?? null,
-          formatter: langConfig.formatter ? {
-            command: langConfig.formatter.command,
-            args: langConfig.formatter.args ?? [],
-          } : null,
+          formatter: langConfig.formatter
+            ? {
+              command: langConfig.formatter.command,
+              args: langConfig.formatter.args ?? [],
+            }
+            : null,
         });
       }
 
@@ -1455,7 +1641,9 @@ async function loadBundle(packageDir: string, manifest: PackageManifest): Promis
 
   // Reload themes if bundle contains any (uses same format as theme-packs)
   if (manifest.fresh?.themes && manifest.fresh.themes.length > 0) {
-    editor.debug(`[pkg] Bundle contains ${manifest.fresh.themes.length} theme(s), reloading themes`);
+    editor.debug(
+      `[pkg] Bundle contains ${manifest.fresh.themes.length} theme(s), reloading themes`,
+    );
     editor.reloadThemes();
   }
 
@@ -1467,13 +1655,21 @@ async function loadBundle(packageDir: string, manifest: PackageManifest): Promis
 /**
  * Checkout a specific version in a package directory
  */
-async function checkoutVersion(pkgPath: string, version: string): Promise<boolean> {
+async function checkoutVersion(
+  pkgPath: string,
+  version: string,
+): Promise<boolean> {
   let target: string;
 
   if (version === "latest") {
     // Get latest tag
-    const tagsResult = await gitCommand(["-C", `${pkgPath}`, "tag", "--sort=-v:refname"]);
-    const tags = tagsResult.stdout.split("\n").filter(t => t.trim());
+    const tagsResult = await gitCommand([
+      "-C",
+      `${pkgPath}`,
+      "tag",
+      "--sort=-v:refname",
+    ]);
+    const tags = tagsResult.stdout.split("\n").filter((t) => t.trim());
     target = tags[0] || "HEAD";
   } else if (version.startsWith("^") || version.startsWith("~")) {
     // Semver matching - find best matching tag
@@ -1497,18 +1693,26 @@ async function checkoutVersion(pkgPath: string, version: string): Promise<boolea
 /**
  * Find best semver matching version
  */
-async function findMatchingSemver(pkgPath: string, spec: string): Promise<string> {
-  const tagsResult = await gitCommand(["-C", `${pkgPath}`, "tag", "--sort=-v:refname"]);
-  const tags = tagsResult.stdout.split("\n").filter(t => t.trim());
+async function findMatchingSemver(
+  pkgPath: string,
+  spec: string,
+): Promise<string> {
+  const tagsResult = await gitCommand([
+    "-C",
+    `${pkgPath}`,
+    "tag",
+    "--sort=-v:refname",
+  ]);
+  const tags = tagsResult.stdout.split("\n").filter((t) => t.trim());
 
   // Simple semver matching (^ means compatible, ~ means patch only)
   const prefix = spec.startsWith("^") ? "^" : "~";
   const baseVersion = spec.slice(1);
-  const [major, minor] = baseVersion.split(".").map(n => parseInt(n, 10));
+  const [major, minor] = baseVersion.split(".").map((n) => parseInt(n, 10));
 
   for (const tag of tags) {
     const version = tag.replace(/^v/, "");
-    const [tagMajor, tagMinor] = version.split(".").map(n => parseInt(n, 10));
+    const [tagMajor, tagMinor] = version.split(".").map((n) => parseInt(n, 10));
 
     if (prefix === "^") {
       // Compatible: same major
@@ -1543,7 +1747,9 @@ async function updatePackage(pkg: InstalledPackage): Promise<boolean> {
       // Use listPlugins to find the correct runtime plugin name
       if (pkg.type === "plugin") {
         const loadedPlugins = await editor.listPlugins();
-        const plugin = loadedPlugins.find((p: { path: string }) => p.path.startsWith(pkg.path));
+        const plugin = loadedPlugins.find((p: { path: string }) =>
+          p.path.startsWith(pkg.path)
+        );
         if (plugin) {
           await editor.reloadPlugin(plugin.name);
         }
@@ -1556,7 +1762,8 @@ async function updatePackage(pkg: InstalledPackage): Promise<boolean> {
   } else {
     const errorMsg = result.stderr.includes("Could not resolve host")
       ? "Network error"
-      : result.stderr.includes("Authentication") || result.stderr.includes("403")
+      : result.stderr.includes("Authentication") ||
+          result.stderr.includes("403")
       ? "Authentication failed"
       : result.stderr.split("\n")[0] || "Update failed";
     editor.setStatus(`Failed to update ${pkg.name}: ${errorMsg}`);
@@ -1586,7 +1793,9 @@ async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
   // Unload plugin first if applicable
   if (pkg.type === "plugin") {
     const loadedPlugins = await editor.listPlugins();
-    const plugin = loadedPlugins.find((p: { path: string }) => p.path.startsWith(pkg.path));
+    const plugin = loadedPlugins.find((p: { path: string }) =>
+      p.path.startsWith(pkg.path)
+    );
     if (plugin) {
       await editor.unloadPlugin(plugin.name).catch(() => {});
     }
@@ -1608,14 +1817,19 @@ async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
   const sourceInfo = {
     local_path: sourcePath,
     original_url: pkg.source,
-    installed_at: new Date().toISOString()
+    installed_at: new Date().toISOString(),
   };
-  await writeJsonFile(editor.pathJoin(pkg.path, ".fresh-source.json"), sourceInfo);
+  await writeJsonFile(
+    editor.pathJoin(pkg.path, ".fresh-source.json"),
+    sourceInfo,
+  );
 
   // Re-read manifest for validation and reload
   const validation = validatePackage(pkg.path, pkg.name);
   if (!validation.valid) {
-    editor.setStatus(`Reinstalled ${pkg.name} but package is invalid: ${validation.error}`);
+    editor.setStatus(
+      `Reinstalled ${pkg.name} but package is invalid: ${validation.error}`,
+    );
     return false;
   }
 
@@ -1651,7 +1865,9 @@ async function removePackage(pkg: InstalledPackage): Promise<boolean> {
   // Use listPlugins to find the correct runtime plugin name by matching path
   if (pkg.type === "plugin") {
     const loadedPlugins = await editor.listPlugins();
-    const plugin = loadedPlugins.find((p: { path: string }) => p.path.startsWith(pkg.path));
+    const plugin = loadedPlugins.find((p: { path: string }) =>
+      p.path.startsWith(pkg.path)
+    );
     if (plugin) {
       await editor.unloadPlugin(plugin.name).catch(() => {});
     }
@@ -1688,7 +1904,9 @@ async function updateAllPackages(): Promise<void> {
   let failed = 0;
 
   for (const pkg of all) {
-    editor.setStatus(`Updating ${pkg.name} (${updated + failed + 1}/${all.length})...`);
+    editor.setStatus(
+      `Updating ${pkg.name} (${updated + failed + 1}/${all.length})...`,
+    );
 
     if (pkg.localSource) {
       // Local packages: reinstall from source path
@@ -1699,7 +1917,12 @@ async function updateAllPackages(): Promise<void> {
         failed++;
       }
     } else {
-      const result = await gitCommand(["-C", `${pkg.path}`, "pull", "--ff-only"]);
+      const result = await gitCommand([
+        "-C",
+        `${pkg.path}`,
+        "pull",
+        "--ff-only",
+      ]);
       if (result.exit_code === 0) {
         if (!result.stdout.includes("Already up to date")) {
           updated++;
@@ -1710,7 +1933,11 @@ async function updateAllPackages(): Promise<void> {
     }
   }
 
-  editor.setStatus(`Update complete: ${updated} updated, ${all.length - updated - failed} unchanged, ${failed} failed`);
+  editor.setStatus(
+    `Update complete: ${updated} updated, ${
+      all.length - updated - failed
+    } unchanged, ${failed} failed`,
+  );
 }
 
 // =============================================================================
@@ -1730,18 +1957,23 @@ async function generateLockfile(): Promise<void> {
   const lockfile: Lockfile = {
     lockfile_version: 1,
     generated: new Date().toISOString(),
-    packages: {}
+    packages: {},
   };
 
   for (const pkg of all) {
     // Get current commit
-    const commitResult = await gitCommand(["-C", `${pkg.path}`, "rev-parse", "HEAD"]);
+    const commitResult = await gitCommand([
+      "-C",
+      `${pkg.path}`,
+      "rev-parse",
+      "HEAD",
+    ]);
     const commit = commitResult.stdout.trim();
 
     lockfile.packages[pkg.name] = {
       source: pkg.source,
       commit,
-      version: pkg.version
+      version: pkg.version,
     };
   }
 
@@ -1768,7 +2000,11 @@ async function installFromLockfile(): Promise<void> {
   let failed = 0;
 
   for (const [name, entry] of Object.entries(lockfile.packages)) {
-    editor.setStatus(`Installing ${name} (${installed + failed + 1}/${Object.keys(lockfile.packages).length})...`);
+    editor.setStatus(
+      `Installing ${name} (${installed + failed + 1}/${
+        Object.keys(lockfile.packages).length
+      })...`,
+    );
 
     // Check if already installed
     const pluginPath = editor.pathJoin(PACKAGES_DIR, name);
@@ -1778,7 +2014,12 @@ async function installFromLockfile(): Promise<void> {
       // Already installed, just checkout the commit
       const path = fsLocal.fileExists(pluginPath) ? pluginPath : themePath;
       await gitCommand(["-C", `${path}`, "fetch"]);
-      const result = await gitCommand(["-C", `${path}`, "checkout", entry.commit]);
+      const result = await gitCommand([
+        "-C",
+        `${path}`,
+        "checkout",
+        entry.commit,
+      ]);
       if (result.exit_code === 0) {
         installed++;
       } else {
@@ -1787,7 +2028,11 @@ async function installFromLockfile(): Promise<void> {
     } else {
       // Need to clone
       ensureDir(PACKAGES_DIR);
-      const result = await gitCommand(["clone", `${entry.source}`, `${pluginPath}`]);
+      const result = await gitCommand([
+        "clone",
+        `${entry.source}`,
+        `${pluginPath}`,
+      ]);
 
       if (result.exit_code === 0) {
         await gitCommand(["-C", `${pluginPath}`, "checkout", entry.commit]);
@@ -1798,7 +2043,9 @@ async function installFromLockfile(): Promise<void> {
     }
   }
 
-  editor.setStatus(`Lockfile install complete: ${installed} installed, ${failed} failed`);
+  editor.setStatus(
+    `Lockfile install complete: ${installed} installed, ${failed} failed`,
+  );
 }
 
 // =============================================================================
@@ -1829,11 +2076,11 @@ interface PackageListItem {
 
 // Focus target types for Tab navigation
 type FocusTarget =
-  | { type: "filter"; index: number }  // 0=All, 1=Installed, 2=Plugins, 3=Themes, 4=Languages, 5=Bundles
+  | { type: "filter"; index: number } // 0=All, 1=Installed, 2=Plugins, 3=Themes, 4=Languages, 5=Bundles
   | { type: "sync" }
   | { type: "search" }
-  | { type: "list" }  // Package list (use arrows to navigate)
-  | { type: "action"; index: number };  // Action buttons for selected package
+  | { type: "list" } // Package list (use arrows to navigate)
+  | { type: "action"; index: number }; // Action buttons for selected package
 
 interface PkgManagerState {
   isOpen: boolean;
@@ -1844,7 +2091,7 @@ interface PkgManagerState {
   searchQuery: string;
   items: PackageListItem[];
   selectedIndex: number;
-  focus: FocusTarget;  // What element has Tab focus
+  focus: FocusTarget; // What element has Tab focus
   isLoading: boolean;
   viewportHeight: number;
   // Buffer group fields
@@ -1897,7 +2144,7 @@ const pkgTheme: Record<string, ThemeColor> = {
   available: { fg: { theme: "editor.fg", rgb: [200, 200, 210] } },
   selected: {
     fg: { theme: "ui.menu_active_fg", rgb: [255, 255, 255] },
-    bg: { theme: "ui.menu_active_bg", rgb: [50, 80, 120] }
+    bg: { theme: "ui.menu_active_bg", rgb: [50, 80, 120] },
   },
 
   // Descriptions and details
@@ -1915,14 +2162,14 @@ const pkgTheme: Record<string, ThemeColor> = {
   // Filter buttons
   filterActive: {
     fg: { rgb: [255, 255, 255] },
-    bg: { theme: "syntax.keyword", rgb: [60, 100, 160] }
+    bg: { theme: "syntax.keyword", rgb: [60, 100, 160] },
   },
   filterInactive: {
     fg: { rgb: [160, 160, 170] },
   },
   filterFocused: {
     fg: { rgb: [255, 255, 255] },
-    bg: { rgb: [80, 80, 90] }
+    bg: { rgb: [80, 80, 90] },
   },
 
   // Action buttons
@@ -1931,17 +2178,17 @@ const pkgTheme: Record<string, ThemeColor> = {
   },
   buttonFocused: {
     fg: { rgb: [255, 255, 255] },
-    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] }
+    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] },
   },
 
   // Search box - distinct input field appearance
   searchBox: {
     fg: { rgb: [200, 200, 210] },
-    bg: { rgb: [40, 42, 48] }
+    bg: { rgb: [40, 42, 48] },
   },
   searchBoxFocused: {
     fg: { rgb: [255, 255, 255] },
-    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] }
+    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] },
   },
 
   // Status indicators
@@ -1961,7 +2208,7 @@ editor.defineMode(
     ["Escape", "pkg_back_or_close"],
     ["/", "pkg_search"],
   ],
-  true // read-only
+  true, // read-only
 );
 
 // Define pkg-detail mode for package details view
@@ -1975,7 +2222,7 @@ editor.defineMode(
     ["S-Tab", "pkg_prev_button"],
     ["Escape", "pkg_back_or_close"],
   ],
-  true // read-only
+  true, // read-only
 );
 
 /**
@@ -1991,7 +2238,14 @@ function buildPackageList(): PackageListItem[] {
   const installedBundles = getInstalledPackages("bundle");
   const installedMap = new Map<string, InstalledPackage>();
 
-  for (const pkg of [...installedPlugins, ...installedThemes, ...installedLanguages, ...installedBundles]) {
+  for (
+    const pkg of [
+      ...installedPlugins,
+      ...installedThemes,
+      ...installedLanguages,
+      ...installedBundles,
+    ]
+  ) {
     installedMap.set(pkg.name, pkg);
     items.push({
       type: "installed",
@@ -2094,29 +2348,29 @@ function getFilteredItems(): PackageListItem[] {
   // Apply filter
   switch (pkgState.filter) {
     case "installed":
-      items = items.filter(i => i.installed);
+      items = items.filter((i) => i.installed);
       break;
     case "plugins":
-      items = items.filter(i => i.packageType === "plugin");
+      items = items.filter((i) => i.packageType === "plugin");
       break;
     case "themes":
-      items = items.filter(i => i.packageType === "theme");
+      items = items.filter((i) => i.packageType === "theme");
       break;
     case "languages":
-      items = items.filter(i => i.packageType === "language");
+      items = items.filter((i) => i.packageType === "language");
       break;
     case "bundles":
-      items = items.filter(i => i.packageType === "bundle");
+      items = items.filter((i) => i.packageType === "bundle");
       break;
   }
 
   // Apply search (case insensitive)
   if (pkgState.searchQuery) {
     const query = pkgState.searchQuery.toLowerCase();
-    items = items.filter(i =>
+    items = items.filter((i) =>
       i.name.toLowerCase().includes(query) ||
       (i.description && i.description.toLowerCase().includes(query)) ||
-      (i.keywords && i.keywords.some(k => k.toLowerCase().includes(query)))
+      (i.keywords && i.keywords.some((k) => k.toLowerCase().includes(query)))
     );
   }
 
@@ -2144,7 +2398,9 @@ function formatNumber(n: number | undefined): string {
 // Layout constants
 const TOTAL_WIDTH = 88;
 const LIST_WIDTH = 36;
-function DETAIL_WIDTH(): number { return TOTAL_WIDTH - LIST_WIDTH - 3; }
+function DETAIL_WIDTH(): number {
+  return TOTAL_WIDTH - LIST_WIDTH - 3;
+}
 
 /**
  * Helper to check if a button is focused
@@ -2188,7 +2444,9 @@ function wrapText(text: string, maxWidth: number): string[] {
       currentLine += (currentLine ? " " : "") + word;
     } else {
       if (currentLine) lines.push(currentLine);
-      currentLine = word.length > maxWidth ? word.slice(0, maxWidth - 1) + "…" : word;
+      currentLine = word.length > maxWidth
+        ? word.slice(0, maxWidth - 1) + "…"
+        : word;
     }
   }
   if (currentLine) lines.push(currentLine);
@@ -2225,13 +2483,24 @@ function buildPkgHeaderEntries(): TextPropertyEntry[] {
   const searchLeft = searchFocused ? "[" : " ";
   const searchRight = searchFocused ? "]" : " ";
   const searchVal = pkgState.searchQuery || "";
-  entries.push({ text: ` Search: ${searchLeft}${searchVal.padEnd(30)}${searchRight}\n`, properties: { type: "search-input", focused: searchFocused } });
+  entries.push({
+    text: ` Search: ${searchLeft}${searchVal.padEnd(30)}${searchRight}\n`,
+    properties: { type: "search-input", focused: searchFocused },
+  });
   // Filter bar
-  const filters = ["All", "Installed", "Plugins", "Themes", "Languages", "Bundles"];
+  const filters = [
+    "All",
+    "Installed",
+    "Plugins",
+    "Themes",
+    "Languages",
+    "Bundles",
+  ];
   let filterLine = " ";
   for (let i = 0; i < filters.length; i++) {
     const isActive = pkgState.filter === filters[i].toLowerCase();
-    const isFocused = pkgState.focus.type === "filter" && pkgState.focus.index === i;
+    const isFocused = pkgState.focus.type === "filter" &&
+      pkgState.focus.index === i;
     const lb = isFocused ? "[" : " ";
     const rb = isFocused ? "]" : " ";
     filterLine += `${lb} ${filters[i]} ${rb} `;
@@ -2285,11 +2554,13 @@ function buildPkgListRows(): PkgListRow[] {
     let idx = 0;
     for (const item of installedItems) {
       const status = item.updateAvailable ? "↑" : "✓";
-      const ver =
-        item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
+      const ver = item.version.length > 7
+        ? item.version.slice(0, 6) + "…"
+        : item.version;
       const nameW = Math.max(8, LIST_WIDTH - 16);
-      const name =
-        item.name.length > nameW ? item.name.slice(0, nameW - 1) + "…" : item.name;
+      const name = item.name.length > nameW
+        ? item.name.slice(0, nameW - 1) + "…"
+        : item.name;
       rows.push({
         entry: {
           text: `  ${name.padEnd(nameW)} ${ver.padEnd(7)} ${status}`,
@@ -2320,19 +2591,17 @@ function buildPkgListRows(): PkgListRow[] {
     });
     let idx = installedItems.length;
     for (const item of availableItems) {
-      const typeTag =
-        item.packageType === "theme"
-          ? "T"
-          : item.packageType === "language"
-            ? "L"
-            : item.packageType === "bundle"
-              ? "B"
-              : "P";
+      const typeTag = item.packageType === "theme"
+        ? "T"
+        : item.packageType === "language"
+        ? "L"
+        : item.packageType === "bundle"
+        ? "B"
+        : "P";
       const availNameW = Math.max(8, LIST_WIDTH - 10);
-      const name =
-        item.name.length > availNameW
-          ? item.name.slice(0, availNameW - 1) + "…"
-          : item.name;
+      const name = item.name.length > availNameW
+        ? item.name.slice(0, availNameW - 1) + "…"
+        : item.name;
       rows.push({
         entry: {
           text: `  ${name.padEnd(availNameW)} [${typeTag}]`,
@@ -2406,16 +2675,26 @@ function renderPkgList(): void {
 function buildPkgDetailEntries(): TextPropertyEntry[] {
   const items = getFilteredItems();
   const selectedItem = items.length > 0 && pkgState.selectedIndex < items.length
-    ? items[pkgState.selectedIndex] : null;
+    ? items[pkgState.selectedIndex]
+    : null;
   const entries: TextPropertyEntry[] = [];
 
   if (selectedItem) {
-    entries.push({ text: selectedItem.name + "\n", properties: { type: "detail-title" } });
-    entries.push({ text: "─".repeat(Math.min(selectedItem.name.length + 2, 50)) + "\n", properties: { type: "detail-sep" } });
+    entries.push({
+      text: selectedItem.name + "\n",
+      properties: { type: "detail-title" },
+    });
+    entries.push({
+      text: "─".repeat(Math.min(selectedItem.name.length + 2, 50)) + "\n",
+      properties: { type: "detail-sep" },
+    });
     let metaLine = `v${selectedItem.version}`;
     if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
     if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
-    entries.push({ text: metaLine + "\n", properties: { type: "detail-meta" } });
+    entries.push({
+      text: metaLine + "\n",
+      properties: { type: "detail-meta" },
+    });
     entries.push({ text: "\n", properties: { type: "blank" } });
     const descText = selectedItem.description || "No description available";
     const descLines = wrapText(descText, 50);
@@ -2424,24 +2703,38 @@ function buildPkgDetailEntries(): TextPropertyEntry[] {
     }
     entries.push({ text: "\n", properties: { type: "blank" } });
     if (selectedItem.keywords && selectedItem.keywords.length > 0) {
-      entries.push({ text: `Tags: ${selectedItem.keywords.slice(0, 4).join(", ")}\n`, properties: { type: "detail-tags" } });
+      entries.push({
+        text: `Tags: ${selectedItem.keywords.slice(0, 4).join(", ")}\n`,
+        properties: { type: "detail-tags" },
+      });
       entries.push({ text: "\n", properties: { type: "blank" } });
     }
     if (selectedItem.repository) {
-      let displayUrl = selectedItem.repository.replace(/^https?:\/\//, "").replace(/\.git$/, "");
+      let displayUrl = selectedItem.repository.replace(/^https?:\/\//, "")
+        .replace(/\.git$/, "");
       if (displayUrl.length > 50) displayUrl = displayUrl.slice(0, 47) + "...";
-      entries.push({ text: displayUrl + "\n", properties: { type: "detail-url" } });
+      entries.push({
+        text: displayUrl + "\n",
+        properties: { type: "detail-url" },
+      });
       entries.push({ text: "\n", properties: { type: "blank" } });
     }
     const actions = getActionButtons();
     for (let i = 0; i < actions.length; i++) {
-      const focused = pkgState.focus.type === "action" && pkgState.focus.index === i;
+      const focused = pkgState.focus.type === "action" &&
+        pkgState.focus.index === i;
       const lb = focused ? "[" : " ";
       const rb = focused ? "]" : " ";
-      entries.push({ text: `${lb} ${actions[i]} ${rb}\n`, properties: { type: "action-btn", focused, btnIndex: i } });
+      entries.push({
+        text: `${lb} ${actions[i]} ${rb}\n`,
+        properties: { type: "action-btn", focused, btnIndex: i },
+      });
     }
   } else {
-    entries.push({ text: "Select a package\nto view details\n", properties: { type: "empty-state" } });
+    entries.push({
+      text: "Select a package\nto view details\n",
+      properties: { type: "empty-state" },
+    });
   }
 
   return entries;
@@ -2458,7 +2751,8 @@ function renderPkgFooter(): void {
   // tokens separated by two spaces, each token is `<keys>:<label>`
   // or `<keys> <label>`. The host's HintBar styles the keys portion
   // with `ui.help_key_fg`.
-  const hintString = `↑↓:Navigate  Tab:Next  /:Search  Enter:${actionLabel}  Esc:Close`;
+  const hintString =
+    `↑↓:Navigate  Tab:Next  /:Search  Enter:${actionLabel}  Esc:Close`;
   pkgState.footerPanel.set(hintBar(parseHintString(hintString)));
 }
 
@@ -2525,7 +2819,11 @@ async function openPackageManager(): Promise<void> {
     },
   });
 
-  const groupResult = await editor.createBufferGroup("*Packages*", "pkg-manager", layout);
+  const groupResult = await editor.createBufferGroup(
+    "*Packages*",
+    "pkg-manager",
+    layout,
+  );
   pkgState.groupId = groupResult.groupId;
   pkgState.panelBuffers = groupResult.panels;
   pkgState.isOpen = true;
@@ -2593,12 +2891,12 @@ function closePackageManager(): void {
 function getFocusOrder(): FocusTarget[] {
   const order: FocusTarget[] = [
     { type: "search" },
-    { type: "filter", index: 0 },  // All
-    { type: "filter", index: 1 },  // Installed
-    { type: "filter", index: 2 },  // Plugins
-    { type: "filter", index: 3 },  // Themes
-    { type: "filter", index: 4 },  // Languages
-    { type: "filter", index: 5 },  // Bundles
+    { type: "filter", index: 0 }, // All
+    { type: "filter", index: 1 }, // Installed
+    { type: "filter", index: 2 }, // Plugins
+    { type: "filter", index: 3 }, // Themes
+    { type: "filter", index: 4 }, // Languages
+    { type: "filter", index: 5 }, // Bundles
     { type: "sync" },
     { type: "list" },
   ];
@@ -2657,8 +2955,9 @@ editor.on("widget_event", (data) => {
     return;
   }
   if (data.event_type === "select") {
-    const rowIdx =
-      typeof data.payload?.index === "number" ? data.payload.index : -1;
+    const rowIdx = typeof data.payload?.index === "number"
+      ? data.payload.index
+      : -1;
     if (rowIdx < 0) return;
     const itemIdx = selectedRowToItemIndex(rowIdx);
     if (itemIdx < 0) return; // selection landed on a section header
@@ -2669,8 +2968,16 @@ editor.on("widget_event", (data) => {
     // the list itself is already updated by the host (we don't
     // need to call renderPkgList again).
     if (pkgState.groupId !== null) {
-      editor.setPanelContent(pkgState.groupId, "header", buildPkgHeaderEntries());
-      editor.setPanelContent(pkgState.groupId, "detail", buildPkgDetailEntries());
+      editor.setPanelContent(
+        pkgState.groupId,
+        "header",
+        buildPkgHeaderEntries(),
+      );
+      editor.setPanelContent(
+        pkgState.groupId,
+        "detail",
+        buildPkgDetailEntries(),
+      );
     }
     renderPkgFooter();
     return;
@@ -2681,7 +2988,7 @@ editor.on("widget_event", (data) => {
   }
 });
 
-function pkg_next_button() : void {
+function pkg_next_button(): void {
   if (!pkgState.isOpen) return;
 
   const order = getFocusOrder();
@@ -2692,7 +2999,7 @@ function pkg_next_button() : void {
 }
 registerHandler("pkg_next_button", pkg_next_button);
 
-function pkg_prev_button() : void {
+function pkg_prev_button(): void {
   if (!pkgState.isOpen) return;
 
   const order = getFocusOrder();
@@ -2703,14 +3010,21 @@ function pkg_prev_button() : void {
 }
 registerHandler("pkg_prev_button", pkg_prev_button);
 
-async function pkg_activate() : Promise<void> {
+async function pkg_activate(): Promise<void> {
   if (!pkgState.isOpen) return;
 
   const focus = pkgState.focus;
 
   // Handle filter button activation
   if (focus.type === "filter") {
-    const filters = ["all", "installed", "plugins", "themes", "languages", "bundles"] as const;
+    const filters = [
+      "all",
+      "installed",
+      "plugins",
+      "themes",
+      "languages",
+      "bundles",
+    ] as const;
     pkgState.filter = filters[focus.index];
     pkgState.selectedIndex = 0;
     pkgState.items = buildPackageList();
@@ -2770,11 +3084,18 @@ async function pkg_activate() : Promise<void> {
       await removePackage(item.installedPackage);
       pkgState.items = buildPackageList();
       const newItems = getFilteredItems();
-      pkgState.selectedIndex = Math.min(pkgState.selectedIndex, Math.max(0, newItems.length - 1));
+      pkgState.selectedIndex = Math.min(
+        pkgState.selectedIndex,
+        Math.max(0, newItems.length - 1),
+      );
       pkgState.focus = { type: "list" };
       updatePkgManagerView();
     } else if (actionName === "Install" && item.registryEntry) {
-      await installPackage(item.registryEntry.repository, item.name, item.packageType);
+      await installPackage(
+        item.registryEntry.repository,
+        item.name,
+        item.packageType,
+      );
       pkgState.items = buildPackageList();
       updatePkgManagerView();
     }
@@ -2782,7 +3103,7 @@ async function pkg_activate() : Promise<void> {
 }
 registerHandler("pkg_activate", pkg_activate);
 
-function pkg_back_or_close() : void {
+function pkg_back_or_close(): void {
   if (!pkgState.isOpen) return;
 
   // If focus is on action buttons, go back to list
@@ -2797,31 +3118,33 @@ function pkg_back_or_close() : void {
 }
 registerHandler("pkg_back_or_close", pkg_back_or_close);
 
-function pkg_scroll_up() : void {
+function pkg_scroll_up(): void {
   // Just move cursor up in detail view
   editor.executeAction("move_up");
 }
 registerHandler("pkg_scroll_up", pkg_scroll_up);
 
-function pkg_scroll_down() : void {
+function pkg_scroll_down(): void {
   // Just move cursor down in detail view
   editor.executeAction("move_down");
 }
 registerHandler("pkg_scroll_down", pkg_scroll_down);
 
-function pkg_search() : void {
+function pkg_search(): void {
   if (!pkgState.isOpen) return;
 
   // Pre-fill with current search query so typing replaces it
   if (pkgState.searchQuery) {
-    editor.startPromptWithInitial("Search packages: ", "pkg-search", pkgState.searchQuery);
+    editor.startPromptWithInitial(
+      "Search packages: ",
+      "pkg-search",
+      pkgState.searchQuery,
+    );
   } else {
     editor.startPrompt("Search packages: ", "pkg-search");
   }
 }
 registerHandler("pkg_search", pkg_search);
-
-
 
 editor.on("prompt_confirmed", (args) => {
   if (args.prompt_type !== "pkg-search") return true;
@@ -2833,7 +3156,6 @@ editor.on("prompt_confirmed", (args) => {
 
   return true;
 });
-
 
 editor.on("resize", () => {
   if (!pkgState.isOpen) return;
@@ -2850,13 +3172,13 @@ const registryFinder = new Finder<[string, RegistryEntry]>(editor, {
   format: ([name, entry]) => ({
     label: name,
     description: entry.description,
-    metadata: { name, entry }
+    metadata: { name, entry },
   }),
   preview: false,
   maxResults: 100,
   onSelect: async ([name, entry]) => {
     await installPackage(entry.repository, name, "plugin");
-  }
+  },
 });
 
 // =============================================================================
@@ -2866,14 +3188,18 @@ const registryFinder = new Finder<[string, RegistryEntry]>(editor, {
 /**
  * Browse and install plugins from registry
  */
-async function pkg_install_plugin() : Promise<void> {
+async function pkg_install_plugin(): Promise<void> {
   editor.debug("[pkg] pkg_install_plugin called");
   try {
     // Always sync registry to ensure latest plugins are available
     await syncRegistry();
 
     const registry = loadRegistry("plugins");
-    editor.debug(`[pkg] loaded registry with ${Object.keys(registry.packages).length} packages`);
+    editor.debug(
+      `[pkg] loaded registry with ${
+        Object.keys(registry.packages).length
+      } packages`,
+    );
     const entries = Object.entries(registry.packages);
     editor.debug(`[pkg] entries.length = ${entries.length}`);
 
@@ -2889,8 +3215,8 @@ async function pkg_install_plugin() : Promise<void> {
       title: "Install Plugin:",
       source: {
         mode: "filter",
-        load: async () => entries
-      }
+        load: async () => entries,
+      },
     });
   } catch (e) {
     editor.debug(`[pkg] Error in pkg_install_plugin: ${e}`);
@@ -2902,14 +3228,18 @@ registerHandler("pkg_install_plugin", pkg_install_plugin);
 /**
  * Browse and install themes from registry
  */
-async function pkg_install_theme() : Promise<void> {
+async function pkg_install_theme(): Promise<void> {
   editor.debug("[pkg] pkg_install_theme called");
   try {
     // Always sync registry to ensure latest themes are available
     await syncRegistry();
 
     const registry = loadRegistry("themes");
-    editor.debug(`[pkg] loaded registry with ${Object.keys(registry.packages).length} themes`);
+    editor.debug(
+      `[pkg] loaded registry with ${
+        Object.keys(registry.packages).length
+      } themes`,
+    );
     const entries = Object.entries(registry.packages);
 
     if (entries.length === 0) {
@@ -2921,8 +3251,8 @@ async function pkg_install_theme() : Promise<void> {
       title: "Install Theme:",
       source: {
         mode: "filter",
-        load: async () => entries
-      }
+        load: async () => entries,
+      },
     });
   } catch (e) {
     editor.debug(`[pkg] Error in pkg_install_theme: ${e}`);
@@ -2934,12 +3264,10 @@ registerHandler("pkg_install_theme", pkg_install_theme);
 /**
  * Install from git URL, direct file URL, or local path
  */
-function pkg_install_url() : void {
+function pkg_install_url(): void {
   editor.startPrompt("Git URL or local path:", "pkg-install-url");
 }
 registerHandler("pkg_install_url", pkg_install_url);
-
-
 
 editor.on("prompt_confirmed", async (args) => {
   if (args.prompt_type !== "pkg-install-url") return true;
@@ -2957,7 +3285,7 @@ editor.on("prompt_confirmed", async (args) => {
 /**
  * Open the package manager UI
  */
-async function pkg_list() : Promise<void> {
+async function pkg_list(): Promise<void> {
   await openPackageManager();
 }
 registerHandler("pkg_list", pkg_list);
@@ -2965,7 +3293,7 @@ registerHandler("pkg_list", pkg_list);
 /**
  * Update all packages
  */
-async function pkg_update_all() : Promise<void> {
+async function pkg_update_all(): Promise<void> {
   await updateAllPackages();
 }
 registerHandler("pkg_update_all", pkg_update_all);
@@ -2973,7 +3301,7 @@ registerHandler("pkg_update_all", pkg_update_all);
 /**
  * Update a specific package
  */
-function pkg_update() : void {
+function pkg_update(): void {
   const plugins = getInstalledPackages("plugin");
   const themes = getInstalledPackages("theme");
   const all = [...plugins, ...themes];
@@ -2987,8 +3315,10 @@ function pkg_update() : void {
     id: "pkg-update",
     format: (pkg) => ({
       label: pkg.name,
-      description: `${pkg.type} | ${pkg.version}${pkg.localSource ? " (local)" : ""}`,
-      metadata: pkg
+      description: `${pkg.type} | ${pkg.version}${
+        pkg.localSource ? " (local)" : ""
+      }`,
+      metadata: pkg,
     }),
     preview: false,
     onSelect: async (pkg) => {
@@ -2997,15 +3327,15 @@ function pkg_update() : void {
       } else {
         await updatePackage(pkg);
       }
-    }
+    },
   });
 
   finder.prompt({
     title: "Update Package:",
     source: {
       mode: "filter",
-      load: async () => all
-    }
+      load: async () => all,
+    },
   });
 }
 registerHandler("pkg_update", pkg_update);
@@ -3013,7 +3343,7 @@ registerHandler("pkg_update", pkg_update);
 /**
  * Remove a package
  */
-function pkg_remove() : void {
+function pkg_remove(): void {
   const plugins = getInstalledPackages("plugin");
   const themes = getInstalledPackages("theme");
   const all = [...plugins, ...themes];
@@ -3028,20 +3358,20 @@ function pkg_remove() : void {
     format: (pkg) => ({
       label: pkg.name,
       description: `${pkg.type} | ${pkg.version}`,
-      metadata: pkg
+      metadata: pkg,
     }),
     preview: false,
     onSelect: async (pkg) => {
       await removePackage(pkg);
-    }
+    },
   });
 
   finder.prompt({
     title: "Remove Package:",
     source: {
       mode: "filter",
-      load: async () => all
-    }
+      load: async () => all,
+    },
   });
 }
 registerHandler("pkg_remove", pkg_remove);
@@ -3049,7 +3379,7 @@ registerHandler("pkg_remove", pkg_remove);
 /**
  * Sync registry
  */
-async function pkg_sync() : Promise<void> {
+async function pkg_sync(): Promise<void> {
   await syncRegistry();
 }
 registerHandler("pkg_sync", pkg_sync);
@@ -3057,7 +3387,7 @@ registerHandler("pkg_sync", pkg_sync);
 /**
  * Show outdated packages
  */
-async function pkg_outdated() : Promise<void> {
+async function pkg_outdated(): Promise<void> {
   const plugins = getInstalledPackages("plugin");
   const themes = getInstalledPackages("theme");
   const all = [...plugins, ...themes];
@@ -3077,7 +3407,11 @@ async function pkg_outdated() : Promise<void> {
 
     // Check how many commits behind
     const result = await gitCommand([
-      "-C", `${pkg.path}`, "rev-list", "--count", "HEAD..origin/HEAD"
+      "-C",
+      `${pkg.path}`,
+      "rev-list",
+      "--count",
+      "HEAD..origin/HEAD",
     ]);
 
     const behind = parseInt(result.stdout.trim(), 10);
@@ -3096,20 +3430,20 @@ async function pkg_outdated() : Promise<void> {
     format: (item) => ({
       label: item.pkg.name,
       description: `${item.behind} commits behind`,
-      metadata: item
+      metadata: item,
     }),
     preview: false,
     onSelect: async (item) => {
       await updatePackage(item.pkg);
-    }
+    },
   });
 
   finder.prompt({
     title: `Outdated Packages (${outdated.length}):`,
     source: {
       mode: "filter",
-      load: async () => outdated
-    }
+      load: async () => outdated,
+    },
   });
 }
 registerHandler("pkg_outdated", pkg_outdated);
@@ -3117,7 +3451,7 @@ registerHandler("pkg_outdated", pkg_outdated);
 /**
  * Generate lockfile
  */
-async function pkg_lock() : Promise<void> {
+async function pkg_lock(): Promise<void> {
   await generateLockfile();
 }
 registerHandler("pkg_lock", pkg_lock);
@@ -3125,7 +3459,7 @@ registerHandler("pkg_lock", pkg_lock);
 /**
  * Install from lockfile
  */
-async function pkg_install_lock() : Promise<void> {
+async function pkg_install_lock(): Promise<void> {
   await installFromLockfile();
 }
 registerHandler("pkg_install_lock", pkg_install_lock);
@@ -3138,7 +3472,12 @@ registerHandler("pkg_install_lock", pkg_install_lock);
 editor.registerCommand("%cmd.list", "%cmd.list_desc", "pkg_list", null);
 
 // Install from URL - for packages not in registry
-editor.registerCommand("%cmd.install_url", "%cmd.install_url_desc", "pkg_install_url", null);
+editor.registerCommand(
+  "%cmd.install_url",
+  "%cmd.install_url_desc",
+  "pkg_install_url",
+  null,
+);
 
 // Note: Other commands (install_plugin, install_theme, update, remove, sync, etc.)
 // are available via the package manager UI and don't need global command palette entries.

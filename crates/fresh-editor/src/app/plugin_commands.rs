@@ -1835,16 +1835,17 @@ impl Editor {
         self.persist_plugin_global_state(&plugin_name);
     }
 
-    /// Set per-session state on the **active** session. Mirrors
+    /// Set per-session state on one exact session. Mirrors
     /// `handle_set_global_state` semantics: `None` deletes,
     /// per-plugin namespacing, empty map drops the plugin entry.
     pub(super) fn handle_set_session_state(
         &mut self,
+        window_id: fresh_core::WindowId,
         plugin_name: String,
         key: String,
         value: Option<serde_json::Value>,
     ) {
-        let id = self.active_window;
+        let id = window_id;
         let Some(session) = self.windows.get_mut(&id) else {
             return;
         };

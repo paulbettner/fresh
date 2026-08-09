@@ -10,6 +10,7 @@ use fresh::services::remote::{
 use proptest::prelude::*;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,12 +25,18 @@ struct AgentHarness {
 
 impl AgentHarness {
     fn new() -> Option<Self> {
+        Self::new_with_home_setup(|_| {})
+    }
+
+    fn new_with_home_setup(setup: impl FnOnce(&Path)) -> Option<Self> {
         let temp_dir = tempfile::tempdir().ok()?;
+        setup(temp_dir.path());
 
         let mut child = Command::new("python3")
             .arg("-u")
             .arg("-c")
             .arg(AGENT_SOURCE)
+            .env("HOME", temp_dir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -47,7 +54,6 @@ impl AgentHarness {
             temp_dir,
         };
 
-        // Read ready message
         let ready = harness.read_response()?;
         if !ready.is_ready() {
             return None;
@@ -172,12 +178,107 @@ impl AgentHarness {
             .as_str()
             .map(|s: &str| s.to_string())
     }
+
+    fn info(&mut self) -> Option<AgentResponse> {
+        self.send_request("info", serde_json::json!({}))
+    }
 }
 
 impl Drop for AgentHarness {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+#[test]
+fn tenant_anchor_is_exactly_32_bytes_and_stable() {
+    let Some(mut harness) = AgentHarness::new() else {
+        eprintln!("Skipping test: Python3 not available");
+        return;
+    };
+
+    let first = harness
+        .info()
+        .and_then(|response| response.result)
+        .and_then(|result| {
+            result
+                .get("tenant_anchor")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .expect("agent info returns a tenant anchor digest");
+    let second = harness
+        .info()
+        .and_then(|response| response.result)
+        .and_then(|result| {
+            result
+                .get("tenant_anchor")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .expect("second info returns a tenant anchor digest");
+    let anchor = harness
+        .temp_dir
+        .path()
+        .join(".cache/fresh/tenant-anchor-v1");
+
+    assert_eq!(std::fs::read(anchor).unwrap().len(), 32);
+    assert_eq!(first.len(), 64);
+    assert_eq!(first, second, "the durable anchor identity is stable");
+}
+
+#[test]
+fn invalid_existing_tenant_anchor_is_rejected_without_replacement() {
+    let Some(mut harness) = AgentHarness::new_with_home_setup(|home| {
+        let dir = home.join(".cache/fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tenant-anchor-v1"), b"short").unwrap();
+    }) else {
+        eprintln!("Skipping test: Python3 not available");
+        return;
+    };
+
+    let response = harness.info().expect("agent answers info request");
+    assert!(
+        response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("exactly 32 bytes")),
+        "invalid durable identity must be rejected: {:?}",
+        response.error
+    );
+    assert_eq!(
+        std::fs::read(
+            harness
+                .temp_dir
+                .path()
+                .join(".cache/fresh/tenant-anchor-v1")
+        )
+        .unwrap(),
+        b"short"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rm_unlinks_a_symlink_without_removing_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let Some(mut harness) = AgentHarness::new() else {
+        eprintln!("Skipping test: Python3 not available");
+        return;
+    };
+    let target = harness.temp_dir.path().join("target.txt");
+    let link = harness.temp_dir.path().join("link.txt");
+    std::fs::write(&target, b"keep me").unwrap();
+    symlink(&target, &link).unwrap();
+
+    let response = harness
+        .rm(link.to_str().unwrap())
+        .expect("agent answers rm request");
+    assert!(response.error.is_none(), "rm failed: {:?}", response.error);
+    assert_eq!(std::fs::read(target).unwrap(), b"keep me");
+    assert!(std::fs::symlink_metadata(link).is_err());
 }
 
 // ============================================================================

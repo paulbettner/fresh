@@ -51,6 +51,7 @@ pub mod load_from_buffer;
 pub mod lsp_find_references;
 pub mod lsp_navigation;
 pub mod markdown_source;
+pub mod orchestrator_async_create;
 pub mod orchestrator_attach_worktree;
 pub mod orchestrator_new_dialog;
 pub mod orchestrator_new_session_renders;

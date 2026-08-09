@@ -354,10 +354,11 @@ fn test_lsp_rename_undo_restores_all() {
         change_annotations: None,
     };
 
+    let source_window = harness.editor().active_window_id();
     // Call handle_rename_response directly to simulate LSP rename response
     harness
         .editor_mut()
-        .handle_rename_response(1, Ok(workspace_edit))
+        .handle_rename_response(source_window, 1, Ok(workspace_edit))
         .unwrap();
     harness.render().unwrap();
 

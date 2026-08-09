@@ -247,10 +247,14 @@ fn test_orchestrator_session_prompts_then_activates_venv() {
             // A harmless long-running child so the PTY doesn't exit immediately.
             Some(vec!["sh".into(), "-c".into(), "sleep 60".into()]),
             None,
+            None,
             born,
             None,
             None,
             false,
+            None,
+            true,
+            true,
             None,
         )
         .expect("create orchestrator session window");

@@ -96,7 +96,7 @@ Main editor thread                    Plugin thread (QuickJS)
 run_hook(name, args)  ──RunHook──►    handler(args) executes
                                        │ editor.insertText(...)  etc.
                        ◄─PluginCommand─┤  (queued back)
-process_commands()                     │
+process_command_envelopes()            │
 drains next frame    ◄─HookCompleted───┘  sentinel
 ```
 

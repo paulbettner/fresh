@@ -11,9 +11,8 @@
 //!     directory ever opened. Each carries that window's identity
 //!     (`label`, `session_plugin_state`) plus its buffer/split
 //!     layout. [`discover_sessions`] scans this directory at boot,
-//!     garbage-collects entries whose directory no longer exists,
-//!     and returns one [`PersistedWindow`] per survivor (ids
-//!     assigned by sorted canonical root for run-to-run stability).
+//!     garbage-collects dead local entries, migrates legacy filenames to
+//!     exact stable-id paths, and returns one window per durable identity.
 //!
 //!   - `<data_dir>/orchestrator/state/<plugin>.json` — editor-wide
 //!     plugin global state, one file per plugin (not per-project).
@@ -49,7 +48,8 @@
 //! re-warming on first dive is fast enough.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::Editor;
@@ -90,10 +90,9 @@ pub(crate) struct PersistedWindow {
     #[serde(default, skip_serializing_if = "is_local_authority_spec")]
     pub(crate) authority_spec: crate::services::authority::SessionAuthoritySpec,
     /// Durable workspace identity carried in the workspace file
-    /// (`Workspace::stable_id`). `None` for legacy files that predate
-    /// stable ids — the window mints one and the next save re-keys the
-    /// file. Threaded into the window shell at boot so identity survives
-    /// even before the shell materializes.
+    /// (`Workspace::stable_id`). Discovery publishes legacy files under an
+    /// exact stable-id path before returning them, so restored windows always
+    /// carry `Some` even though the optional shape remains for old envelopes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stable_id: Option<String>,
 }
@@ -205,17 +204,186 @@ fn workspace_file_for(data_dir: &Path, root: &Path) -> PathBuf {
     workspaces_dir(data_dir).join(filename)
 }
 
+fn workspace_file_for_id(data_dir: &Path, root: &Path, stable_id: &str) -> PathBuf {
+    let safe_id: String = stable_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    workspaces_dir(data_dir).join(format!(
+        "{}.{}.json",
+        crate::workspace::encode_path_for_filename(&canonical_key(root)),
+        safe_id
+    ))
+}
+
+fn authority_identity_key(spec: &crate::services::authority::SessionAuthoritySpec) -> String {
+    use crate::services::authority::SessionAuthoritySpec;
+
+    match spec {
+        SessionAuthoritySpec::Local => "local".to_string(),
+        SessionAuthoritySpec::RemoteAgent(agent) => match agent.verified_identity() {
+            Some(identity) => format!(
+                "remote-tenant:{}:{}",
+                identity.anchor.digest,
+                identity.canonical_root.to_string_lossy()
+            ),
+            None => format!(
+                "remote-transport:{}",
+                serde_json::to_string(&agent.transport)
+                    .expect("remote transport persistence is serializable")
+            ),
+        },
+        SessionAuthoritySpec::Plugin(payload) => format!(
+            "plugin:{}",
+            serde_json::to_string(payload).expect("plugin authority persistence is serializable")
+        ),
+    }
+}
+
+fn deterministic_legacy_stable_id(
+    source: &Path,
+    root: &Path,
+    authority_spec: &crate::services::authority::SessionAuthoritySpec,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"fresh-legacy-workspace-v1\0");
+    hasher.update(source.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(canonical_key(root).to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(authority_identity_key(authority_spec).as_bytes());
+    let digest = hasher.finalize();
+    let mut id = String::with_capacity(10 + digest.len() * 2);
+    id.push_str("ws-legacy-");
+    for byte in digest {
+        write!(&mut id, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    id
+}
+fn deterministic_conflict_stable_id(
+    stable_id: &str,
+    root: &Path,
+    authority_key: &str,
+    nonce: u32,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"fresh-conflicting-workspace-id-v1\0");
+    hasher.update(stable_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(canonical_key(root).to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(authority_key.as_bytes());
+    hasher.update(nonce.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut id = String::with_capacity(12 + digest.len() * 2);
+    id.push_str("ws-conflict-");
+    for byte in digest {
+        write!(&mut id, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    id
+}
+
+fn persisted_workspace_matches(
+    value: &serde_json::Value,
+    stable_id: &str,
+    root: &Path,
+    authority_spec: &crate::services::authority::SessionAuthoritySpec,
+) -> bool {
+    if value.get("stable_id").and_then(|id| id.as_str()) != Some(stable_id) {
+        return false;
+    }
+    let Some(saved_root) = value
+        .get("working_dir")
+        .and_then(|saved| saved.as_str())
+        .map(PathBuf::from)
+    else {
+        return false;
+    };
+    let saved_authority = value
+        .get("authority_spec")
+        .and_then(|saved| serde_json::from_value(saved.clone()).ok())
+        .unwrap_or_default();
+    canonical_key(&saved_root) == canonical_key(root)
+        && authority_identity_key(&saved_authority) == authority_identity_key(authority_spec)
+}
+
+fn adopt_workspace_file(
+    filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
+    data_dir: &Path,
+    source: &Path,
+    value: &mut serde_json::Value,
+    root: &Path,
+    authority_spec: &crate::services::authority::SessionAuthoritySpec,
+    stable_id: String,
+) -> Option<String> {
+    let destination = workspace_file_for_id(data_dir, root, &stable_id);
+    if source == destination {
+        return persisted_workspace_matches(value, &stable_id, root, authority_spec)
+            .then_some(stable_id);
+    }
+    let source_saved_at = value.get("saved_at").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let destination_value = filesystem
+        .read_file(&destination)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    if filesystem.exists(&destination) {
+        let Some(existing) = destination_value.as_ref() else {
+            return None;
+        };
+        if !persisted_workspace_matches(existing, &stable_id, root, authority_spec) {
+            return None;
+        }
+        let destination_saved_at = existing
+            .get("saved_at")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if destination_saved_at >= source_saved_at {
+            let _ = filesystem.remove_file(source).ok();
+            return Some(stable_id);
+        }
+    }
+
+    value.as_object_mut()?.insert(
+        "stable_id".into(),
+        serde_json::Value::String(stable_id.clone()),
+    );
+    let output = serde_json::to_vec_pretty(value).ok()?;
+    filesystem.write_file(&destination, &output).ok()?;
+    let published = filesystem
+        .read_file(&destination)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())?;
+    if !persisted_workspace_matches(&published, &stable_id, root, authority_spec) {
+        return None;
+    }
+    let _ = filesystem.remove_file(source).ok();
+    Some(stable_id)
+}
+
 fn basename_label(root: &Path) -> String {
     root.file_name()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
+        .map(str::to_owned)
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
-/// One session per existing directory: scan the workspace-file cache,
-/// garbage-collect entries whose directory no longer exists, and return
-/// one `PersistedWindow` per survivor. Ids are assigned by sorted
-/// canonical root so they stay stable across runs for a stable dir set.
+/// Scan the workspace cache, garbage-collect definitively dead local roots,
+/// and return one session per durable workspace identity. Legacy files are
+/// first published under an exact stable-id path so restore never has to guess
+/// among co-tenant local and remote sessions that share a textual root.
 fn discover_sessions(
     filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
     data_dir: &Path,
@@ -223,23 +391,39 @@ fn discover_sessions(
     type SessionState = HashMap<String, HashMap<String, serde_json::Value>>;
     let dir = workspaces_dir(data_dir);
     tracing::debug!(dir = %dir.display(), "discover_sessions: read_dir");
-    let entries = match filesystem.read_dir(&dir) {
+    let mut entries = match filesystem.read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
     tracing::debug!(
         count = entries.len(),
         "discover_sessions: read_dir returned"
     );
-    struct Candidate {
+    struct PendingCandidate {
+        source: PathBuf,
+        value: serde_json::Value,
         root: PathBuf,
+        root_key: PathBuf,
         label: String,
         plugin_state: SessionState,
         authority_spec: crate::services::authority::SessionAuthoritySpec,
-        stable_id: Option<String>,
+        authority_key: String,
+        desired_stable_id: String,
+        exact_identity_path: bool,
         saved_at: u64,
     }
-    let mut found: Vec<Candidate> = Vec::new();
+    struct Candidate {
+        root: PathBuf,
+        root_key: PathBuf,
+        label: String,
+        plugin_state: SessionState,
+        authority_spec: crate::services::authority::SessionAuthoritySpec,
+        authority_key: String,
+        stable_id: String,
+        saved_at: u64,
+    }
+    let mut pending: Vec<PendingCandidate> = Vec::new();
     for entry in entries {
         let p = &entry.path;
         // Only real workspace files. A torn `*.json.tmp` write or a
@@ -295,82 +479,145 @@ fn discover_sessions(
                 Err(_) => continue,
             }
         }
+        let desired_stable_id = val
+            .get("stable_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| deterministic_legacy_stable_id(p, &root, &authority_spec));
+        let authority_key = authority_identity_key(&authority_spec);
         let label = val
             .get("label")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(str::to_owned)
             .unwrap_or_else(|| basename_label(&root));
         let plugin_state: SessionState = val
             .get("session_plugin_state")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        found.push(Candidate {
+        let exact_identity_path = p == &workspace_file_for_id(data_dir, &root, &desired_stable_id);
+        pending.push(PendingCandidate {
+            source: p.clone(),
+            root_key: canonical_key(&root),
             root,
             label,
             plugin_state,
             authority_spec,
-            stable_id: val
-                .get("stable_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
+            authority_key,
+            desired_stable_id,
+            exact_identity_path,
             saved_at: val.get("saved_at").and_then(|v| v.as_u64()).unwrap_or(0),
+            value: val,
         });
     }
-    // Session identity is the durable `stable_id`, not the directory: several
-    // workspaces may co-tenant one root (a tab extracted into its own window
-    // over the same project), each its own on-disk `<root>.<id>.json`. So dedup
-    // by `stable_id` — each id is one session — with two files sharing an id
-    // (a mid-rekey window) resolved to the freshest. Id-less *legacy* files map
-    // to their root instead; a legacy file is the pre-migration copy a window
-    // adopts and re-keys, so it is suppressed once ANY id-keyed file claims the
-    // same root, while an un-migrated root keeps its single legacy session.
-    let mut by_id: std::collections::BTreeMap<String, Candidate> =
+    // A workspace id is the public durable identity consumed throughout the
+    // editor, so it must remain globally unique even when two authorities
+    // arrive with the same persisted id. Sort first so an already-canonical
+    // path keeps its id; otherwise authority/root/path order deterministically
+    // chooses the keeper. Every other authority claim receives a deterministic
+    // scalar replacement and is republished under that identity.
+    pending.sort_by(|a, b| {
+        a.desired_stable_id
+            .cmp(&b.desired_stable_id)
+            .then_with(|| b.exact_identity_path.cmp(&a.exact_identity_path))
+            .then_with(|| a.authority_key.cmp(&b.authority_key))
+            .then_with(|| a.root_key.cmp(&b.root_key))
+            .then_with(|| a.source.cmp(&b.source))
+    });
+    let mut reserved_ids: HashSet<String> = pending
+        .iter()
+        .map(|candidate| candidate.desired_stable_id.clone())
+        .collect();
+    let mut original_claimed: HashSet<String> = HashSet::new();
+    let mut assigned_claims: std::collections::BTreeMap<(String, String), String> =
         std::collections::BTreeMap::new();
-    let mut legacy_by_root: std::collections::BTreeMap<PathBuf, Candidate> =
-        std::collections::BTreeMap::new();
-    let mut roots_with_id: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for c in found {
-        match c.stable_id.clone() {
-            Some(id) => {
-                roots_with_id.insert(canonical_key(&c.root));
-                match by_id.get(&id) {
-                    Some(cur) if cur.saved_at >= c.saved_at => {
-                        tracing::info!(
-                            root = %c.root.display(),
-                            "discover_sessions: skipping stale same-id duplicate"
-                        );
-                    }
-                    _ => {
-                        by_id.insert(id, c);
-                    }
+    let mut found: Vec<Candidate> = Vec::new();
+    for mut candidate in pending {
+        let claim = (
+            candidate.desired_stable_id.clone(),
+            candidate.authority_key.clone(),
+        );
+        let assigned_stable_id = if let Some(existing) = assigned_claims.get(&claim) {
+            existing.clone()
+        } else if original_claimed.insert(candidate.desired_stable_id.clone()) {
+            assigned_claims.insert(claim, candidate.desired_stable_id.clone());
+            candidate.desired_stable_id.clone()
+        } else {
+            let mut nonce = 0;
+            let minted = loop {
+                let id = deterministic_conflict_stable_id(
+                    &candidate.desired_stable_id,
+                    &candidate.root,
+                    &candidate.authority_key,
+                    nonce,
+                );
+                if reserved_ids.insert(id.clone()) {
+                    break id;
                 }
+                nonce = nonce
+                    .checked_add(1)
+                    .expect("workspace identity collision nonce exhausted");
+            };
+            tracing::warn!(
+                stable_id = %candidate.desired_stable_id,
+                replacement = %minted,
+                authority = %candidate.authority_key,
+                "discover_sessions: replacing cross-authority duplicate workspace identity"
+            );
+            assigned_claims.insert(claim, minted.clone());
+            minted
+        };
+        let Some(stable_id) = adopt_workspace_file(
+            filesystem,
+            data_dir,
+            &candidate.source,
+            &mut candidate.value,
+            &candidate.root,
+            &candidate.authority_spec,
+            assigned_stable_id,
+        ) else {
+            tracing::warn!(
+                path = %candidate.source.display(),
+                "discover_sessions: refusing workspace whose exact stable identity could not be published"
+            );
+            continue;
+        };
+        found.push(Candidate {
+            root: candidate.root,
+            root_key: candidate.root_key,
+            label: candidate.label,
+            plugin_state: candidate.plugin_state,
+            authority_spec: candidate.authority_spec,
+            authority_key: candidate.authority_key,
+            stable_id,
+            saved_at: candidate.saved_at,
+        });
+    }
+
+    // Resolve duplicate exact identities to the freshest snapshot. The public
+    // scalar id is now globally unique across authorities, so no composite key
+    // leaks into the rest of the editor.
+    let mut by_identity: std::collections::BTreeMap<String, Candidate> =
+        std::collections::BTreeMap::new();
+    for candidate in found {
+        let key = candidate.stable_id.clone();
+        match by_identity.get(&key) {
+            Some(current) if current.saved_at >= candidate.saved_at => {
+                tracing::info!(
+                    root = %candidate.root.display(),
+                    "discover_sessions: skipping stale same-identity duplicate"
+                );
             }
-            None => {
-                let key = canonical_key(&c.root);
-                match legacy_by_root.get(&key) {
-                    Some(cur) if cur.saved_at >= c.saved_at => {}
-                    _ => {
-                        legacy_by_root.insert(key, c);
-                    }
-                }
+            _ => {
+                by_identity.insert(key, candidate);
             }
         }
     }
-    // Emit id-bearing sessions plus legacy sessions whose root has not been
-    // migrated. Sort by (canonical root, stable id) so window ids are stable
-    // across boots and co-tenants stay grouped by their shared root.
-    let mut sessions: Vec<Candidate> = by_id
-        .into_values()
-        .chain(
-            legacy_by_root
-                .into_iter()
-                .filter(|(root, _)| !roots_with_id.contains(root))
-                .map(|(_, c)| c),
-        )
-        .collect();
+    let mut sessions: Vec<Candidate> = by_identity.into_values().collect();
     sessions.sort_by(|a, b| {
-        canonical_key(&a.root)
-            .cmp(&canonical_key(&b.root))
+        a.root_key
+            .cmp(&b.root_key)
+            .then_with(|| a.authority_key.cmp(&b.authority_key))
             .then_with(|| a.stable_id.cmp(&b.stable_id))
     });
     sessions
@@ -386,7 +633,7 @@ fn discover_sessions(
                 shared_worktree,
                 authority_spec: c.authority_spec,
                 plugin_state: c.plugin_state,
-                stable_id: c.stable_id,
+                stable_id: Some(c.stable_id),
             }
         })
         .collect()
@@ -933,6 +1180,122 @@ fn migrate_legacy_plugin_state(
     );
 }
 
+fn unique_plugin_state_temp(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("plugin-state.json");
+    path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("persistence path has no parent directory"))?;
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        // `replace_plugin_state_temp` uses MOVEFILE_WRITE_THROUGH, Windows'
+        // durable-publication boundary for a renamed directory entry.
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_plugin_state_temp(
+    filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
+    temp: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    filesystem.rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_plugin_state_temp(
+    _filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
+    temp: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn persist_plugin_global_state_transaction(
+    filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
+    data_dir: &Path,
+    plugin: &str,
+    dirty: &HashSet<String>,
+    memory: Option<&HashMap<String, serde_json::Value>>,
+    after_read: impl FnOnce(),
+) -> io::Result<()> {
+    let state_dir = global_state_dir(data_dir);
+    filesystem.create_dir_all(&state_dir)?;
+
+    let path = global_plugin_state_path(data_dir, plugin);
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    lock_file.lock()?;
+
+    let mut merged: HashMap<String, serde_json::Value> = match filesystem.read_file(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(error),
+    };
+    after_read();
+
+    for key in dirty {
+        match memory.and_then(|values| values.get(key)) {
+            Some(value) => {
+                merged.insert(key.clone(), value.clone());
+            }
+            None => {
+                merged.remove(key);
+            }
+        }
+    }
+
+    let bytes = serde_json::to_vec_pretty(&merged).map_err(io::Error::other)?;
+    let temp = unique_plugin_state_temp(&path);
+    let publication = (|| -> io::Result<()> {
+        let mut writer = filesystem.create_file(&temp)?;
+        writer.write_all(&bytes)?;
+        writer.sync_all()?;
+        drop(writer);
+        replace_plugin_state_temp(filesystem, &temp, &path)?;
+        sync_parent_directory(&path)
+    })();
+    if publication.is_err() {
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = filesystem.remove_file(&temp);
+    }
+    publication
+}
 impl Editor {
     /// Persist `sessions` + `plugin_global_state` to disk. Best-
     /// effort: filesystem errors are logged at WARN and swallowed
@@ -957,8 +1320,10 @@ impl Editor {
         }
     }
 
-    /// Flush one plugin's locally-changed global-state keys (atomic
-    /// tmp+rename). Called eagerly from `handle_set_global_state` on every
+    /// Flush one plugin's locally-changed global-state keys through the host
+    /// filesystem under a per-plugin interprocess lock. Publication uses a
+    /// unique same-directory temp, file sync, atomic rename, and parent sync.
+    /// Called eagerly from `handle_set_global_state` on every
     /// mutation — not just at clean quit — so a killed or crashed editor
     /// doesn't forget editor-global plugin state (e.g. the Orchestrator
     /// dock's folders and session→folder assignments; issue #2703). Mirrors
@@ -984,71 +1349,38 @@ impl Editor {
             );
             return;
         }
-        let Some(dirty) = self.plugin_global_dirty.get(plugin) else {
+        let Some(dirty) = self.plugin_global_dirty.get(plugin).cloned() else {
             return;
         };
         if dirty.is_empty() {
             return;
         }
-        let data_dir = self.dir_context.data_dir.clone();
-        // Plugin global state — one file per plugin. Single global
-        // directory (no per-cwd split), so two editor processes writing
-        // the same plugin's state still need atomic-rename safety.
-        let state_dir = global_state_dir(&data_dir);
-        if let Err(e) = self.authority().filesystem.create_dir_all(&state_dir) {
-            tracing::warn!("orchestrator persistence: failed to create {state_dir:?}: {e}");
+
+        let result = persist_plugin_global_state_transaction(
+            self.local_filesystem.as_ref(),
+            &self.dir_context.data_dir,
+            plugin,
+            &dirty,
+            self.plugin_global_state.get(plugin),
+            || {},
+        );
+        if let Err(error) = result {
+            tracing::warn!(
+                "orchestrator persistence: failed to persist plugin {plugin:?}: {error}"
+            );
             return;
         }
-        // Merge base: the file's current content. Absent → empty; unparseable
-        // → warn and start empty (the boot loader skips such files too).
-        let path = global_plugin_state_path(&data_dir, plugin);
-        let mut merged: HashMap<String, serde_json::Value> =
-            match self.authority().filesystem.read_file(&path) {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(map) => map,
-                    Err(e) => {
-                        tracing::warn!(
-                            "orchestrator persistence: failed to parse {path:?}, rewriting: {e}"
-                        );
-                        HashMap::new()
-                    }
-                },
-                Err(_) => HashMap::new(),
-            };
-        let mem = self.plugin_global_state.get(plugin);
-        for key in dirty {
-            match mem.and_then(|m| m.get(key)) {
-                Some(v) => {
-                    merged.insert(key.clone(), v.clone());
-                }
-                None => {
-                    merged.remove(key);
-                }
+
+        let remove_slot = if let Some(current) = self.plugin_global_dirty.get_mut(plugin) {
+            for key in &dirty {
+                current.remove(key);
             }
-        }
-        match serde_json::to_vec_pretty(&merged) {
-            Ok(bytes) => {
-                let tmp = path.with_extension("json.tmp");
-                if let Err(e) = self.authority().filesystem.write_file(&tmp, &bytes) {
-                    tracing::warn!("orchestrator persistence: failed to write {tmp:?}: {e}");
-                    return;
-                }
-                if let Err(e) = self.authority().filesystem.rename(&tmp, &path) {
-                    tracing::warn!(
-                        "orchestrator persistence: failed to rename {tmp:?} → {path:?}: {e}"
-                    );
-                    return;
-                }
-                // Flushed: these keys are on disk now. Clearing them keeps a
-                // later flush from re-imposing old values over a concurrent
-                // instance's newer write of the same key.
-                self.plugin_global_dirty.remove(plugin);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "orchestrator persistence: failed to serialise plugin {plugin}: {e}"
-                );
-            }
+            current.is_empty()
+        } else {
+            false
+        };
+        if remove_slot {
+            self.plugin_global_dirty.remove(plugin);
         }
     }
 }
@@ -1076,13 +1408,19 @@ fn read_orch_session_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    use crate::config_io::DirectoryContext;
 
     #[test]
     fn paths_live_under_data_dir_not_working_dir() {
         // Regression test for issue #1991: orchestrator persistence
         // must never write inside the user's working tree.
-        let data_dir = Path::new("/tmp/fresh-data");
-        let working_dir = Path::new("/home/user/project");
+        let temp = tempfile::tempdir().unwrap();
+        let context = DirectoryContext::for_testing(temp.path());
+        let data_dir = context.data_dir.as_path();
+        let working_dir = temp.path().join("project");
 
         let wp = global_windows_path(data_dir);
         let sd = global_state_dir(data_dir);
@@ -1103,7 +1441,7 @@ mod tests {
 
         for p in [&wp, &sd, &psp] {
             assert!(
-                !p.starts_with(working_dir),
+                !p.starts_with(&working_dir),
                 "orchestrator path must not be inside the working tree: {p:?}"
             );
             for component in p.components() {
@@ -1231,7 +1569,9 @@ mod tests {
         // cwds resolve to the same file path so the user sees
         // their full session history regardless of where the
         // editor was launched from.
-        let data_dir = Path::new("/tmp/fresh-data");
+        let temp = tempfile::tempdir().unwrap();
+        let context = DirectoryContext::for_testing(temp.path());
+        let data_dir = context.data_dir.as_path();
         let a = global_windows_path(data_dir);
         let b = global_windows_path(data_dir);
         assert_eq!(a, b);
@@ -1277,7 +1617,15 @@ mod tests {
         assert_eq!(sessions[0].root, live_root);
         assert_eq!(sessions[0].label, "live-session");
         assert!(!dead_file.exists(), "the dead dir's cache file was GC'd");
-        assert!(live_file.exists(), "the live cache file is kept");
+        let stable_id = sessions[0]
+            .stable_id
+            .as_deref()
+            .expect("legacy workspace receives a stable identity");
+        assert!(!live_file.exists(), "the legacy filename is retired");
+        assert!(
+            workspace_file_for_id(data_dir, &live_root, stable_id).exists(),
+            "the live workspace is published under its exact identity"
+        );
     }
 
     #[test]
@@ -1390,6 +1738,8 @@ mod tests {
                 remote_path: Some(remote_only_root.into()),
                 extra_args: Vec::new(),
             },
+            verified_anchor: None,
+            canonical_root: None,
             base_env: Vec::new(),
             window: true,
             label: Some("ssh-session".into()),
@@ -1414,9 +1764,209 @@ mod tests {
             .find(|s| s.label == "ssh-session")
             .expect("the SSH session survives discovery despite a remote-only root");
         assert_eq!(ssh.authority_spec, spec);
+        let stable_id = ssh
+            .stable_id
+            .as_deref()
+            .expect("remote legacy workspace receives a stable identity");
         assert!(
-            ws_dir.join("ssh.json").exists(),
-            "the remote session's workspace file must not be GC'd"
+            !ws_dir.join("ssh.json").exists(),
+            "legacy filename is retired"
+        );
+        assert!(
+            workspace_file_for_id(data_dir, Path::new(remote_only_root), stable_id).exists(),
+            "the remote session is retained under its exact stable identity"
+        );
+    }
+
+    #[test]
+    fn legacy_remote_sessions_at_the_same_root_keep_authority_and_exact_identity() {
+        use crate::model::filesystem::StdFileSystem;
+        use crate::services::authority::{
+            RemoteAgentSpec, RemoteTransportSpec, SessionAuthoritySpec,
+        };
+
+        fn ssh_spec(host: &str, remote_root: &str) -> SessionAuthoritySpec {
+            SessionAuthoritySpec::RemoteAgent(RemoteAgentSpec {
+                transport: RemoteTransportSpec::Ssh {
+                    user: Some("builder".into()),
+                    host: host.into(),
+                    port: None,
+                    identity_file: None,
+                    remote_path: Some(remote_root.into()),
+                    extra_args: Vec::new(),
+                },
+                verified_anchor: None,
+                canonical_root: None,
+                base_env: Vec::new(),
+                window: true,
+                label: None,
+                command: None,
+            })
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path();
+        let ws_dir = workspaces_dir(data_dir);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let root = "/srv/shared/project";
+        let host_a = ssh_spec("alpha.example", root);
+        let host_b = ssh_spec("beta.example", root);
+        let legacy_a = ws_dir.join("host-a.json");
+        let legacy_b = ws_dir.join("host-b.json");
+        std::fs::write(
+            &legacy_a,
+            serde_json::to_vec(&serde_json::json!({
+                "working_dir": root,
+                "label": "host-a",
+                "stable_id": "ws-existing-host-a",
+                "authority_spec": host_a,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &legacy_b,
+            serde_json::to_vec(&serde_json::json!({
+                "working_dir": root,
+                "label": "host-b",
+                "authority_spec": host_b,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let fs = StdFileSystem;
+        let first = discover_sessions(&fs, data_dir);
+        assert_eq!(
+            first.len(),
+            2,
+            "different SSH authorities must not suppress each other"
+        );
+        let a = first
+            .iter()
+            .find(|window| window.label == "host-a")
+            .unwrap();
+        let b = first
+            .iter()
+            .find(|window| window.label == "host-b")
+            .unwrap();
+        assert_eq!(a.stable_id.as_deref(), Some("ws-existing-host-a"));
+        let b_id = b
+            .stable_id
+            .as_deref()
+            .expect("id-less legacy file is migrated");
+        assert_ne!(b_id, "ws-existing-host-a");
+        assert_eq!(a.authority_spec, host_a);
+        assert_eq!(b.authority_spec, host_b);
+        assert!(!legacy_a.exists() && !legacy_b.exists());
+        assert!(workspace_file_for_id(data_dir, Path::new(root), "ws-existing-host-a").exists());
+        assert!(workspace_file_for_id(data_dir, Path::new(root), b_id).exists());
+
+        let second = discover_sessions(&fs, data_dir);
+        let second_b = second
+            .iter()
+            .find(|window| window.label == "host-b")
+            .unwrap();
+        assert_eq!(second_b.stable_id.as_deref(), Some(b_id));
+    }
+
+    #[test]
+    fn discover_rekeys_cross_authority_duplicate_workspace_ids() {
+        use crate::model::filesystem::StdFileSystem;
+        use crate::services::authority::{
+            RemoteAgentSpec, RemoteTransportSpec, SessionAuthoritySpec,
+        };
+
+        fn ssh_spec(host: &str, remote_root: &str) -> SessionAuthoritySpec {
+            SessionAuthoritySpec::RemoteAgent(RemoteAgentSpec {
+                transport: RemoteTransportSpec::Ssh {
+                    user: Some("builder".into()),
+                    host: host.into(),
+                    port: None,
+                    identity_file: None,
+                    remote_path: Some(remote_root.into()),
+                    extra_args: Vec::new(),
+                },
+                verified_anchor: None,
+                canonical_root: None,
+                base_env: Vec::new(),
+                window: true,
+                label: None,
+                command: None,
+            })
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path();
+        let ws_dir = workspaces_dir(data_dir);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let root = "/srv/shared/project";
+        let authority_a = ssh_spec("alpha.example", root);
+        let authority_b = ssh_spec("beta.example", root);
+        for (path, label, authority) in [
+            (ws_dir.join("alpha.json"), "alpha", &authority_a),
+            (
+                workspace_file_for_id(data_dir, Path::new(root), "ws-shared-across-authorities"),
+                "beta",
+                &authority_b,
+            ),
+        ] {
+            std::fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "working_dir": root,
+                    "label": label,
+                    "stable_id": "ws-shared-across-authorities",
+                    "authority_spec": authority,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let fs = StdFileSystem;
+        let first = discover_sessions(&fs, data_dir);
+        assert_eq!(
+            first.len(),
+            2,
+            "both authority candidates remain discoverable"
+        );
+        let ids: HashSet<&str> = first
+            .iter()
+            .map(|window| window.stable_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "public workspace ids must be globally unique");
+        assert!(ids.contains("ws-shared-across-authorities"));
+        for window in &first {
+            assert!(workspace_file_for_id(
+                data_dir,
+                &window.root,
+                window.stable_id.as_deref().unwrap(),
+            )
+            .exists());
+        }
+        let first_by_label: HashMap<String, String> = first
+            .iter()
+            .map(|window| {
+                (
+                    window.label.clone(),
+                    window.stable_id.clone().expect("discovered stable id"),
+                )
+            })
+            .collect();
+
+        let second_by_label: HashMap<String, String> = discover_sessions(&fs, data_dir)
+            .into_iter()
+            .map(|window| {
+                (
+                    window.label,
+                    window.stable_id.expect("rediscovered stable id"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            second_by_label, first_by_label,
+            "the collision replacement must be durable and deterministic"
         );
     }
 
@@ -1464,6 +2014,91 @@ mod tests {
             val.get("label").and_then(|v| v.as_str()),
             Some("from-windows-json"),
             "the label was folded into the per-dir workspace file"
+        );
+    }
+
+    #[test]
+    fn concurrent_global_state_transactions_preserve_disjoint_keys() {
+        use crate::model::filesystem::StdFileSystem;
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path().to_path_buf();
+        let filesystem = Arc::new(StdFileSystem);
+        let (first_read_tx, first_read_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first_fs = Arc::clone(&filesystem);
+        let first_data = data_dir.clone();
+        let first = std::thread::spawn(move || {
+            let dirty = HashSet::from(["first".to_string()]);
+            let memory = HashMap::from([("first".to_string(), serde_json::json!(1))]);
+            persist_plugin_global_state_transaction(
+                first_fs.as_ref(),
+                &first_data,
+                "orchestrator",
+                &dirty,
+                Some(&memory),
+                || {
+                    first_read_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+
+        // Hold the first writer after its read. The second writer starts at a
+        // deterministic barrier: without the per-plugin lock it publishes its
+        // stale merge before the first resumes, and one disjoint key is lost.
+        first_read_rx.recv().unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let second_start = Arc::clone(&start);
+        let second_fs = Arc::clone(&filesystem);
+        let second_data = data_dir.clone();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let dirty = HashSet::from(["second".to_string()]);
+            let memory = HashMap::from([("second".to_string(), serde_json::json!(2))]);
+            second_start.wait();
+            let result = persist_plugin_global_state_transaction(
+                second_fs.as_ref(),
+                &second_data,
+                "orchestrator",
+                &dirty,
+                Some(&memory),
+                || {},
+            );
+            second_done_tx.send(result).unwrap();
+        });
+        start.wait();
+        let premature = second_done_rx.recv_timeout(Duration::from_millis(100));
+        let second_was_blocked = matches!(&premature, Err(mpsc::RecvTimeoutError::Timeout));
+        release_tx.send(()).unwrap();
+
+        let second_result = match premature {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => second_done_rx.recv().unwrap(),
+            Err(error) => panic!("second writer completion channel failed: {error}"),
+        };
+        first.join().unwrap().unwrap();
+        second_result.unwrap();
+        second.join().unwrap();
+        assert!(
+            second_was_blocked,
+            "the second writer published while the first held the plugin lock"
+        );
+
+        let path = global_plugin_state_path(&data_dir, "orchestrator");
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(state["first"], 1);
+        assert_eq!(state["second"], 2);
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "successful publishers must remove only their own unique temps"
         );
     }
 }

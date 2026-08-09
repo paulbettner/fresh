@@ -15,6 +15,8 @@ For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
 * **Git-gutter hunks and unsaved edits show on the scrollbar** (#2713, requested by @RetributionByRevenue).
 * **The Orchestrator dock has a close button** and a **View → Orchestrator Dock** menu row.
 * **Thrift syntax highlighting** (#2884, by @asukaminato0721).
+* **OMP native-TUI companion** - the Orchestrator `omp` preset keeps OMP's interactive terminal UI while adding authenticated live status, approval attention, exact scoped conversation resume (including `/new` rotation), and Interrupt. Unsupported launch shapes fall back to ordinary terminal tracking.
+* **Plugin API v3** - terminal controls now require `WindowTerminalId`, pairing every terminal with its owning window; packages using terminal control must declare `min_api_version: 3`.
 
 ### Bug Fixes
 
@@ -28,6 +30,8 @@ For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
 * **Input**
   * **Shift works with "Keyboard Report All Keys As Escape Codes"** - `Shift+A` typed `a` (#2880, reported by @akarinotomoshibi).
   * **Pasting works in the New Workspace and Run Agent dialogs**, in daemon mode too.
+  * **Terminal drag selection includes the cell under the pointer and publishes on mouse-up**, fixing the one-cell-behind right edge and macOS `Command+C` clipboard behavior.
+  * **Fresh can own terminal mouse gestures** with `terminal.mouse_forwarding = "never"`; per-button capture now releases the exact terminal on mouse-up, focus loss, or buffer changes.
 * **Settings & commands**
   * **Settings toggles actually stick**
     * Eight toggles forgot your choice on restart.
@@ -48,6 +52,7 @@ For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
 * **Workspaces & agents**
   * **Renaming a workspace made with "Extract Tab to New Workspace" no longer renames its co-tenant.**
   * **A restored workspace's agent can still drive the editor** - the script grant now survives a restart.
+  * **OMP companion rows mirror the exact live footer status** and safely return to ordinary terminal activity after expiry; delayed exits/snapshots cannot retarget a replacement terminal.
 * **Self-update**
   * **Updates finish through the channel that installed Fresh**
     * `.deb`/`.rpm`/`.flatpak` updates asked repos that never served Fresh ("already the newest version", forever).
@@ -140,7 +145,6 @@ Keyboard and mouse input is now parsed by our own `fresh-input-parser` crate ins
 * **Orchestrator: agents & workspaces**
   * **`Run Agent…` command** launches a terminal or a coding agent (`claude`, `codex`, `opencode`, `aider`) in your current workspace or a new one, without the full New Workspace dialog.
   * **Non-blocking workspace creation** - creating a workspace no longer freezes the editor; choose **Create & Visit** or **Create in Background** and keep working while it comes up.
-  * **OMP native-TUI companion** - the Orchestrator `omp` preset keeps OMP's interactive terminal UI while adding authenticated structured status, approval attention, exact restart resume, immediate same-incarnation `/new` resume rotation, and a non-destructive Interrupt control. A focused companion controller now owns projection, presentation, liveness, exact resume, and exit/window cleanup; cumulative exact tombstones reject delayed snapshots from every exited replacement terminal while allowing the next live terminal to claim the window. Restored workspaces accept their first snapshot without opening picker or dock, initial marker persistence distinguishes active/unsupported launches from entropy failure, the capability environment is one-shot, two-stage teardown filters private sideband bytes through reader drain, frozen command bodies use audited HMAC/constant-time/zeroization crates, and generated plugin hook types match runtime terminal-output fields.
 * **Classic Mac (CR) line endings** are now fully supported (#2736, requested by @720720).
 * **`.editorconfig` support** - `indent_style`/`indent_size`/`tab_width` are picked up automatically (#959, requested by @nyurik).
 * **Save All** - save every modified buffer at once from the File menu (#2289, requested by @alspaughb).
@@ -150,12 +154,9 @@ Keyboard and mouse input is now parsed by our own `fresh-input-parser` crate ins
 * **Orchestrator & dock**
   * Codex "Auto mode" works again (it was passing a flag recent Codex CLI rejects).
   * Dock rows are fully clickable in compact (list) view, ordered by recency, and auto-name themselves from their terminal.
-  * OMP companion rows now mirror the exact live OMP footer status (for example `Working…` or `Finding top-level files`) instead of synthesizing lowercase working text from tool metadata. Dock cards use two content rows: the OMP loader frame and matching shimmer animate beside the second-row status while the first-row workspace title stays stable and no longer repeats a working/idle glyph; critical errors retain `!`, status aligns under the project name, `Idle` is capitalized, and branch/git details remain in the picker.
   * Fixed a crash when navigating to an unreachable remote workspace.
 * **Terminal**
   * Scrollback no longer loses output or gets stuck mid-scroll (#2649, reported by @dmknght).
-  * Drag selection now includes the cell under the pointer and publishes the completed selection on mouse-up, fixing the one-cell-behind right edge and macOS `Command+C` clipboard behavior.
-  * Added `terminal.mouse_forwarding = "never"` so Fresh can own wheel scrolling and drag selection even when the inner program requests mouse tracking.
 * **Tabs & splits**
   * A long filename no longer hides other tabs, and per-split scrolling is fixed (#2650, reported by @dmknght).
   * Closing a split now asks for confirmation first.

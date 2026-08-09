@@ -4,6 +4,7 @@
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::{Config, VirtualSpaceMode};
+use fresh::config_io::DirectoryContext;
 
 fn harness_with_mode(mode: VirtualSpaceMode) -> EditorTestHarness {
     let mut config = Config::default();
@@ -590,16 +591,18 @@ fn test_toggle_virtual_space_persists_across_restart() {
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let file = project_dir.join("a.txt");
     std::fs::write(&file, "ab\nxyz").unwrap();
 
     // Session 1: toggle the buffer to "on", then save the workspace.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
         harness.open_file(&file).unwrap();
@@ -610,11 +613,12 @@ fn test_toggle_virtual_space_persists_across_restart() {
 
     // Session 2: restore — typing past EOL must still pad this buffer.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context,
         )
         .unwrap();
         let restored = harness.editor_mut().try_restore_workspace().unwrap();

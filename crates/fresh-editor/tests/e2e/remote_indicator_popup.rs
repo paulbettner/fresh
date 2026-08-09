@@ -160,6 +160,8 @@ fn ssh_agent_spec() -> SessionAuthoritySpec {
             remote_path: None,
             extra_args: Vec::new(),
         },
+        verified_anchor: None,
+        canonical_root: None,
         base_env: Vec::new(),
         window: true,
         label: None,
@@ -275,7 +277,10 @@ fn test_remote_indicator_popup_connecting_offers_cancel_and_logs() -> anyhow::Re
     // Drive the editor into the Connecting state the way the plugin
     // would via setRemoteIndicatorState — bypassing the plugin
     // command channel keeps the test hermetic.
-    harness.editor_mut().remote_indicator_override = Some(RemoteIndicatorOverride::Connecting {
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .remote_indicator_override = Some(RemoteIndicatorOverride::Connecting {
         label: Some("Building".into()),
     });
 
@@ -326,7 +331,10 @@ fn test_remote_indicator_popup_failed_attach_offers_retry() -> anyhow::Result<()
         HarnessOptions::new().with_working_dir(temp.path().to_path_buf()),
     )?;
 
-    harness.editor_mut().remote_indicator_override = Some(RemoteIndicatorOverride::FailedAttach {
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .remote_indicator_override = Some(RemoteIndicatorOverride::FailedAttach {
         error: Some("exit 1".into()),
     });
 

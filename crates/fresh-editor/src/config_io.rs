@@ -1597,15 +1597,6 @@ mod tests {
         );
     }
 
-    /// Reproduces the reported data-loss bug. Saving a single settings change
-    /// onto an existing config file that fails to parse must NOT overwrite the
-    /// whole file with just that change. The save must error (so the UI can
-    /// alert) and leave the file byte-for-byte intact.
-    ///
-    /// Without the guard, `read_existing_json` returns an empty object for an
-    /// unparseable file, the one change is applied on top, and the user's
-    /// entire config is overwritten — exactly the failure that was reported.
-    #[test]
     /// A meaningful empty collection the user wrote by hand — e.g.
     /// `"status_bar": {"left": []}` to empty the status bar, whose built-in
     /// default is non-empty — must survive an unrelated settings write.

@@ -1,26 +1,27 @@
 //! Regression: a brand-new terminal must never come up showing some *other*
 //! terminal's scrollback (fresh#2836).
 //!
-//! Terminal transcripts live in `fresh-terminal-<id>.{txt,log}`, named after a
-//! terminal id that restarts at 0 every editor run — while the files (and the
-//! workspace entries pointing at them) outlive the run that wrote them. The
-//! spawn path used to infer "this is a restore, append and seed the history
+//! Terminal artifacts use one append-only history file plus a separately
+//! published checkpoint (`fresh-terminal-<id>.history.txt` and `.txt`), named
+//! after a terminal id that restarts at 0 every editor run — while the files
+//! (and workspace entries pointing at them) outlive the run that wrote them.
+//! The spawn path used to infer "this is a restore, append and seed the history
 //! end" from nothing more than "that file already has bytes", so two unrelated
 //! terminals could end up sharing one transcript:
 //!
-//!   * **Restore.** A restored terminal keeps the backing path it was saved
+//!   * **Restore.** A restored terminal keeps the history path it was saved
 //!     with but takes a *fresh* id. Restore a workspace whose surviving
 //!     terminal was saved as `…-1`, and it comes back as id 0 — so the next
 //!     terminal the user opens is handed id 1, i.e. the path the restored
 //!     terminal is still streaming into. Scroll up in the new terminal and the
 //!     old one's history is there.
 //!   * **Leftovers.** A run that ended without closing its terminals (a crash,
-//!     a kill) leaves `…-0.txt` on disk. The next run's first terminal is
-//!     offered that same path and inherits a dead session's scrollback.
+//!     a kill) leaves `…-0.history.txt` on disk. The next run's first terminal
+//!     is offered that same path and inherits a dead session's scrollback.
 //!
 //! Both are covered below. The fix is two-part and both halves are asserted:
 //! a new terminal never gets a path a *live* terminal owns, and a new terminal
-//! opens its transcript `BackingMode::Fresh` (truncating) so leftovers can't
+//! opens its append-only history with `BackingMode::Fresh` so leftovers can't
 //! survive into it.
 //!
 //! Own integration binary because it sets the process-global `XDG_DATA_HOME`
@@ -86,19 +87,19 @@ fn pty_available() -> bool {
         .is_ok()
 }
 
-/// The backing (rendered-scrollback) file of the terminal in the editor's
+/// The append-only rendered-history file of the terminal in the editor's
 /// currently active buffer.
-fn active_terminal_backing(editor: &fresh::app::Editor) -> PathBuf {
+fn active_terminal_history(editor: &fresh::app::Editor) -> PathBuf {
     let buffer_id = editor.active_buffer();
     let window = editor.active_window();
     let terminal_id = window
         .get_terminal_id(buffer_id)
         .expect("active buffer must be a terminal buffer");
     window
-        .terminal_backing_files
+        .terminal_history_files
         .get(&terminal_id)
         .cloned()
-        .expect("a spawned terminal must have a backing file")
+        .expect("a spawned terminal must have a history file")
 }
 
 fn read_to_string(path: &Path) -> String {
@@ -144,29 +145,29 @@ fn new_terminal_does_not_adopt_a_restored_terminal_transcript() {
     // for the history the user still has in their scroll-back.
     let mut e2 = editor_in(&project, &dir_context);
     e2.restore_active_window_on_launch(false).unwrap();
-    let restored_backing = active_terminal_backing(&e2);
+    let restored_history = active_terminal_history(&e2);
     const MARKER: &str = "RESTORED_TERMINAL_HISTORY";
-    std::fs::write(&restored_backing, format!("{MARKER}\n")).unwrap();
+    std::fs::write(&restored_history, format!("{MARKER}\n")).unwrap();
 
     // …and now the user opens a brand-new terminal.
     e2.open_terminal();
-    let new_backing = active_terminal_backing(&e2);
+    let new_history = active_terminal_history(&e2);
 
     assert_ne!(
-        new_backing, restored_backing,
+        new_history, restored_history,
         "a new terminal must not be handed the transcript a live (restored) \
          terminal is still writing to"
     );
     assert!(
-        !read_to_string(&new_backing).contains(MARKER),
+        !read_to_string(&new_history).contains(MARKER),
         "the new terminal's scroll-back must not contain the restored \
          terminal's history; got: {:?}",
-        read_to_string(&new_backing)
+        read_to_string(&new_history)
     );
     // The restored terminal keeps its own history — the fix must not have
     // moved *it* off its file either.
     assert!(
-        read_to_string(&restored_backing).contains(MARKER),
+        read_to_string(&restored_history).contains(MARKER),
         "the restored terminal must keep streaming into its own transcript"
     );
 }
@@ -183,17 +184,17 @@ fn new_terminal_discards_a_leftover_transcript_on_its_path() {
     const MARKER: &str = "DEAD_SESSION_HISTORY";
     let terminal_root = dir_context.terminal_dir_for(&project);
     std::fs::create_dir_all(&terminal_root).unwrap();
-    let leftover = terminal_root.join("fresh-terminal-0.txt");
+    let leftover = terminal_root.join("fresh-terminal-0.history.txt");
     std::fs::write(&leftover, format!("{MARKER}\n")).unwrap();
 
     let mut editor = editor_in(&project, &dir_context);
     editor.open_terminal();
-    let backing = active_terminal_backing(&editor);
+    let history = active_terminal_history(&editor);
 
     assert!(
-        !read_to_string(&backing).contains(MARKER),
+        !read_to_string(&history).contains(MARKER),
         "a new terminal must start from an empty transcript, not inherit the \
          one a dead session left on its path; got: {:?}",
-        read_to_string(&backing)
+        read_to_string(&history)
     );
 }

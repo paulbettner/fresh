@@ -1555,6 +1555,7 @@
   "workspace.extract_no_file_path": "Nelze extrahovat: buffer nemá cestu k souboru",
   "workspace.extract_terminal_dormant": "Nelze extrahovat: terminál nemá živou relaci",
   "workspace.extract_terminal_companion": "Nelze extrahovat: doprovodný terminál OMP musí zůstat ve svém pracovním prostoru",
+  "workspace.extract_terminal_script_capable": "Nelze extrahovat: terminál s přístupem ke skriptům musí zůstat ve svém pracovním prostoru",
   "workspace.extract_already_rooted": "Již v pracovním prostoru s kořenem %{root}",
   "workspace.extracted_tab": "%{name} extrahováno do prostoru %{label}",
   "whitespace.newline_added": "Přidán koncový nový řádek",

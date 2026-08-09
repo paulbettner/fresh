@@ -18,6 +18,15 @@ use lsp_types::{
 use serde_json::Value;
 use std::sync::mpsc;
 
+/// Stable process-local identity for the filesystem allocation captured by an
+/// async job. Authority swaps replace the `Arc`; comparing this tag prevents a
+/// late result from the previous backend from mutating the replacement window.
+pub(crate) fn filesystem_identity(
+    filesystem: &std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+) -> usize {
+    std::sync::Arc::as_ptr(filesystem) as *const () as usize
+}
+
 /// Semantic token responses grouped by request type.
 #[derive(Debug)]
 pub enum LspSemanticTokensResponse {
@@ -34,19 +43,20 @@ pub enum RemoteAttachMode {
     Restart,
     /// Born-attached: spawn a *new window* whose authority is the remote
     /// backend, leaving existing (local / other-remote) windows untouched.
-    /// The session coexists warm beside them; switching windows retargets the
-    /// active authority (see `set_active_window` / Gap A). `command` is the
-    /// optional agent argv for the window's seed terminal.
+    /// `activate` controls whether the new window keeps focus; a background
+    /// attach restores the window active when installation actually begins.
+    /// `command` is the optional agent argv for the seed terminal.
     Window {
         label: String,
         command: Option<Vec<String>>,
+        activate: bool,
+        initial_state: Option<(String, std::collections::HashMap<String, serde_json::Value>)>,
     },
-    /// Reconnect an **existing dormant** session: a remote session restored
-    /// from disk (its backend spec known, but its live authority still the
-    /// local placeholder) whose user just switched to it. Re-point *that
-    /// window's* authority at the freshly-connected backend and park the
-    /// keepalive — no new window, no editor restart.
+    /// Reconnect an existing live or dormant remote session.
     Reconnect { window_id: fresh_core::WindowId },
+    /// Atomically re-root a live remote session after the replacement tenant
+    /// and canonical root have been verified by the new agent connection.
+    Switch { window_id: fresh_core::WindowId },
 }
 
 /// A completed remote-agent attach: the assembled authority plus the
@@ -68,11 +78,14 @@ pub struct RemoteAttachReady {
     /// session so a restart / relaunch can bring it back (dormant) and
     /// reconnect it, rather than degrading it to local.
     pub spec: crate::services::authority::SessionAuthoritySpec,
-    /// JS callback id of the `attachRemoteAgent` promise to settle once the
-    /// session (authority + window) is fully constructed. The main loop
-    /// resolves it on success and rejects it if window creation fails, so the
-    /// plugin's dialog only closes when there is a real session to show.
-    pub request_id: u64,
+    /// Whether the persisted remote identity exactly matches the connected
+    /// agent's immutable tenant anchor and canonical root. Only an exact match
+    /// may restore prior workspace/plugin/terminal state.
+    pub restore_allowed: bool,
+    /// Host-minted attempt identity. Plugin callback ids are scoped to their
+    /// concrete plugin instance and reconnects have no callback, so completions
+    /// never use either as a global async correlation key.
+    pub attempt_id: u64,
 }
 
 impl std::fmt::Debug for RemoteAttachReady {
@@ -80,6 +93,33 @@ impl std::fmt::Debug for RemoteAttachReady {
         f.debug_struct("RemoteAttachReady")
             .field("label", &self.authority.display_label)
             .finish_non_exhaustive()
+    }
+}
+
+/// A drained async message paired with the bridge that produced it.
+///
+/// Window bridges intentionally carry bare [`AsyncMessage`] values so their
+/// senders stay reusable by LSP and terminal tasks. The editor wraps each
+/// drained value before merging bridges, preserving ownership through the
+/// frame-budget backlog without consulting mutable focus.
+#[derive(Debug)]
+pub enum AsyncMessageEnvelope {
+    Global(AsyncMessage),
+    Window(fresh_core::WindowId, AsyncMessage),
+}
+
+impl AsyncMessageEnvelope {
+    pub fn message(&self) -> &AsyncMessage {
+        match self {
+            Self::Global(message) | Self::Window(_, message) => message,
+        }
+    }
+
+    pub fn into_parts(self) -> (Option<fresh_core::WindowId>, AsyncMessage) {
+        match self {
+            Self::Global(message) => (None, message),
+            Self::Window(window, message) => (Some(window), message),
+        }
     }
 }
 
@@ -92,35 +132,34 @@ pub enum AsyncMessage {
 
     /// A remote agent channel's transport was silently hot-swapped back in by
     /// the background reconnect task (`spawn_reconnect_task`). Carries the
-    /// channel's stable id (`AgentChannel::id`); the editor maps it to the
-    /// owning window and reattaches — respawning the embedded terminals that
-    /// died with the dropped carrier. This is the event-driven counterpart to
-    /// the app-level `RemoteAttachMode::Reconnect` rebuild path.
-    RemoteReconnected { connection_id: u64 },
+    /// channel's stable id plus monotonic transport generation; the editor maps
+    /// it to the owning window, ignores duplicate delivery, and retains any
+    /// terminal reattach that races the old PTY's concrete exit.
+    RemoteReconnected { connection_id: u64, generation: u64 },
 
     /// Content for a remote session's placeholder buffer, read off the editor
-    /// loop (see `Window::pending_content_load`). The main loop installs it into
-    /// `window_id`'s `buffer_id`, replacing the empty placeholder — or logs and
-    /// drops it on read error. Keeps remote workspace restore from freezing the
-    /// UI: the buffers appear instantly (empty) and fill in as this arrives.
+    /// loop (see `Window::pending_content_load`). The requested path and
+    /// filesystem identity fence a late read from an authority that has since
+    /// been replaced; the current backend retries instead of accepting it.
     RemoteBufferContentLoaded {
         window_id: fresh_core::WindowId,
         buffer_id: fresh_core::BufferId,
+        path: std::path::PathBuf,
+        filesystem_id: usize,
         content: Result<Vec<u8>, String>,
     },
 
-    /// An async `attachRemoteAgent` connect failed — reject the plugin's
-    /// promise with `error` (the plugin shows it and creates no window); the
-    /// editor stays on its current authority. `reconnect_window` is `Some(id)`
-    /// only when the failed connect was a *dive-triggered reconnect* of an
-    /// existing dormant session (`RemoteAttachMode::Reconnect`); the handler
-    /// records the error on that window so the status-bar remote indicator can
-    /// show `FailedAttach` for it. `None` for born-attached / restart attaches,
-    /// whose failure the launching plugin surfaces via the rejected promise.
-    RemoteAttachFailed {
-        error: String,
-        request_id: u64,
-        reconnect_window: Option<fresh_core::WindowId>,
+    /// A remote connect failed. The host attempt identity recovers its exact
+    /// plugin owner or reconnect window; stale/cancelled attempts have already
+    /// been removed and are discarded on arrival.
+    RemoteAttachFailed { error: String, attempt_id: u64 },
+
+    /// Delayed hard-stop for the exact process registrations captured by one
+    /// `StopWindow` command. Pid + incarnation matching on the editor thread
+    /// prevents the escalation from killing a replacement process.
+    WindowStopEscalation {
+        window_id: fresh_core::WindowId,
+        targets: Vec<crate::app::window::ProcessGroupEntry>,
     },
 
     /// LSP diagnostics received for a file
@@ -299,19 +338,19 @@ pub enum AsyncMessage {
     /// Git status updated (future: git integration)
     GitStatusChanged { status: String },
 
-    /// File explorer initialized with tree view. Carries the id of the window
-    /// that requested it: a background preview/materialize can init a
-    /// *non-active* window's explorer, so the view must land on that window —
-    /// applying it to whatever is active would clobber an unrelated explorer.
+    /// File explorer initialized with tree view. The filesystem identity fences
+    /// a slow tree build from an authority that was replaced in the meantime.
     FileExplorerInitialized {
         window: fresh_core::WindowId,
+        filesystem_id: usize,
         view: FileTreeView,
     },
 
-    /// Initial file-explorer build failed for the requesting window. Carries
-    /// the window id (see `FileExplorerInitialized`) so the column reservation
-    /// taken in `init_file_explorer` is released on the right window.
-    FileExplorerInitFailed { window: fresh_core::WindowId },
+    /// Initial file-explorer build failed for the requesting window/backend.
+    FileExplorerInitFailed {
+        window: fresh_core::WindowId,
+        filesystem_id: usize,
+    },
 
     /// File explorer node toggle completed
     FileExplorerToggleNode(NodeId),
@@ -319,11 +358,10 @@ pub enum AsyncMessage {
     /// File explorer node refresh completed
     FileExplorerRefreshNode(NodeId),
 
-    /// File explorer expand to path completed. Carries the requesting window id
-    /// (see `FileExplorerInitialized`) so the expanded view returns to its own
-    /// window rather than the active one.
+    /// File explorer expand-to-path completed for one exact window/backend.
     FileExplorerExpandedToPath {
         window: fresh_core::WindowId,
+        filesystem_id: usize,
         view: FileTreeView,
     },
 

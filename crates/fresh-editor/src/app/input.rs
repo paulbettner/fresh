@@ -95,9 +95,19 @@ impl Editor {
     /// settled here, since in that case nothing will ever call
     /// `completeCommand` and the caller would wait for an answer that cannot
     /// come.
-    pub fn eval_agent_script(&mut self, wrapped: &str, request_id: u64) -> Result<(), String> {
+    pub fn eval_agent_script(
+        &mut self,
+        wrapped: &str,
+        request_id: u64,
+        plugin_instance_id: fresh_core::api::PluginInstanceId,
+        window_id: fresh_core::WindowId,
+        authority: fresh_core::api::AuthorityStamp,
+    ) -> Result<(), String> {
         #[cfg(feature = "plugins")]
         {
+            let state_snapshot = self
+                .create_scoped_plugin_snapshot(window_id)
+                .ok_or_else(|| "the capability's window is no longer available".to_string())?;
             // A name per request: two scripts in flight must not share a
             // context, or the second would see (and could clobber) the first's
             // globals.
@@ -106,12 +116,23 @@ impl Editor {
                 .plugin_manager
                 .read()
                 .unwrap()
-                .load_plugin_from_source_request(wrapped, &name, true)
+                .load_plugin_from_source_request_with_kind(
+                    wrapped,
+                    &name,
+                    true,
+                    fresh_plugin_runtime::runtime::PluginLoadKind::AgentScript {
+                        request_id,
+                        plugin_instance_id,
+                        window_id,
+                        authority,
+                        state_snapshot,
+                    },
+                )
                 .ok_or_else(|| "plugin runtime unavailable".to_string())?;
             // Wait for the load off the editor thread: the script's own host
             // calls only complete on later editor ticks, which this thread must
             // stay free to service.
-            std::thread::Builder::new()
+            let loader = std::thread::Builder::new()
                 .name("agent-script-load".to_string())
                 .spawn(move || {
                     let failure = match rx.recv() {
@@ -120,14 +141,26 @@ impl Editor {
                         Ok(Err(e)) => format!("{e}"),
                         Err(e) => format!("plugin thread closed: {e}"),
                     };
-                    crate::server::command_access::complete(request_id, false, None, Some(failure));
-                })
-                .map_err(|e| format!("could not start script loader: {e}"))?;
+                    crate::server::command_access::fail_pending_script(
+                        request_id,
+                        plugin_instance_id,
+                        failure,
+                    );
+                });
+            if let Err(error) = loader {
+                // The load request is already queued. Queue its unload behind
+                // it so no script authority survives a failed monitor spawn.
+                self.plugin_manager
+                    .read()
+                    .unwrap()
+                    .unload_plugin_request(&name);
+                return Err(format!("could not start script loader: {error}"));
+            }
             Ok(())
         }
         #[cfg(not(feature = "plugins"))]
         {
-            let _ = (wrapped, request_id);
+            let _ = (wrapped, request_id, plugin_instance_id, window_id);
             Err("scripts not available (compiled without plugin support)".to_string())
         }
     }
@@ -2478,11 +2511,12 @@ impl Editor {
                 // Use non-blocking version to avoid deadlock with async plugin ops
                 #[cfg(feature = "plugins")]
                 {
-                    let result = self.plugin_manager.read().unwrap().execute_action_async(
-                        &action_name,
-                        None,
-                        None,
-                    );
+                    let invocation = self.plugin_invocation(self.active_window);
+                    let result = self
+                        .plugin_manager
+                        .read()
+                        .unwrap()
+                        .execute_action_async_with_invocation(&action_name, None, None, invocation);
                     if let Some(result) = result {
                         match result {
                             Ok(receiver) => {
@@ -3133,20 +3167,29 @@ impl Editor {
                     return true;
                 }
                 KeyCode::Char(' ') => {
-                    // Toggle the highlighted row's multi-select checkbox
-                    // (plugin owns the selection set).
-                    tracing::debug!(
-                        target: "fresh::dock",
-                        panel = %panel_key,
-                        focus_key = ?self.widget_registry.focus_key(&panel_key),
-                        "dispatch_floating_widget_key: Space on LeftDock — firing dock_space widget_event"
-                    );
-                    self.fire_widget_event(
-                        &panel_key,
-                        "sessions".to_string(),
-                        "dock_space".to_string(),
-                        serde_json::json!({}),
-                    );
+                    let focus_key = self
+                        .widget_registry
+                        .focus_key(&panel_key)
+                        .unwrap_or_default();
+                    if focus_key == "sessions" || focus_key.is_empty() {
+                        // The dock tree has no bulk-selection affordance, so
+                        // retain its explicit list Space behaviour.
+                        self.fire_widget_event(
+                            &panel_key,
+                            "sessions".to_string(),
+                            "dock_space".to_string(),
+                            serde_json::json!({}),
+                        );
+                    } else {
+                        // A focused dock action must receive its normal smart
+                        // key rather than being swallowed as a list gesture.
+                        self.handle_widget_command(
+                            &panel_key,
+                            fresh_core::api::WidgetAction::Key {
+                                key: "Space".to_string(),
+                            },
+                        );
+                    }
                     return true;
                 }
                 _ => {}

@@ -9,10 +9,16 @@
 //! - Results are sent back via the existing PluginCommand channel
 //! - Async operations complete naturally without runtime destruction
 
-use crate::backend::quickjs_backend::{AsyncResourceOwners, PendingResponses, TsPluginInfo};
-use crate::backend::QuickJsBackend;
+use crate::backend::{QuickJsBackend, TsPluginInfo};
+use crate::runtime::{
+    ActivePluginInstances, AsyncResourceOwner, AsyncResourceOwners, PendingResponses,
+    PluginLoadKind, TrackedAsyncResource,
+};
 use anyhow::{anyhow, Result};
-use fresh_core::api::{EditorStateSnapshot, JsCallbackId, PluginCommand, SearchHandleRegistry};
+use fresh_core::api::{
+    EditorStateSnapshot, JsCallbackId, PluginCommandEnvelope, PluginInstanceId, PluginInvocation,
+    SearchHandleRegistry,
+};
 use fresh_core::hooks::HookArgs;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,17 +52,20 @@ pub enum PluginRequest {
     /// Load a plugin from a file
     LoadPlugin {
         path: PathBuf,
+        kind: PluginLoadKind,
         response: oneshot::Sender<Result<()>>,
     },
 
     /// Resolve an async callback with a result (for async operations like SpawnProcess, Delay)
     ResolveCallback {
+        expected_instance: Option<PluginInstanceId>,
         callback_id: fresh_core::api::JsCallbackId,
         result_json: String,
     },
 
     /// Reject an async callback with an error
     RejectCallback {
+        expected_instance: Option<PluginInstanceId>,
         callback_id: fresh_core::api::JsCallbackId,
         error: String,
     },
@@ -64,6 +73,7 @@ pub enum PluginRequest {
     /// Load all plugins from a directory
     LoadPluginsFromDir {
         dir: PathBuf,
+        kind: PluginLoadKind,
         response: oneshot::Sender<Vec<String>>,
     },
 
@@ -72,6 +82,7 @@ pub enum PluginRequest {
     /// all found plugins with their paths and enabled status
     LoadPluginsFromDirWithConfig {
         dir: PathBuf,
+        kind: PluginLoadKind,
         plugin_configs: HashMap<String, PluginConfig>,
         response: oneshot::Sender<(Vec<String>, HashMap<String, PluginConfig>)>,
     },
@@ -81,6 +92,7 @@ pub enum PluginRequest {
         source: String,
         name: String,
         is_typescript: bool,
+        kind: PluginLoadKind,
         response: oneshot::Sender<Result<()>>,
     },
 
@@ -107,6 +119,7 @@ pub enum PluginRequest {
         /// failure) back to the editor under this id once the handler settles —
         /// how a `RunCommand` over the agent command channel gets an answer.
         request_id: Option<u64>,
+        invocation: Option<PluginInvocation>,
         response: oneshot::Sender<Result<()>>,
     },
 
@@ -117,6 +130,7 @@ pub enum PluginRequest {
         hook_name: String,
         args: HookArgs,
         target: Option<String>,
+        invocation: Option<PluginInvocation>,
     },
 
     /// Check if any handlers are registered for a hook
@@ -130,25 +144,14 @@ pub enum PluginRequest {
         response: oneshot::Sender<Vec<TsPluginInfo>>,
     },
 
-    /// Track an async resource (buffer/terminal) that was just created.
-    /// Sent by deliver_response when the editor confirms resource creation.
+    /// Track an async resource whose creation was confirmed by the editor.
     TrackAsyncResource {
-        plugin_name: String,
+        owner: AsyncResourceOwner,
         resource: TrackedAsyncResource,
     },
 
     /// Shutdown the plugin thread
     Shutdown,
-}
-
-/// An async resource whose creation was confirmed by the editor.
-/// Used to update plugin_tracked_state for cleanup on unload.
-#[derive(Debug)]
-pub enum TrackedAsyncResource {
-    VirtualBuffer(fresh_core::BufferId),
-    CompositeBuffer(fresh_core::BufferId),
-    Terminal(fresh_core::TerminalId),
-    WatchHandle(u64),
 }
 
 /// Simple oneshot channel implementation
@@ -217,13 +220,15 @@ pub struct PluginThreadHandle {
     /// Pending response senders for async operations (shared with runtime)
     pending_responses: PendingResponses,
 
-    /// Receiver for plugin commands (polled by editor directly)
-    command_receiver: std::sync::mpsc::Receiver<PluginCommand>,
+    /// Receiver for plugin commands and their loader-owned context.
+    command_receiver: std::sync::mpsc::Receiver<PluginCommandEnvelope>,
 
     /// Shared map of request_id → plugin_name for async resource creations.
     /// JsEditorApi inserts entries at creation time; deliver_response reads them
     /// when the editor confirms resource creation to track the actual IDs.
     async_resource_owners: AsyncResourceOwners,
+    /// Loader-owned plugin instances whose contexts are currently live.
+    active_plugin_instances: ActivePluginInstances,
 
     /// Streaming-search handle registry. JsEditorApi's `_beginSearch`
     /// inserts an `Arc<SearchHandleState>`; the editor's `BeginSearch`
@@ -259,6 +264,9 @@ impl PluginThreadHandle {
         let async_resource_owners: AsyncResourceOwners =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let thread_async_resource_owners = Arc::clone(&async_resource_owners);
+        let active_plugin_instances: ActivePluginInstances =
+            Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let thread_active_plugin_instances = Arc::clone(&active_plugin_instances);
 
         // Streaming-search handle registry shared with the editor thread.
         let search_handles: SearchHandleRegistry =
@@ -305,6 +313,7 @@ impl PluginThreadHandle {
                 thread_pending_responses,
                 services.clone(),
                 thread_async_resource_owners,
+                thread_active_plugin_instances,
                 thread_search_handles,
                 thread_event_handlers,
             ) {
@@ -344,9 +353,17 @@ impl PluginThreadHandle {
             pending_responses,
             command_receiver,
             async_resource_owners,
+            active_plugin_instances,
             search_handles,
             event_handlers,
         })
+    }
+
+    pub fn is_plugin_instance_active(&self, plugin_instance_id: PluginInstanceId) -> bool {
+        self.active_plugin_instances
+            .read()
+            .map(|active| active.contains(&plugin_instance_id))
+            .unwrap_or(false)
     }
 
     /// Accessor for the streaming-search handle registry.
@@ -363,6 +380,18 @@ impl PluginThreadHandle {
         self.event_handlers
             .read()
             .map(|h| h.get(hook_name).is_some_and(|v| !v.is_empty()))
+            .unwrap_or(false)
+    }
+    /// Non-blocking targeted variant used before building a private invocation
+    /// snapshot for a hook that only one plugin may consume.
+    pub fn has_subscriber(&self, plugin: &str, hook_name: &str) -> bool {
+        self.event_handlers
+            .read()
+            .map(|handlers| {
+                handlers.get(hook_name).is_some_and(|handlers| {
+                    handlers.iter().any(|handler| handler.plugin_name == plugin)
+                })
+            })
             .unwrap_or(false)
     }
 
@@ -499,14 +528,16 @@ impl PluginThreadHandle {
                 terminal_id,
                 split_id,
             } => {
-                // Track the created terminal for cleanup on plugin unload
                 self.track_async_resource(request_id, TrackedAsyncResource::Terminal(terminal_id));
                 let result = serde_json::json!({
                     "bufferId": buffer_id.0,
-                    "terminalId": terminal_id.0,
+                    "terminalId": terminal_id,
                     "splitId": split_id.map(|s| s.0)
                 });
                 self.resolve_callback(JsCallbackId(request_id), result.to_string());
+            }
+            PluginResponse::WindowWithTerminalCreated { request_id, result } => {
+                self.resolve_json_callback(request_id, result, "null");
             }
             PluginResponse::SplitByLabel {
                 request_id,
@@ -523,6 +554,7 @@ impl PluginThreadHandle {
                     self.resolve_callback(JsCallbackId(request_id), handle.to_string());
                 }
                 Err(e) => {
+                    self.forget_async_resource(request_id);
                     self.reject_callback(JsCallbackId(request_id), e);
                 }
             },
@@ -536,32 +568,39 @@ impl PluginThreadHandle {
         self.resolve_callback(JsCallbackId(request_id), result);
     }
 
-    /// Look up the plugin that owns a request_id and send a TrackAsyncResource
-    /// request to the plugin thread so it can update plugin_tracked_state.
+    /// Move the exact owner of `request_id` back to the plugin thread so the
+    /// current instance records it or a stale instance compensates immediately.
     fn track_async_resource(&self, request_id: u64, resource: TrackedAsyncResource) {
-        let plugin_name = self
+        let owner = self
             .async_resource_owners
             .lock()
             .ok()
             .and_then(|mut owners| owners.remove(&request_id));
-        if let Some(plugin_name) = plugin_name {
+        if let Some(owner) = owner {
             if let Some(sender) = self.request_sender.as_ref() {
-                fire_and_forget(sender.send(PluginRequest::TrackAsyncResource {
-                    plugin_name,
-                    resource,
-                }));
+                fire_and_forget(sender.send(PluginRequest::TrackAsyncResource { owner, resource }));
             }
         }
     }
 
-    /// Load a plugin from a file (blocking)
+    fn forget_async_resource(&self, request_id: u64) {
+        if let Ok(mut owners) = self.async_resource_owners.lock() {
+            owners.remove(&request_id);
+        }
+    }
+
     pub fn load_plugin(&self, path: &Path) -> Result<()> {
+        self.load_plugin_with_kind(path, PluginLoadKind::External)
+    }
+
+    pub fn load_plugin_with_kind(&self, path: &Path, kind: PluginLoadKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.request_sender
             .as_ref()
             .ok_or_else(|| anyhow!("Plugin thread shut down"))?
             .send(PluginRequest::LoadPlugin {
                 path: path.to_path_buf(),
+                kind,
                 response: tx,
             })
             .map_err(|_| anyhow!("Plugin thread not responding"))?;
@@ -571,6 +610,10 @@ impl PluginThreadHandle {
 
     /// Load all plugins from a directory (blocking)
     pub fn load_plugins_from_dir(&self, dir: &Path) -> Vec<String> {
+        self.load_plugins_from_dir_with_kind(dir, PluginLoadKind::External)
+    }
+
+    pub fn load_plugins_from_dir_with_kind(&self, dir: &Path, kind: PluginLoadKind) -> Vec<String> {
         let (tx, rx) = oneshot::channel();
         let Some(sender) = self.request_sender.as_ref() else {
             return vec!["Plugin thread shut down".to_string()];
@@ -578,6 +621,7 @@ impl PluginThreadHandle {
         if sender
             .send(PluginRequest::LoadPluginsFromDir {
                 dir: dir.to_path_buf(),
+                kind,
                 response: tx,
             })
             .is_err()
@@ -597,6 +641,19 @@ impl PluginThreadHandle {
         dir: &Path,
         plugin_configs: &HashMap<String, PluginConfig>,
     ) -> (Vec<String>, HashMap<String, PluginConfig>) {
+        self.load_plugins_from_dir_with_config_and_kind(
+            dir,
+            plugin_configs,
+            PluginLoadKind::External,
+        )
+    }
+
+    pub fn load_plugins_from_dir_with_config_and_kind(
+        &self,
+        dir: &Path,
+        plugin_configs: &HashMap<String, PluginConfig>,
+        kind: PluginLoadKind,
+    ) -> (Vec<String>, HashMap<String, PluginConfig>) {
         let (tx, rx) = oneshot::channel();
         let Some(sender) = self.request_sender.as_ref() else {
             return (vec!["Plugin thread shut down".to_string()], HashMap::new());
@@ -605,6 +662,7 @@ impl PluginThreadHandle {
             .send(PluginRequest::LoadPluginsFromDirWithConfig {
                 dir: dir.to_path_buf(),
                 plugin_configs: plugin_configs.clone(),
+                kind,
                 response: tx,
             })
             .is_err()
@@ -629,6 +687,21 @@ impl PluginThreadHandle {
         name: &str,
         is_typescript: bool,
     ) -> Result<()> {
+        self.load_plugin_from_source_with_kind(
+            source,
+            name,
+            is_typescript,
+            PluginLoadKind::External,
+        )
+    }
+
+    pub fn load_plugin_from_source_with_kind(
+        &self,
+        source: &str,
+        name: &str,
+        is_typescript: bool,
+        kind: PluginLoadKind,
+    ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.request_sender
             .as_ref()
@@ -637,6 +710,7 @@ impl PluginThreadHandle {
                 source: source.to_string(),
                 name: name.to_string(),
                 is_typescript,
+                kind,
                 response: tx,
             })
             .map_err(|_| anyhow!("Plugin thread not responding"))?;
@@ -657,6 +731,19 @@ impl PluginThreadHandle {
             .map_err(|_| anyhow!("Plugin thread not responding"))?;
 
         rx.recv().map_err(|_| anyhow!("Plugin thread closed"))?
+    }
+
+    /// Queue a plugin unload without blocking the caller.
+    pub fn unload_plugin_request(&self, name: &str) -> Result<()> {
+        let (tx, _rx) = oneshot::channel();
+        self.request_sender
+            .as_ref()
+            .ok_or_else(|| anyhow!("Plugin thread shut down"))?
+            .send(PluginRequest::UnloadPlugin {
+                name: name.to_string(),
+                response: tx,
+            })
+            .map_err(|_| anyhow!("Plugin thread not responding"))
     }
 
     /// Reload a plugin (blocking)
@@ -684,6 +771,16 @@ impl PluginThreadHandle {
         args_json: Option<String>,
         request_id: Option<u64>,
     ) -> Result<oneshot::Receiver<Result<()>>> {
+        self.execute_action_async_with_invocation(action_name, args_json, request_id, None)
+    }
+
+    pub fn execute_action_async_with_invocation(
+        &self,
+        action_name: &str,
+        args_json: Option<String>,
+        request_id: Option<u64>,
+        invocation: Option<PluginInvocation>,
+    ) -> Result<oneshot::Receiver<Result<()>>> {
         tracing::trace!("execute_action_async: starting action '{}'", action_name);
         let (tx, rx) = oneshot::channel();
         self.request_sender
@@ -693,6 +790,7 @@ impl PluginThreadHandle {
                 action_name: action_name.to_string(),
                 args_json,
                 request_id,
+                invocation,
                 response: tx,
             })
             .map_err(|_| anyhow!("Plugin thread not responding"))?;
@@ -701,32 +799,58 @@ impl PluginThreadHandle {
         Ok(rx)
     }
 
-    /// Run a hook (non-blocking, fire-and-forget)
-    ///
-    /// This is the key improvement: hooks are now non-blocking.
-    /// The plugin thread will execute them asynchronously and
-    /// any results will come back via the PluginCommand channel.
-    pub fn run_hook(&self, hook_name: &str, args: HookArgs) {
-        if let Some(sender) = self.request_sender.as_ref() {
-            fire_and_forget(sender.send(PluginRequest::RunHook {
-                hook_name: hook_name.to_string(),
-                args,
-                target: None,
-            }));
-        }
+    /// Run a hook (non-blocking, fire-and-forget). Returns whether the request
+    /// was enqueued; hooks without subscribers never enter the runtime queue.
+    pub fn run_hook(&self, hook_name: &str, args: HookArgs) -> bool {
+        self.run_hook_with_invocation(hook_name, args, None)
     }
 
-    /// Run a hook in a single plugin's context only (non-blocking,
-    /// fire-and-forget). Handlers registered by other plugins are
-    /// skipped.
-    pub fn run_hook_for_plugin(&self, plugin: &str, hook_name: &str, args: HookArgs) {
-        if let Some(sender) = self.request_sender.as_ref() {
-            fire_and_forget(sender.send(PluginRequest::RunHook {
-                hook_name: hook_name.to_string(),
-                args,
-                target: Some(plugin.to_string()),
-            }));
+    pub fn run_hook_with_invocation(
+        &self,
+        hook_name: &str,
+        args: HookArgs,
+        invocation: Option<PluginInvocation>,
+    ) -> bool {
+        if !self.has_subscribers(hook_name) {
+            return false;
         }
+        self.request_sender.as_ref().is_some_and(|sender| {
+            sender
+                .send(PluginRequest::RunHook {
+                    hook_name: hook_name.to_string(),
+                    args,
+                    target: None,
+                    invocation,
+                })
+                .is_ok()
+        })
+    }
+
+    /// Run a hook in a single plugin's context only.
+    pub fn run_hook_for_plugin(&self, plugin: &str, hook_name: &str, args: HookArgs) -> bool {
+        self.run_hook_for_plugin_with_invocation(plugin, hook_name, args, None)
+    }
+
+    pub fn run_hook_for_plugin_with_invocation(
+        &self,
+        plugin: &str,
+        hook_name: &str,
+        args: HookArgs,
+        invocation: Option<PluginInvocation>,
+    ) -> bool {
+        if !self.has_subscriber(plugin, hook_name) {
+            return false;
+        }
+        self.request_sender.as_ref().is_some_and(|sender| {
+            sender
+                .send(PluginRequest::RunHook {
+                    hook_name: hook_name.to_string(),
+                    args,
+                    target: Some(plugin.to_string()),
+                    invocation,
+                })
+                .is_ok()
+        })
     }
 
     /// Check if any handlers are registered for a hook (blocking)
@@ -772,6 +896,19 @@ impl PluginThreadHandle {
         dir: &Path,
         plugin_configs: &HashMap<String, PluginConfig>,
     ) -> Result<oneshot::Receiver<PluginsDirLoadResult>> {
+        self.load_plugins_from_dir_with_config_request_and_kind(
+            dir,
+            plugin_configs,
+            PluginLoadKind::External,
+        )
+    }
+
+    pub fn load_plugins_from_dir_with_config_request_and_kind(
+        &self,
+        dir: &Path,
+        plugin_configs: &HashMap<String, PluginConfig>,
+        kind: PluginLoadKind,
+    ) -> Result<oneshot::Receiver<PluginsDirLoadResult>> {
         let (tx, rx) = oneshot::channel();
         self.request_sender
             .as_ref()
@@ -779,6 +916,7 @@ impl PluginThreadHandle {
             .send(PluginRequest::LoadPluginsFromDirWithConfig {
                 dir: dir.to_path_buf(),
                 plugin_configs: plugin_configs.clone(),
+                kind,
                 response: tx,
             })
             .map_err(|_| anyhow!("Plugin thread not responding"))?;
@@ -793,6 +931,21 @@ impl PluginThreadHandle {
         name: &str,
         is_typescript: bool,
     ) -> Result<oneshot::Receiver<Result<()>>> {
+        self.load_plugin_from_source_request_with_kind(
+            source,
+            name,
+            is_typescript,
+            PluginLoadKind::External,
+        )
+    }
+
+    pub fn load_plugin_from_source_request_with_kind(
+        &self,
+        source: &str,
+        name: &str,
+        is_typescript: bool,
+        kind: PluginLoadKind,
+    ) -> Result<oneshot::Receiver<Result<()>>> {
         let (tx, rx) = oneshot::channel();
         self.request_sender
             .as_ref()
@@ -801,6 +954,7 @@ impl PluginThreadHandle {
                 source: source.to_string(),
                 name: name.to_string(),
                 is_typescript,
+                kind,
                 response: tx,
             })
             .map_err(|_| anyhow!("Plugin thread not responding"))?;
@@ -821,74 +975,9 @@ impl PluginThreadHandle {
         Ok(rx)
     }
 
-    /// Process pending plugin commands (non-blocking)
-    ///
-    /// Returns immediately with any pending commands by polling the command queue directly.
-    /// This does not require the plugin thread to respond, avoiding deadlocks.
-    pub fn process_commands(&mut self) -> Vec<PluginCommand> {
-        let mut commands = Vec::new();
-        while let Ok(cmd) = self.command_receiver.try_recv() {
-            commands.push(cmd);
-        }
-        commands
-    }
-
-    /// Process commands, blocking until `HookCompleted` for the given hook arrives.
-    ///
-    /// After the render loop fires a hook like `lines_changed`, the plugin thread
-    /// processes it and sends back commands (AddConceal, etc.) followed by a
-    /// `HookCompleted` sentinel. This method waits for that sentinel so the
-    /// render has all conceal/overlay updates before painting the frame.
-    ///
-    /// Returns all non-sentinel commands collected while waiting.
-    /// Falls back to non-blocking drain if the timeout expires.
-    pub fn process_commands_until_hook_completed(
-        &mut self,
-        hook_name: &str,
-        timeout: std::time::Duration,
-    ) -> Vec<PluginCommand> {
-        let mut commands = Vec::new();
-        let deadline = std::time::Instant::now() + timeout;
-
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                // Timeout: drain whatever is available
-                while let Ok(cmd) = self.command_receiver.try_recv() {
-                    if !matches!(&cmd, PluginCommand::HookCompleted { .. }) {
-                        commands.push(cmd);
-                    }
-                }
-                break;
-            }
-
-            match self.command_receiver.recv_timeout(remaining) {
-                Ok(PluginCommand::HookCompleted {
-                    hook_name: ref name,
-                }) if name == hook_name => {
-                    // Got our sentinel — drain any remaining commands
-                    while let Ok(cmd) = self.command_receiver.try_recv() {
-                        if !matches!(&cmd, PluginCommand::HookCompleted { .. }) {
-                            commands.push(cmd);
-                        }
-                    }
-                    break;
-                }
-                Ok(PluginCommand::HookCompleted { .. }) => {
-                    // Sentinel for a different hook, keep waiting
-                    continue;
-                }
-                Ok(cmd) => {
-                    commands.push(cmd);
-                }
-                Err(_) => {
-                    // Timeout or disconnected
-                    break;
-                }
-            }
-        }
-
-        commands
+    /// Process pending plugin commands and their loader-owned security context.
+    pub fn process_command_envelopes(&mut self) -> Vec<PluginCommandEnvelope> {
+        self.command_receiver.try_iter().collect()
     }
 
     /// Get the state snapshot handle for editor to update
@@ -935,26 +1024,65 @@ impl PluginThreadHandle {
         tracing::debug!("PluginThreadHandle::shutdown: shutdown complete");
     }
 
-    /// Resolve an async callback in the plugin runtime
-    /// Called by the app when async operations (SpawnProcess, Delay) complete
+    /// Resolve an async callback in the recorded owning plugin instance.
     pub fn resolve_callback(
         &self,
         callback_id: fresh_core::api::JsCallbackId,
         result_json: String,
     ) {
+        self.send_callback_resolution(None, callback_id, result_json);
+    }
+
+    pub fn resolve_callback_for(
+        &self,
+        plugin_instance_id: PluginInstanceId,
+        callback_id: fresh_core::api::JsCallbackId,
+        result_json: String,
+    ) {
+        self.send_callback_resolution(Some(plugin_instance_id), callback_id, result_json);
+    }
+
+    fn send_callback_resolution(
+        &self,
+        expected_instance: Option<PluginInstanceId>,
+        callback_id: fresh_core::api::JsCallbackId,
+        result_json: String,
+    ) {
         if let Some(sender) = self.request_sender.as_ref() {
             fire_and_forget(sender.send(PluginRequest::ResolveCallback {
+                expected_instance,
                 callback_id,
                 result_json,
             }));
         }
     }
 
-    /// Reject an async callback in the plugin runtime
-    /// Called by the app when async operations fail
+    /// Reject an async callback in the recorded owning plugin instance.
     pub fn reject_callback(&self, callback_id: fresh_core::api::JsCallbackId, error: String) {
+        self.send_callback_rejection(None, callback_id, error);
+    }
+
+    pub fn reject_callback_for(
+        &self,
+        plugin_instance_id: PluginInstanceId,
+        callback_id: fresh_core::api::JsCallbackId,
+        error: String,
+    ) {
+        self.send_callback_rejection(Some(plugin_instance_id), callback_id, error);
+    }
+
+    fn send_callback_rejection(
+        &self,
+        expected_instance: Option<PluginInstanceId>,
+        callback_id: fresh_core::api::JsCallbackId,
+        error: String,
+    ) {
         if let Some(sender) = self.request_sender.as_ref() {
-            fire_and_forget(sender.send(PluginRequest::RejectCallback { callback_id, error }));
+            fire_and_forget(sender.send(PluginRequest::RejectCallback {
+                expected_instance,
+                callback_id,
+                error,
+            }));
         }
     }
 }
@@ -1044,6 +1172,8 @@ mod plugin_thread_tests {
     }
 }
 
+const MAX_READY_REQUESTS_BEFORE_EVENT_LOOP_POLL: usize = 32;
+
 /// Main loop for the plugin thread
 ///
 /// Uses `tokio::select!` to interleave request handling with periodic event loop
@@ -1056,9 +1186,10 @@ async fn plugin_thread_loop(
 ) {
     tracing::info!("Plugin thread event loop started");
 
-    // Interval for polling the JS event loop when there's pending work
+    // Poll promptly when idle, and also after a bounded run of ready requests.
     let poll_interval = Duration::from_millis(1);
     let mut has_pending_work = false;
+    let mut requests_since_poll = 0;
 
     loop {
         // Check for fatal JS errors (e.g., unhandled promise rejections in test mode)
@@ -1073,9 +1204,13 @@ async fn plugin_thread_loop(
                 panic!("Fatal plugin error: {}", error_msg);
             }
         }
+        if has_pending_work && requests_since_poll >= MAX_READY_REQUESTS_BEFORE_EVENT_LOOP_POLL {
+            has_pending_work = runtime.borrow_mut().poll_event_loop_once();
+            requests_since_poll = 0;
+        }
 
         tokio::select! {
-            biased; // Prefer handling requests over polling
+            biased; // Prefer requests only within the bounded batch above.
 
             request = request_receiver.recv() => {
                 match request {
@@ -1083,6 +1218,7 @@ async fn plugin_thread_loop(
                         action_name,
                         args_json,
                         request_id,
+                        invocation,
                         response,
                     }) => {
                         // Start the action without blocking - this allows us to process
@@ -1091,6 +1227,7 @@ async fn plugin_thread_loop(
                             &action_name,
                             args_json.as_deref(),
                             request_id,
+                            invocation,
                         );
                         fire_and_forget(response.send(result));
                         has_pending_work = true; // Action may have started async work
@@ -1110,11 +1247,13 @@ async fn plugin_thread_loop(
                         break;
                     }
                 }
+                requests_since_poll += 1;
             }
 
             // Poll the JS event loop periodically to make progress on pending promises
             _ = tokio::time::sleep(poll_interval), if has_pending_work => {
                 has_pending_work = runtime.borrow_mut().poll_event_loop_once();
+                requests_since_poll = 0;
             }
         }
     }
@@ -1133,6 +1272,7 @@ async fn run_hook_internal_rc(
     hook_name: &str,
     args: &HookArgs,
     target: Option<&str>,
+    invocation: Option<PluginInvocation>,
 ) -> Result<()> {
     // Convert HookArgs to serde_json::Value using hook_args_to_json which produces flat JSON
     // (not enum-tagged JSON from serde's default Serialize)
@@ -1148,7 +1288,7 @@ async fn run_hook_internal_rc(
     let emit_start = std::time::Instant::now();
     runtime
         .borrow_mut()
-        .emit_to(hook_name, &json_data, target)
+        .emit_to(hook_name, &json_data, target, invocation)
         .await?;
     tracing::trace!(
         hook = hook_name,
@@ -1167,18 +1307,28 @@ async fn handle_request(
     plugins: &mut HashMap<String, TsPluginInfo>,
 ) -> bool {
     match request {
-        PluginRequest::LoadPlugin { path, response } => {
-            let result = load_plugin_internal(Rc::clone(&runtime), plugins, &path).await;
+        PluginRequest::LoadPlugin {
+            path,
+            kind,
+            response,
+        } => {
+            let result = load_plugin_internal(Rc::clone(&runtime), plugins, &path, kind).await;
             fire_and_forget(response.send(result));
         }
 
-        PluginRequest::LoadPluginsFromDir { dir, response } => {
-            let errors = load_plugins_from_dir_internal(Rc::clone(&runtime), plugins, &dir).await;
+        PluginRequest::LoadPluginsFromDir {
+            dir,
+            kind,
+            response,
+        } => {
+            let errors =
+                load_plugins_from_dir_internal(Rc::clone(&runtime), plugins, &dir, kind).await;
             fire_and_forget(response.send(errors));
         }
 
         PluginRequest::LoadPluginsFromDirWithConfig {
             dir,
+            kind,
             plugin_configs,
             response,
         } => {
@@ -1187,6 +1337,7 @@ async fn handle_request(
                 plugins,
                 &dir,
                 &plugin_configs,
+                kind,
             )
             .await;
             fire_and_forget(response.send((errors, discovered)));
@@ -1196,6 +1347,7 @@ async fn handle_request(
             source,
             name,
             is_typescript,
+            kind,
             response,
         } => {
             let result = load_plugin_from_source_internal(
@@ -1204,6 +1356,7 @@ async fn handle_request(
                 &source,
                 &name,
                 is_typescript,
+                kind,
             );
             fire_and_forget(response.send(result));
         }
@@ -1238,6 +1391,7 @@ async fn handle_request(
             hook_name,
             args,
             target,
+            invocation,
         } => {
             // Fire-and-forget hook execution
             let hook_start = std::time::Instant::now();
@@ -1247,9 +1401,14 @@ async fn handle_request(
             } else {
                 tracing::trace!(hook = %hook_name, "RunHook request received");
             }
-            if let Err(e) =
-                run_hook_internal_rc(Rc::clone(&runtime), &hook_name, &args, target.as_deref())
-                    .await
+            if let Err(e) = run_hook_internal_rc(
+                Rc::clone(&runtime),
+                &hook_name,
+                &args,
+                target.as_deref(),
+                invocation.clone(),
+            )
+            .await
             {
                 let error_msg = format!("Plugin error in '{}': {}", hook_name, e);
                 tracing::error!("{}", error_msg);
@@ -1258,7 +1417,9 @@ async fn handle_request(
             }
             // Send sentinel so the main thread can wait deterministically
             // for all commands from this hook to be available.
-            runtime.borrow().send_hook_completed(hook_name.clone());
+            runtime
+                .borrow()
+                .send_hook_completed(hook_name.clone(), invocation);
             if hook_name == "prompt_confirmed" || hook_name == "prompt_cancelled" {
                 tracing::info!(
                     hook = %hook_name,
@@ -1288,54 +1449,36 @@ async fn handle_request(
         }
 
         PluginRequest::ResolveCallback {
+            expected_instance,
             callback_id,
             result_json,
         } => {
-            // One callback resolves per async op completion; a plugin that
-            // fires async calls in bulk (or a feedback loop) drives this at
-            // high frequency, and `result_json` can be large. Keep both at
-            // `trace` so it's off by default and not amplifying log volume.
-            tracing::trace!(
-                "ResolveCallback: resolving callback_id={} with result_json={}",
-                callback_id,
-                result_json
-            );
-            runtime
-                .borrow_mut()
-                .resolve_callback(callback_id, &result_json);
-            // resolve_callback now runs execute_pending_job() internally
-            tracing::trace!(
-                "ResolveCallback: done resolving callback_id={}",
-                callback_id
-            );
-        }
-
-        PluginRequest::RejectCallback { callback_id, error } => {
-            runtime.borrow_mut().reject_callback(callback_id, &error);
-            // reject_callback now runs execute_pending_job() internally
-        }
-
-        PluginRequest::TrackAsyncResource {
-            plugin_name,
-            resource,
-        } => {
-            let rt = runtime.borrow();
-            let mut tracked = rt.plugin_tracked_state.borrow_mut();
-            let state = tracked.entry(plugin_name).or_default();
-            match resource {
-                TrackedAsyncResource::VirtualBuffer(buffer_id) => {
-                    state.virtual_buffer_ids.push(buffer_id);
-                }
-                TrackedAsyncResource::CompositeBuffer(buffer_id) => {
-                    state.composite_buffer_ids.push(buffer_id);
-                }
-                TrackedAsyncResource::Terminal(terminal_id) => {
-                    state.terminal_ids.push(terminal_id);
-                }
-                TrackedAsyncResource::WatchHandle(handle) => {
-                    state.watch_handles.push(handle);
-                }
+            tracing::trace!(%callback_id, "resolving plugin callback");
+            let mut runtime = runtime.borrow_mut();
+            if let Some(plugin_instance_id) = expected_instance {
+                runtime.resolve_callback_for(plugin_instance_id, callback_id, &result_json);
+            } else {
+                runtime.resolve_callback(callback_id, &result_json);
             }
+        }
+
+        PluginRequest::RejectCallback {
+            expected_instance,
+            callback_id,
+            error,
+        } => {
+            let mut runtime = runtime.borrow_mut();
+            if let Some(plugin_instance_id) = expected_instance {
+                runtime.reject_callback_for(plugin_instance_id, callback_id, &error);
+            } else {
+                runtime.reject_callback(callback_id, &error);
+            }
+        }
+
+        PluginRequest::TrackAsyncResource { owner, resource } => {
+            runtime
+                .borrow()
+                .record_or_cleanup_async_resource(owner, resource);
         }
 
         PluginRequest::Shutdown => {
@@ -1355,6 +1498,7 @@ struct PreparedPlugin {
     js_code: String,
     i18n: Option<HashMap<String, HashMap<String, String>>>,
     dependencies: Vec<String>,
+    trusted_builtin: Option<fresh_core::api::TrustedBuiltinPlugin>,
     /// `.d.ts` emit for the plugin source, produced by oxc's
     /// isolated-declarations transformer. Present on every successful
     /// TS/JS prepare; callers can use it to assemble a consolidated
@@ -1369,19 +1513,33 @@ struct PreparedPlugin {
 ///
 /// This function does I/O and CPU-bound work only — no QuickJS interaction.
 /// It is safe to call from any thread (all inputs/outputs are Send).
-fn prepare_plugin(path: &Path) -> Result<PreparedPlugin> {
+fn prepare_plugin(path: &Path, kind: &PluginLoadKind) -> Result<PreparedPlugin> {
     let plugin_name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("Invalid plugin filename"))?
         .to_string();
+    let trusted_spec = kind.verified_trusted_builtin(&plugin_name, path)?;
 
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("Failed to read plugin {}: {}", path.display(), e))?;
+    let source = if let Some(spec) = &trusted_spec {
+        let bytes = spec
+            .sources()
+            .get(spec.entrypoint())
+            .expect("trusted entrypoint is present in its source map");
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|error| anyhow!("Trusted plugin {} is not UTF-8: {error}", path.display()))?
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|error| anyhow!("Failed to read plugin {}: {error}", path.display()))?
+    };
 
-    let filename = path
+    let filename = trusted_spec
+        .as_ref()
+        .map(|spec| spec.entrypoint())
+        .unwrap_or(path)
         .file_name()
-        .and_then(|s| s.to_str())
+        .and_then(|name| name.to_str())
         .unwrap_or("plugin.ts");
 
     // Extract dependencies before transpilation
@@ -1409,17 +1567,23 @@ fn prepare_plugin(path: &Path) -> Result<PreparedPlugin> {
         None
     };
 
-    // Transpile/bundle to JS (same logic as QuickJsBackend::load_module_with_source)
+    // Trusted built-ins bundle only the immutable bytes compiled into the host.
     let js_code = if fresh_parser_js::has_es_imports(&source) {
-        match fresh_parser_js::bundle_module(path) {
+        let bundled = match &trusted_spec {
+            Some(spec) => {
+                fresh_parser_js::bundle_module_from_sources(spec.entrypoint(), spec.sources())
+            }
+            None => fresh_parser_js::bundle_module(path),
+        };
+        match bundled {
             Ok(bundled) => bundled,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     "Plugin {} uses ES imports but bundling failed: {}. Skipping.",
                     path.display(),
-                    e
+                    error
                 );
-                return Err(anyhow!("Bundling failed for {}: {}", plugin_name, e));
+                return Err(anyhow!("Bundling failed for {}: {}", plugin_name, error));
             }
         }
     } else if fresh_parser_js::has_es_module_syntax(&source) {
@@ -1435,22 +1599,28 @@ fn prepare_plugin(path: &Path) -> Result<PreparedPlugin> {
         source
     };
 
-    // Load accompanying .i18n.json file
-    let i18n_path = path.with_extension("i18n.json");
-    let i18n = if i18n_path.exists() {
-        std::fs::read_to_string(&i18n_path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
+    let i18n = if let Some(spec) = &trusted_spec {
+        spec.sources()
+            .get(&spec.entrypoint().with_extension("i18n.json"))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|content| serde_json::from_str(content).ok())
     } else {
-        None
+        let i18n_path = path.with_extension("i18n.json");
+        if i18n_path.exists() {
+            std::fs::read_to_string(&i18n_path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+        } else {
+            None
+        }
     };
-
     Ok(PreparedPlugin {
         name: plugin_name,
         path: path.to_path_buf(),
         js_code,
         i18n,
         dependencies,
+        trusted_builtin: trusted_spec.as_ref().map(|spec| spec.identity()),
         declarations,
     })
 }
@@ -1461,44 +1631,53 @@ fn execute_prepared_plugin(
     runtime: &Rc<RefCell<QuickJsBackend>>,
     plugins: &mut HashMap<String, TsPluginInfo>,
     prepared: &PreparedPlugin,
+    kind: PluginLoadKind,
 ) -> Result<()> {
-    // Register i18n strings
-    if let Some(ref i18n) = prepared.i18n {
+    if kind.trusted_builtin(&prepared.name) != prepared.trusted_builtin {
+        return Err(anyhow!(
+            "trusted built-in attestation changed after preparation"
+        ));
+    }
+    runtime
+        .borrow()
+        .validate_plugin_load(&prepared.name, &kind)?;
+    if plugins.contains_key(&prepared.name) {
+        unload_plugin_internal(Rc::clone(runtime), plugins, &prepared.name)?;
+    }
+    runtime.borrow().prepare_plugin_load(&prepared.name, kind)?;
+
+    let result = (|| {
+        if let Some(i18n) = &prepared.i18n {
+            runtime
+                .borrow_mut()
+                .services
+                .register_plugin_strings(&prepared.name, i18n.clone());
+        }
+
+        let path_str = prepared
+            .path
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid path encoding"))?;
         runtime
             .borrow_mut()
-            .services
-            .register_plugin_strings(&prepared.name, i18n.clone());
-        tracing::debug!("Loaded i18n strings for plugin '{}'", prepared.name);
+            .execute_js(&prepared.js_code, path_str)?;
+
+        plugins.insert(
+            prepared.name.clone(),
+            TsPluginInfo {
+                name: prepared.name.clone(),
+                path: prepared.path.clone(),
+                enabled: true,
+                declarations: prepared.declarations.clone(),
+            },
+        );
+        Ok(())
+    })();
+
+    if result.is_err() {
+        runtime.borrow().abandon_plugin_load(&prepared.name);
     }
-
-    let path_str = prepared
-        .path
-        .to_str()
-        .ok_or_else(|| anyhow!("Invalid path encoding"))?;
-
-    let exec_start = std::time::Instant::now();
-    runtime
-        .borrow_mut()
-        .execute_js(&prepared.js_code, path_str)?;
-    let exec_elapsed = exec_start.elapsed();
-
-    tracing::debug!(
-        "execute_prepared_plugin: plugin '{}' executed in {:?}",
-        prepared.name,
-        exec_elapsed
-    );
-
-    plugins.insert(
-        prepared.name.clone(),
-        TsPluginInfo {
-            name: prepared.name.clone(),
-            path: prepared.path.clone(),
-            enabled: true,
-            declarations: prepared.declarations.clone(),
-        },
-    );
-
-    Ok(())
+    result
 }
 
 #[allow(clippy::await_holding_refcell_ref)]
@@ -1506,75 +1685,10 @@ async fn load_plugin_internal(
     runtime: Rc<RefCell<QuickJsBackend>>,
     plugins: &mut HashMap<String, TsPluginInfo>,
     path: &Path,
+    kind: PluginLoadKind,
 ) -> Result<()> {
-    let plugin_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Invalid plugin filename"))?
-        .to_string();
-
-    tracing::info!("Loading TypeScript plugin: {} from {:?}", plugin_name, path);
-    tracing::debug!(
-        "load_plugin_internal: starting module load for plugin '{}'",
-        plugin_name
-    );
-
-    // Load and execute the module, passing plugin name for command registration
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow!("Invalid path encoding"))?;
-
-    // Try to load accompanying .i18n.json file
-    let i18n_path = path.with_extension("i18n.json");
-    if i18n_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&i18n_path) {
-            if let Ok(strings) = serde_json::from_str::<
-                std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-            >(&content)
-            {
-                runtime
-                    .borrow_mut()
-                    .services
-                    .register_plugin_strings(&plugin_name, strings);
-                tracing::debug!("Loaded i18n strings for plugin '{}'", plugin_name);
-            }
-        }
-    }
-
-    let load_start = std::time::Instant::now();
-    runtime
-        .borrow_mut()
-        .load_module_with_source(path_str, &plugin_name)
-        .await?;
-    let load_elapsed = load_start.elapsed();
-
-    tracing::debug!(
-        "load_plugin_internal: plugin '{}' loaded successfully in {:?}",
-        plugin_name,
-        load_elapsed
-    );
-
-    // Store plugin info
-    plugins.insert(
-        plugin_name.clone(),
-        TsPluginInfo {
-            name: plugin_name.clone(),
-            path: path.to_path_buf(),
-            enabled: true,
-            // `load_plugin_internal` is the hot-reload path (single
-            // file, no prepare-then-execute split). Skip the emit
-            // here; the full directory scan picks it up next time.
-            declarations: None,
-        },
-    );
-
-    tracing::debug!(
-        "load_plugin_internal: plugin '{}' registered, total plugins loaded: {}",
-        plugin_name,
-        plugins.len()
-    );
-
-    Ok(())
+    let prepared = prepare_plugin(path, &kind)?;
+    execute_prepared_plugin(&runtime, plugins, &prepared, kind)
 }
 
 /// Load all plugins from a directory
@@ -1582,6 +1696,7 @@ async fn load_plugins_from_dir_internal(
     runtime: Rc<RefCell<QuickJsBackend>>,
     plugins: &mut HashMap<String, TsPluginInfo>,
     dir: &Path,
+    kind: PluginLoadKind,
 ) -> Vec<String> {
     tracing::debug!(
         "load_plugins_from_dir_internal: scanning directory {:?}",
@@ -1605,7 +1720,9 @@ async fn load_plugins_from_dir_internal(
                         "load_plugins_from_dir_internal: attempting to load {:?}",
                         path
                     );
-                    if let Err(e) = load_plugin_internal(Rc::clone(&runtime), plugins, &path).await
+                    if let Err(e) =
+                        load_plugin_internal(Rc::clone(&runtime), plugins, &path, kind.clone())
+                            .await
                     {
                         let err = format!("Failed to load {:?}: {}", path, e);
                         tracing::error!("{}", err);
@@ -1638,6 +1755,7 @@ async fn load_plugins_from_dir_with_config_internal(
     plugins: &mut HashMap<String, TsPluginInfo>,
     dir: &Path,
     plugin_configs: &HashMap<String, PluginConfig>,
+    kind: PluginLoadKind,
 ) -> (Vec<String>, HashMap<String, PluginConfig>) {
     tracing::debug!(
         "load_plugins_from_dir_with_config_internal: scanning directory {:?}",
@@ -1719,13 +1837,14 @@ async fn load_plugins_from_dir_with_config_internal(
             .iter()
             .map(|path| {
                 let path = path.clone();
+                let kind = kind.clone();
                 scope.spawn(move || {
                     let name = path
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    let result = prepare_plugin(&path);
+                    let result = prepare_plugin(&path, &kind);
                     (name, result)
                 })
             })
@@ -1794,7 +1913,7 @@ async fn load_plugins_from_dir_with_config_internal(
                 "load_plugins_from_dir_with_config_internal: executing plugin '{}'",
                 plugin_name
             );
-            if let Err(e) = execute_prepared_plugin(&runtime, plugins, prepared) {
+            if let Err(e) = execute_prepared_plugin(&runtime, plugins, prepared, kind.clone()) {
                 let err = format!("Failed to execute plugin '{}': {}", plugin_name, e);
                 tracing::error!("{}", err);
                 errors.push(err);
@@ -1830,43 +1949,36 @@ fn load_plugin_from_source_internal(
     source: &str,
     name: &str,
     is_typescript: bool,
+    kind: PluginLoadKind,
 ) -> Result<()> {
-    // Hot-reload: unload previous version if it exists
+    if matches!(&kind, PluginLoadKind::Bundled { .. }) {
+        return Err(anyhow!(
+            "bundled plugin provenance requires a verified filesystem entrypoint"
+        ));
+    }
+    runtime.borrow().validate_plugin_load(name, &kind)?;
     if plugins.contains_key(name) {
-        tracing::info!(
-            "Hot-reloading buffer plugin '{}' — unloading previous version",
-            name
-        );
         unload_plugin_internal(Rc::clone(&runtime), plugins, name)?;
     }
+    runtime.borrow().prepare_plugin_load(name, kind)?;
 
-    tracing::info!("Loading plugin from source: {}", name);
-
-    runtime
+    let result = runtime
         .borrow_mut()
-        .execute_source(source, name, is_typescript)?;
+        .execute_source(source, name, is_typescript);
+    if let Err(error) = result {
+        runtime.borrow().abandon_plugin_load(name);
+        return Err(error);
+    }
 
-    // Register in plugins map with a synthetic path
     plugins.insert(
         name.to_string(),
         TsPluginInfo {
             name: name.to_string(),
             path: PathBuf::from(format!("<buffer:{}>", name)),
             enabled: true,
-            // "Load from buffer" is a developer convenience — the
-            // source doesn't live on disk, so we skip isolated-
-            // declarations emit. Users editing real plugin files
-            // still get types on the next full scan.
             declarations: None,
         },
     );
-
-    tracing::info!(
-        "Buffer plugin '{}' loaded successfully, total plugins: {}",
-        name,
-        plugins.len()
-    );
-
     Ok(())
 }
 
@@ -1911,16 +2023,19 @@ async fn reload_plugin_internal(
         .ok_or_else(|| anyhow!("Plugin '{}' not found", name))?
         .path
         .clone();
+    let kind = runtime
+        .borrow()
+        .plugin_load_kind(name)
+        .unwrap_or(PluginLoadKind::External);
 
     unload_plugin_internal(Rc::clone(&runtime), plugins, name)?;
-    load_plugin_internal(runtime, plugins, &path).await?;
-
-    Ok(())
+    load_plugin_internal(runtime, plugins, &path, kind).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fresh_core::api::{PluginCommand, TrustedBuiltinPlugin};
     use fresh_core::hooks::hook_args_to_json;
 
     #[test]
@@ -1946,5 +2061,84 @@ mod tests {
         let json = hook_args_to_json(&args).unwrap();
         assert_eq!(json["prompt_type"], "search");
         assert_eq!(json["input"], "test");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_requests_cannot_starve_cross_plugin_promise_settlement() {
+        let (command_sender, command_receiver) = std::sync::mpsc::channel();
+        let state_snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        let mut backend = QuickJsBackend::with_state(
+            state_snapshot,
+            command_sender,
+            Arc::new(fresh_core::services::NoopServiceBridge),
+        )
+        .unwrap();
+
+        let spec = crate::runtime::TrustedBuiltinSpec::from_embedded_files(
+            TrustedBuiltinPlugin::Orchestrator,
+            PathBuf::from("/unused-trusted-plugin-root"),
+            PathBuf::from("orchestrator.ts"),
+            [(PathBuf::from("orchestrator.ts"), b"".as_slice())],
+        )
+        .unwrap();
+        backend
+            .prepare_plugin_load(
+                "orchestrator",
+                PluginLoadKind::bundled(crate::runtime::TrustedBuiltinManifest::new([(
+                    "orchestrator".to_string(),
+                    spec,
+                )])),
+            )
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                editor.exportPluginApi("orchestrator", {
+                    runAgent: async () => "settled",
+                });
+                "#,
+                "orchestrator",
+                false,
+            )
+            .unwrap();
+        backend
+            .prepare_plugin_load("api-caller", PluginLoadKind::External)
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                editor.getPluginApi("orchestrator").runAgent({}).then(() => {
+                    editor.setStatus("bridge promise settled");
+                });
+                "#,
+                "api-caller",
+                false,
+            )
+            .unwrap();
+        assert!(command_receiver.try_recv().is_err());
+
+        let runtime = Rc::new(RefCell::new(backend));
+        let (request_sender, request_receiver) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..MAX_READY_REQUESTS_BEFORE_EVENT_LOOP_POLL {
+            let (response, _response_receiver) = oneshot::channel();
+            request_sender
+                .send(PluginRequest::HasHookHandlers {
+                    hook_name: "never-registered".to_string(),
+                    response,
+                })
+                .unwrap();
+        }
+        request_sender.send(PluginRequest::Shutdown).unwrap();
+
+        let mut plugins = HashMap::new();
+        plugin_thread_loop(runtime, &mut plugins, request_receiver).await;
+
+        assert!(command_receiver.try_iter().any(|envelope| {
+            matches!(
+                envelope.command,
+                PluginCommand::SetStatus { ref message }
+                    if message == "bridge promise settled"
+            )
+        }));
     }
 }

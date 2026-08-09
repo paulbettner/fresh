@@ -167,40 +167,42 @@ impl Editor {
         &self,
         exclude_buffer_id: crate::model::event::BufferId,
     ) -> Vec<OtherBufferSlice> {
-        let mut slices = Vec::new();
+        self.collect_other_buffer_slices_in_window(self.active_window, exclude_buffer_id)
+    }
 
-        for (&buf_id, state) in self
-            .windows
-            .get(&self.active_window)
-            .map(|w| &w.buffers)
-            .expect("active window present")
-        {
-            if buf_id == exclude_buffer_id {
+    pub(crate) fn collect_other_buffer_slices_in_window(
+        &self,
+        window_id: fresh_core::WindowId,
+        exclude_buffer_id: crate::model::event::BufferId,
+    ) -> Vec<OtherBufferSlice> {
+        let Some(window) = self.windows.get(&window_id) else {
+            return Vec::new();
+        };
+        let mut slices = Vec::new();
+        for (&buffer_id, state) in &window.buffers {
+            if buffer_id == exclude_buffer_id {
                 continue;
             }
-            let buf = &state.buffer;
-            let buf_len = buf.len();
-            if buf_len == 0 {
+            let buffer = &state.buffer;
+            let buffer_len = buffer.len();
+            if buffer_len == 0 {
                 continue;
             }
-            // Take a window from the middle (or full if small enough).
             let radius = OTHER_BUFFER_SCAN_RADIUS;
-            let mid = buf_len / 2;
-            let start = mid.saturating_sub(radius);
-            let end = (mid + radius).min(buf_len);
-            let bytes = buf.slice_bytes(start..end);
-            let label = buf
+            let middle = buffer_len / 2;
+            let start = middle.saturating_sub(radius);
+            let end = (middle + radius).min(buffer_len);
+            let label = buffer
                 .file_path()
-                .and_then(|p| p.file_name())
-                .map(|f| f.to_string_lossy().to_string())
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_else(|| "untitled".to_string());
             slices.push(OtherBufferSlice {
-                buffer_id: buf_id.0 as u64,
-                bytes,
+                buffer_id: buffer_id.0 as u64,
+                bytes: buffer.slice_bytes(start..end),
                 label,
             });
         }
-
         slices
     }
 
@@ -219,55 +221,61 @@ impl Editor {
     pub(crate) fn get_buffer_completion_popup_items(
         &mut self,
     ) -> Vec<crate::model::event::PopupListItemData> {
+        self.get_buffer_completion_popup_items_in_window(self.active_window)
+    }
+
+    pub(crate) fn get_buffer_completion_popup_items_in_window(
+        &mut self,
+        window_id: fresh_core::WindowId,
+    ) -> Vec<crate::model::event::PopupListItemData> {
         use crate::model::event::PopupListItemData;
         use crate::primitives::word_navigation::find_completion_word_start;
 
-        let cursor_pos = self.active_cursors().primary().position;
-        let word_start = find_completion_word_start(&self.active_state().buffer, cursor_pos);
-
-        if word_start >= cursor_pos {
+        let Some(window) = self.windows.get_mut(&window_id) else {
             return Vec::new();
-        }
-
-        let prefix = self
-            .active_state_mut()
-            .get_text_range(word_start, cursor_pos);
-        if prefix.is_empty() {
-            return Vec::new();
-        }
-
-        let buffer_len = self.active_state().buffer.len();
-        let is_large = self.active_state().buffer.is_large_file();
-        let scan_range = CompletionContext::compute_scan_range(cursor_pos, buffer_len, is_large);
-        let buffer_window = self.active_state().buffer.slice_bytes(scan_range.clone());
-        let word_chars_extra = self.active_state().buffer_settings.word_characters.clone();
-
-        let active_buf_id = self.active_buffer();
-        let other_buffers = self.collect_other_buffer_slices(active_buf_id);
-
-        // Get viewport bounds for proximity scoring.
-        let split_id = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        let viewport_top_byte = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&split_id)
-            .map(|sv| sv.viewport.top_byte())
+        };
+        let buffer_id = window.active_buffer();
+        let cursor_pos = window.active_cursors().primary().position;
+        let (word_start, prefix, buffer_len, is_large, scan_range, buffer_window, word_chars_extra) = {
+            let state = window.active_state_mut();
+            let word_start = find_completion_word_start(&state.buffer, cursor_pos);
+            if word_start >= cursor_pos {
+                return Vec::new();
+            }
+            let prefix = state.get_text_range(word_start, cursor_pos);
+            if prefix.is_empty() {
+                return Vec::new();
+            }
+            let buffer_len = state.buffer.len();
+            let is_large = state.buffer.is_large_file();
+            let scan_range =
+                CompletionContext::compute_scan_range(cursor_pos, buffer_len, is_large);
+            let buffer_window = state.buffer.slice_bytes(scan_range.clone());
+            (
+                word_start,
+                prefix,
+                buffer_len,
+                is_large,
+                scan_range,
+                buffer_window,
+                state.buffer_settings.word_characters.clone(),
+            )
+        };
+        let split_id = window
+            .buffers
+            .splits()
+            .map(|(manager, _)| manager.active_split())
+            .expect("window must have a populated split layout");
+        let viewport_top_byte = window
+            .buffers
+            .splits()
+            .and_then(|(_, views)| views.get(&split_id))
+            .map(|view| view.viewport.top_byte())
             .unwrap_or(0);
-        // Estimate bottom by adding a generous window.
         let viewport_bottom_byte = (viewport_top_byte + 8192).min(buffer_len);
-
-        let prefix_has_upper = prefix.chars().any(|c| c.is_uppercase());
-
-        let ctx = CompletionContext {
+        let prefix_has_uppercase = prefix.chars().any(|character| character.is_uppercase());
+        let other_buffers = self.collect_other_buffer_slices_in_window(window_id, buffer_id);
+        let context = CompletionContext {
             prefix,
             cursor_byte: cursor_pos,
             word_start_byte: word_start,
@@ -278,22 +286,23 @@ impl Editor {
             viewport_bottom_byte,
             language_id: None,
             word_chars_extra,
-            prefix_has_uppercase: prefix_has_upper,
+            prefix_has_uppercase,
             other_buffers,
         };
 
         let candidates = self
-            .active_window_mut()
+            .windows
+            .get_mut(&window_id)
+            .expect("source window checked above")
             .completion_service
-            .request(&ctx, &buffer_window);
-
+            .request(&context, &buffer_window);
         candidates
             .into_iter()
-            .map(|c| PopupListItemData {
-                text: c.label.clone(),
-                detail: c.detail.clone(),
+            .map(|candidate| PopupListItemData {
+                text: candidate.label.clone(),
+                detail: candidate.detail.clone(),
                 icon: Some("w".to_string()),
-                data: c.insert_text.or(Some(c.label)),
+                data: candidate.insert_text.or(Some(candidate.label)),
             })
             .collect()
     }

@@ -48,9 +48,15 @@ fn set_session_authority_on_active_window_updates_window_and_editor() -> anyhow:
     assert_eq!(harness.editor_mut().authority().display_label, "");
 
     let active = harness.editor_mut().active_window_id();
+    let file = temp.path().join("open.txt");
+    std::fs::write(&file, "content")?;
+    harness.open_file(&file)?;
+    let buffer_id = harness.editor().active_buffer();
+    let replacement = container_authority("Container:abc");
+    let replacement_fs = replacement.filesystem.clone();
     harness
         .editor_mut()
-        .set_session_authority(active, container_authority("Container:abc"));
+        .set_session_authority(active, replacement);
 
     // The editor-wide cache (read by the 100+ `self.authority` call sites)
     // reflects the swap…
@@ -67,6 +73,15 @@ fn set_session_authority_on_active_window_updates_window_and_editor() -> anyhow:
             .display_label,
         "Container:abc"
     );
+    let window = harness.editor().active_window();
+    assert!(std::sync::Arc::ptr_eq(
+        window.buffers.get(&buffer_id).unwrap().buffer.filesystem(),
+        &replacement_fs,
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        window.filesystem_manager().filesystem(),
+        &replacement_fs,
+    ));
     Ok(())
 }
 
@@ -268,11 +283,15 @@ fn new_local_session_is_born_with_its_own_local_authority() -> anyhow::Result<()
             "projB".into(),
             Some(proj_b.clone()),
             Some(vec!["sh".into(), "-c".into(), "sleep 60".into()]),
+            None,
             Some("agent".into()),
             born_authority,
             None,
             None,
             false,
+            None,
+            true,
+            true,
             None,
         )
         .map_err(anyhow::Error::msg)?;
@@ -405,6 +424,8 @@ fn switching_to_a_dormant_remote_session_starts_reconnect() -> anyhow::Result<()
                 remote_path: None,
                 extra_args: Vec::new(),
             },
+            verified_anchor: None,
+            canonical_root: None,
             base_env: Vec::new(),
             window: true,
             label: None,
@@ -607,6 +628,7 @@ fn activating_env_does_not_restart_the_editor() -> anyhow::Result<()> {
     harness
         .editor_mut()
         .handle_plugin_command(PluginCommand::SetEnv {
+            window_id: active,
             snippet: "export FRESH_TEST=1".into(),
             dir: None,
         })?;

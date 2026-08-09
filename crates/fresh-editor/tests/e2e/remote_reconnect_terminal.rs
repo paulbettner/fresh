@@ -18,7 +18,12 @@
 //! preserved. This drives that directly. Requires a working PTY (`/dev/ptmx`);
 //! skips when unavailable, like the other terminal e2e tests.
 
-use crate::common::harness::{EditorTestHarness, HarnessOptions};
+use crate::common::{
+    harness::{EditorTestHarness, HarnessOptions},
+    PathGuard,
+};
+use fresh::config::Config;
+use fresh_core::api::TerminalCompanion;
 use portable_pty::{native_pty_system, PtySize};
 
 fn pty_available() -> bool {
@@ -145,4 +150,67 @@ fn respawn_leaves_a_live_terminal_untouched() {
         Some(id),
         "a live terminal keeps its id (not respawned)"
     );
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn reconnect_uses_exact_omp_resume_when_generic_resume_is_disabled() {
+    if !pty_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let resumed = temp.path().join("RESUMED");
+    let relaunched = temp.path().join("RELAUNCHED");
+    let omp = temp.path().join("omp");
+    std::fs::write(
+        &omp,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--fresh-omp-companion\" ] && [ \"$2\" = \"--version\" ]; then exit 0; fi\n\
+             case \"$1\" in\n\
+               --resume) touch '{}'; exec sleep 30 ;;\n\
+               *) touch '{}'; exec sleep 30 ;;\n\
+             esac\n",
+            resumed.display(),
+            relaunched.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path_guard = PathGuard::prepend_with_trusted_omp(temp.path(), &omp);
+    let session_id = "123e4567-e89b-42d3-a456-426614174099";
+    let mut config = Config::default();
+    config.terminal.resume_agents = false;
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let window = harness.editor_mut().active_window_mut();
+    let (old_id, buffer_id) = window.open_terminal_in_window().unwrap();
+    window
+        .terminal_commands
+        .insert(old_id, vec!["omp".into(), "--initial".into()]);
+    window.terminal_resume_commands.insert(
+        old_id,
+        vec!["omp".into(), "--resume".into(), session_id.into()],
+    );
+    window
+        .terminal_companions
+        .insert(old_id, TerminalCompanion::Omp);
+    window.terminal_manager.close(old_id);
+
+    assert_eq!(window.respawn_terminals_through_authority(), 1);
+    let new_id = window.get_terminal_id(buffer_id).unwrap();
+    assert_ne!(new_id, old_id);
+    harness.wait_until(|_| resumed.exists()).unwrap();
+    assert!(!relaunched.exists());
 }

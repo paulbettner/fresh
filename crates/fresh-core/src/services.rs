@@ -93,10 +93,15 @@ pub trait PluginServiceBridge: Send + Sync + 'static {
 
     /// The filesystem plugins use for authority-scoped file I/O — a window's
     /// backend (local for a local window, remote for an SSH/container window).
-    /// `window` selects which window; `None` means the active window (where a
-    /// bare string path resolves). A `None` return of an operation on a window
-    /// that no longer exists is treated as a failed op, never a silent fallback.
-    fn authority_filesystem(&self, window: Option<u64>) -> Arc<dyn PluginFilesystem>;
+    /// `window` selects which window; `None` means the active window. When
+    /// `authority` is present, the selected window must still have that exact
+    /// authority incarnation. The returned object is bound to one concrete
+    /// backend for the whole plugin operation.
+    fn authority_filesystem(
+        &self,
+        window: Option<u64>,
+        authority: Option<crate::api::AuthorityStamp>,
+    ) -> Arc<dyn PluginFilesystem>;
 
     /// The filesystem plugins use for explicitly local file I/O — always the
     /// editor host, regardless of the active authority. This is where a
@@ -207,7 +212,11 @@ impl PluginServiceBridge for NoopServiceBridge {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    fn authority_filesystem(&self, _window: Option<u64>) -> Arc<dyn PluginFilesystem> {
+    fn authority_filesystem(
+        &self,
+        _window: Option<u64>,
+        _authority: Option<crate::api::AuthorityStamp>,
+    ) -> Arc<dyn PluginFilesystem> {
         Arc::new(NoopPluginFilesystem)
     }
     fn local_filesystem(&self) -> Arc<dyn PluginFilesystem> {
@@ -242,12 +251,12 @@ impl PluginServiceBridge for NoopServiceBridge {
     fn unregister_commands_by_prefix(&self, _prefix: &str) {}
     fn unregister_commands_by_plugin(&self, _plugin_name: &str) {}
     fn plugins_dir(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from("/tmp/plugins")
+        std::path::PathBuf::from("plugins")
     }
     fn config_dir(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from("/tmp/config")
+        std::path::PathBuf::from("config")
     }
     fn data_dir(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from("/tmp/data")
+        std::path::PathBuf::from("data")
     }
 }

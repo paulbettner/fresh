@@ -197,6 +197,7 @@ jsonc-parser.workspace = true
 schemars.workspace = true
 rust-i18n.workspace = true
 once_cell.workspace = true
+parking_lot = "0.12"
 # Cross-platform PATH / binary resolution.  Handles Windows PATHEXT
 # (.CMD/.BAT/.PS1 wrappers that npm -g creates for Node-based LSPs),
 # the Unix executable bit, symlinks, and App Execution Aliases on
@@ -295,6 +296,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Console",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
     "Win32_Security",

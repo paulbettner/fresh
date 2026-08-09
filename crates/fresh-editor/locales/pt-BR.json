@@ -1555,6 +1555,7 @@
   "workspace.extract_no_file_path": "Não é possível extrair: o buffer não tem caminho de arquivo",
   "workspace.extract_terminal_dormant": "Não é possível extrair: o terminal não tem uma sessão ativa",
   "workspace.extract_terminal_companion": "Não é possível extrair: terminais auxiliares do OMP devem permanecer no espaço de trabalho original",
+  "workspace.extract_terminal_script_capable": "Não é possível extrair: terminais com acesso a scripts devem permanecer no espaço de trabalho original",
   "workspace.extract_already_rooted": "Já está em um espaço de trabalho com raiz em %{root}",
   "workspace.extracted_tab": "%{name} extraído para o espaço %{label}",
   "whitespace.newline_added": "Nova linha final adicionada",

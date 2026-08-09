@@ -10,9 +10,12 @@
 
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
-use fresh_core::api::PluginCommand;
+use fresh_core::api::{
+    PluginCommand, PluginCommandContext, PluginCommandEnvelope, PluginInstanceId,
+};
 use serde_json::Value;
 use std::path::Path;
+use std::sync::Arc;
 
 const WIDTH: u16 = 160;
 const HEIGHT: u16 = 40;
@@ -33,18 +36,27 @@ fn run_palette(harness: &mut EditorTestHarness, command_name: &str) {
 }
 
 fn set_orch_project_path(harness: &mut EditorTestHarness, project_path: &Path) {
+    let window_id = harness.editor().active_window_id();
     harness
         .editor_mut()
-        .handle_plugin_command(PluginCommand::SetWindowState {
-            plugin_name: "orchestrator".into(),
-            key: "project_path".into(),
-            value: Some(Value::String(project_path.to_string_lossy().into_owned())),
-        })
-        .unwrap();
+        .dispatch_plugin_command_envelope(PluginCommandEnvelope::new(
+            PluginCommand::SetWindowState {
+                window_id,
+                key: "project_path".into(),
+                value: Some(Value::String(project_path.to_string_lossy().into_owned())),
+            },
+            PluginCommandContext {
+                plugin_name: Arc::from("orchestrator"),
+                plugin_instance_id: PluginInstanceId::fresh(),
+                source_window: Some(window_id),
+                ..PluginCommandContext::default()
+            },
+        ));
 }
 
 #[test]
 fn open_dialog_defaults_to_all_projects_then_scopes_to_current() {
+    let _locale = crate::common::locale_lock::lock_locale();
     let mut harness = EditorTestHarness::with_temp_project(WIDTH, HEIGHT).unwrap();
 
     // Project A: the harness's temp project root, owned by the base
@@ -52,9 +64,9 @@ fn open_dialog_defaults_to_all_projects_then_scopes_to_current() {
     let proj_a = harness.project_dir().unwrap().canonicalize().unwrap();
     set_orch_project_path(&mut harness, &proj_a);
 
-    // Project B: a separate tempdir, owned by a second window we
-    // create explicitly. Per-session plugin state always writes to
-    // the *active* window, so we set B active before tagging.
+    // Project B: a separate tempdir, owned by a second window we create
+    // explicitly. Make B active for the picker, then tag that exact captured
+    // window through the loader-attributed command envelope.
     let proj_b_dir = tempfile::TempDir::new().unwrap();
     let proj_b = proj_b_dir.path().canonicalize().unwrap();
     let win_b = harness
@@ -80,10 +92,24 @@ fn open_dialog_defaults_to_all_projects_then_scopes_to_current() {
     // Default scope is "all": every session is listed and the Project
     // control shows "All".
     let screen = harness.screen_to_string();
+    let scope_label = harness
+        .editor()
+        .plugin_manager()
+        .state_snapshot_handle()
+        .and_then(|snapshot| {
+            snapshot
+                .read()
+                .ok()?
+                .keybinding_labels
+                .get("orchestrator_toggle_scope\0orchestrator-open")
+                .cloned()
+        })
+        .expect("Orchestrator scope binding label must be published");
+    let scope_hint = format!("({scope_label})");
     assert!(
-        screen.contains("Project:") && screen.contains("(Alt+P)"),
+        screen.contains("Project:") && screen.contains(&scope_hint),
         "Picker must render the visible Project scope control with its \
-         Alt+P hint.\nScreen:\n{}",
+         live shortcut hint {scope_hint}.\nScreen:\n{}",
         screen,
     );
     assert!(

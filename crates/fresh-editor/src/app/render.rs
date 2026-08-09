@@ -90,6 +90,11 @@ impl Editor {
         // the rest of `render` lays into; `dock_area` (if any) is
         // painted last alongside the centered-overlay path.
         let (dock_area, chrome_area) = self.compute_dock_split(size);
+        if dock_area.is_none() {
+            if let Some(dock) = self.dock.as_mut() {
+                dock.clear_painted_geometry();
+            }
+        }
 
         // Let active animations snapshot the previous frame's buffer.
         // We can't read the live `frame.buffer_mut()` — ratatui resets it
@@ -1486,9 +1491,7 @@ impl Editor {
                 format!("{glyph} {label} — {}", r.detail)
             })
             .unwrap_or_else(|| format!("⇅ {label}"));
-        let connecting = self
-            .remote_attach_inflight
-            .contains(&(u64::MAX - active_id.0));
+        let connecting = self.remote_reconnect_inflight(active_id);
         let state_line = if connecting {
             "Connecting…".to_string()
         } else if let Some(reason) = &window.remote_reconnect_error {
@@ -1784,12 +1787,11 @@ impl Editor {
             // Active window's last failed-reconnect error (drives a core
             // FailedAttach indicator for a dormant remote workspace).
             let remote_reconnect_error = self.active_window().remote_reconnect_error.clone();
-            // The active window is a remote session whose window-derived
-            // connect (dive / retry; see `start_remote_reconnect`'s request-id
-            // scheme) is still in flight — its shell shows `Connecting`.
-            let remote_connecting = self
-                .remote_attach_inflight
-                .contains(&(u64::MAX - self.active_window_id().0))
+            let remote_indicator_override = self.active_window().remote_indicator_override.clone();
+            // The active window is a remote session whose exact-window
+            // connect (dive / retry) is still in flight — its shell shows
+            // `Connecting`.
+            let remote_connecting = self.remote_reconnect_inflight(self.active_window_id())
                 && self.active_window().authority_spec.is_remote();
 
             // Get session label for display (only in session mode). The display
@@ -1825,7 +1827,8 @@ impl Editor {
                 crate::view::ui::status_bar::TerminalRestartState {
                     program: e.program_name().map(str::to_string),
                     exit_code: e.exit_code,
-                    resumes_agent: e.resumes_agent() && self.config.terminal.resume_agents,
+                    resumes_agent: e.resumes_agent()
+                        && (self.config.terminal.resume_agents || e.companion.is_some()),
                 }
             });
             // Single window borrow, split into buffers + cursors so the
@@ -1867,7 +1870,7 @@ impl Editor {
                         remote_connection: remote_connection.as_deref(),
                         session_name: session_name.as_deref(),
                         read_only: is_read_only,
-                        remote_state_override: self.remote_indicator_override.as_ref(),
+                        remote_state_override: remote_indicator_override.as_ref(),
                         remote_reconnect_error: remote_reconnect_error.as_deref(),
                         remote_connecting,
                         is_synthetic_placeholder,
@@ -4637,6 +4640,7 @@ impl Editor {
 
         if inner.width == 0 || inner.height == 0 {
             if let Some(fwp) = self.panel_mut(slot) {
+                fwp.last_outer_rect = Some(overlay_rect);
                 fwp.last_inner_rect = Some(inner);
                 fwp.close_button_rect = close_button_rect;
             }
@@ -4647,6 +4651,7 @@ impl Editor {
         // stop before painting any content cells.
         if !draw {
             if let Some(fwp) = self.panel_mut(slot) {
+                fwp.last_outer_rect = Some(overlay_rect);
                 fwp.last_inner_rect = Some(inner);
                 fwp.close_button_rect = close_button_rect;
             }
@@ -5010,6 +5015,7 @@ impl Editor {
         }
 
         if let Some(fwp) = self.panel_mut(slot) {
+            fwp.last_outer_rect = Some(overlay_rect);
             fwp.last_inner_rect = Some(inner);
             fwp.close_button_rect = close_button_rect;
             fwp.scrollbar_tracks = scrollbar_tracks;
@@ -5186,6 +5192,22 @@ fn paint_dock_seamless_active_tab(
     }
 }
 
+fn snap_inline_overlay_boundary(text: &str, byte: usize) -> usize {
+    crate::primitives::grapheme::snap_to_grapheme_boundary(text, byte.min(text.len()))
+}
+
+fn inline_overlay_covers(
+    text: &str,
+    overlay_start: usize,
+    overlay_end: usize,
+    span_start: usize,
+    span_end: usize,
+) -> bool {
+    let start = snap_inline_overlay_boundary(text, overlay_start);
+    let end = snap_inline_overlay_boundary(text, overlay_end);
+    span_start >= start && span_end <= end && end > start
+}
+
 /// Paint a single rendered widget entry into the frame buffer at
 /// `(x, y)` over `width` cells. Resolves the entry's segments / inline
 /// overlays to styled spans using the panel's theme; trailing columns
@@ -5286,14 +5308,7 @@ pub(crate) fn paint_text_property_entry(
     // boundaries are kept as-is; an interior one floors to the previous
     // grapheme boundary (worst case a span edge shifts by one cluster,
     // invisible in practice).
-    let snap = |i: usize| {
-        let i = i.min(text.len());
-        if text.is_char_boundary(i) {
-            i
-        } else {
-            crate::primitives::grapheme::prev_grapheme_boundary(&text, i)
-        }
-    };
+    let snap = |i: usize| snap_inline_overlay_boundary(&text, i);
     let boundaries: std::collections::BTreeSet<usize> = std::iter::once(0)
         .chain(std::iter::once(text.len()))
         .chain(
@@ -5331,9 +5346,7 @@ pub(crate) fn paint_text_property_entry(
         let mut fg_key = base_fg_key.clone();
         let mut bg_key = base_bg_key.clone();
         for o in &normalized.inline_overlays {
-            let os = o.start.min(text.len());
-            let oe = o.end.min(text.len());
-            if a >= os && b <= oe && oe > os {
+            if inline_overlay_covers(&text, o.start, o.end, a, b) {
                 let resolved = Editor::resolve_overlay_style(&o.style, theme);
                 if let Some(fg) = resolved.fg {
                     style = style.fg(fg);
@@ -5456,4 +5469,30 @@ fn byte_to_screen_col(text: &str, target_byte: usize) -> usize {
         byte += ch.len_utf8();
     }
     col
+}
+
+#[cfg(test)]
+mod inline_overlay_tests {
+    use super::{inline_overlay_covers, snap_inline_overlay_boundary};
+
+    #[test]
+    fn inline_overlay_edges_snap_out_of_combining_and_zwj_graphemes() {
+        let combining = "e\u{301}x";
+        assert_eq!(snap_inline_overlay_boundary(combining, 1), 0);
+        assert_eq!(snap_inline_overlay_boundary(combining, 3), 3);
+
+        let zwj = "👩\u{200d}💻x";
+        assert_eq!(snap_inline_overlay_boundary(zwj, 4), 0);
+        assert_eq!(
+            snap_inline_overlay_boundary(zwj, zwj.len() - 1),
+            zwj.len() - 1
+        );
+    }
+
+    #[test]
+    fn inline_overlay_interval_checks_use_snapped_edges() {
+        let text = "e\u{301}x";
+        assert!(inline_overlay_covers(text, 1, 3, 0, 3));
+        assert!(!inline_overlay_covers(text, 0, 1, 0, 3));
+    }
 }

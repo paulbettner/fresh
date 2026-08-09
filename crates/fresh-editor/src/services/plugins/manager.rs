@@ -32,11 +32,11 @@ pub struct PluginManager {
     _phantom: std::marker::PhantomData<()>,
     /// Test-only side channel: commands pushed via
     /// [`Self::test_inject_command`] are returned by the next
-    /// `process_commands()` call as if they had come from the plugin
+    /// `process_command_envelopes()` call as if they had come from the plugin
     /// thread. Always present (zero overhead — empty `Vec`) so
     /// integration tests in `tests/` can use it without an extra
     /// feature flag.
-    pending_injected_commands: Vec<super::api::PluginCommand>,
+    pending_injected_commands: Vec<super::api::PluginCommandEnvelope>,
 }
 
 impl PluginManager {
@@ -123,16 +123,16 @@ impl PluginManager {
         self.window_registry.clone()
     }
 
-    /// Inject a [`PluginCommand`](super::api::PluginCommand) into the
-    /// manager's pending queue as if it had arrived from the plugin
-    /// thread. Returned by the next `process_commands()` call.
+    /// Inject a [`PluginCommandEnvelope`](super::api::PluginCommandEnvelope)
+    /// into the manager's pending queue as if it had arrived from the plugin
+    /// thread. Returned by the next `process_command_envelopes()` call.
     ///
     /// Intended for tests that need to deterministically reproduce
-    /// renderer/plugin races (e.g. the mid-render `process_commands`
-    /// path in `Editor::render`) without spinning up the real plugin
+    /// renderer/plugin races (e.g. the mid-render plugin-command drain
+    /// in `Editor::render`) without spinning up the real plugin
     /// runtime. Production code should not call this.
-    pub fn test_inject_command(&mut self, command: super::api::PluginCommand) {
-        self.pending_injected_commands.push(command);
+    pub fn test_inject_command(&mut self, envelope: super::api::PluginCommandEnvelope) {
+        self.pending_injected_commands.push(envelope);
     }
 
     /// Check if the plugin system is active (has a running plugin thread,
@@ -147,6 +147,24 @@ impl PluginManager {
         }
         #[cfg(not(feature = "plugins"))]
         {
+            false
+        }
+    }
+    /// Whether this exact loader-minted plugin instance still owns a live context.
+    pub fn is_plugin_instance_active(
+        &self,
+        plugin_instance_id: fresh_core::api::PluginInstanceId,
+    ) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            return self
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.is_plugin_instance_active(plugin_instance_id));
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = plugin_instance_id;
             false
         }
     }
@@ -206,6 +224,19 @@ impl PluginManager {
         (Vec::new(), HashMap::new())
     }
 
+    #[cfg(feature = "plugins")]
+    pub fn load_plugins_from_dir_with_config_and_kind(
+        &self,
+        dir: &Path,
+        plugin_configs: &HashMap<String, PluginConfig>,
+        kind: fresh_plugin_runtime::runtime::PluginLoadKind,
+    ) -> (Vec<String>, HashMap<String, PluginConfig>) {
+        if let Some(manager) = &self.inner {
+            return manager.load_plugins_from_dir_with_config_and_kind(dir, plugin_configs, kind);
+        }
+        (Vec::new(), HashMap::new())
+    }
+
     /// Load plugins from a directory with config support (no-op when plugins disabled).
     #[cfg(not(feature = "plugins"))]
     pub fn load_plugins_from_dir_with_config(
@@ -231,6 +262,16 @@ impl PluginManager {
             let _ = name;
             Ok(())
         }
+    }
+
+    /// Queue an unload without blocking the editor thread.
+    pub fn unload_plugin_request(&self, name: &str) {
+        #[cfg(feature = "plugins")]
+        if let Some(manager) = &self.inner {
+            let _ = manager.unload_plugin_request(name);
+        }
+        #[cfg(not(feature = "plugins"))]
+        let _ = name;
     }
 
     /// Load a single plugin by path.
@@ -273,32 +314,91 @@ impl PluginManager {
         }
     }
 
-    /// Run a hook (fire-and-forget).
-    pub fn run_hook(&self, hook_name: &str, args: super::hooks::HookArgs) {
+    #[cfg(feature = "plugins")]
+    pub fn load_plugin_from_source_with_kind(
+        &self,
+        source: &str,
+        name: &str,
+        is_typescript: bool,
+        kind: fresh_plugin_runtime::runtime::PluginLoadKind,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Plugin system not active"))?
+            .load_plugin_from_source_with_kind(source, name, is_typescript, kind)
+    }
+
+    /// Run a hook (fire-and-forget). Returns whether a subscribed runtime
+    /// consumer accepted the request.
+    pub fn run_hook(&self, hook_name: &str, args: super::hooks::HookArgs) -> bool {
         #[cfg(feature = "plugins")]
         {
-            if let Some(ref manager) = self.inner {
-                manager.run_hook(hook_name, args);
-            }
+            self.inner
+                .as_ref()
+                .is_some_and(|manager| manager.run_hook(hook_name, args))
         }
         #[cfg(not(feature = "plugins"))]
         {
             let _ = (hook_name, args);
+            false
+        }
+    }
+    pub fn run_hook_with_invocation(
+        &self,
+        hook_name: &str,
+        args: super::hooks::HookArgs,
+        invocation: Option<fresh_core::api::PluginInvocation>,
+    ) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            self.inner.as_ref().is_some_and(|manager| {
+                manager.run_hook_with_invocation(hook_name, args, invocation)
+            })
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = (hook_name, args, invocation);
+            false
         }
     }
 
     /// Run a hook in one plugin's context only (fire-and-forget).
     /// Handlers registered by other plugins are skipped.
-    pub fn run_hook_for_plugin(&self, plugin: &str, hook_name: &str, args: super::hooks::HookArgs) {
+    pub fn run_hook_for_plugin(
+        &self,
+        plugin: &str,
+        hook_name: &str,
+        args: super::hooks::HookArgs,
+    ) -> bool {
         #[cfg(feature = "plugins")]
         {
-            if let Some(ref manager) = self.inner {
-                manager.run_hook_for_plugin(plugin, hook_name, args);
-            }
+            self.inner
+                .as_ref()
+                .is_some_and(|manager| manager.run_hook_for_plugin(plugin, hook_name, args))
         }
         #[cfg(not(feature = "plugins"))]
         {
             let _ = (plugin, hook_name, args);
+            false
+        }
+    }
+    pub fn run_hook_for_plugin_with_invocation(
+        &self,
+        plugin: &str,
+        hook_name: &str,
+        args: super::hooks::HookArgs,
+        invocation: Option<fresh_core::api::PluginInvocation>,
+    ) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            self.inner.as_ref().is_some_and(|manager| {
+                manager.run_hook_for_plugin_with_invocation(plugin, hook_name, args, invocation)
+            })
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = (plugin, hook_name, args, invocation);
+            false
         }
     }
 
@@ -316,46 +416,16 @@ impl PluginManager {
         }
     }
 
-    /// Process pending plugin commands (non-blocking).
-    pub fn process_commands(&mut self) -> Vec<super::api::PluginCommand> {
-        // Drain any test-injected commands first so they appear at the
-        // front of the returned batch — matching the order the real
-        // plugin thread would have produced if the inject call were a
-        // genuine plugin response.
+    /// Process pending plugin commands with their loader-owned context.
+    pub fn process_command_envelopes(&mut self) -> Vec<super::api::PluginCommandEnvelope> {
         let mut commands = std::mem::take(&mut self.pending_injected_commands);
         #[cfg(feature = "plugins")]
         {
-            if let Some(ref mut manager) = self.inner {
-                commands.extend(manager.process_commands());
+            if let Some(manager) = &mut self.inner {
+                commands.extend(manager.process_command_envelopes());
             }
         }
         commands
-    }
-
-    /// Process commands, blocking until `HookCompleted` for the given hook arrives.
-    /// See [`PluginThreadHandle::process_commands_until_hook_completed`] for details.
-    ///
-    // TODO: This method is currently unused (dead code). Either wire it into the
-    // render path to synchronously wait for plugin responses (e.g. conceals from
-    // lines_changed), or remove it along with PluginThreadHandle's implementation
-    // and the HookCompleted sentinel if the non-blocking drain approach is sufficient.
-    pub fn process_commands_until_hook_completed(
-        &mut self,
-        hook_name: &str,
-        timeout: std::time::Duration,
-    ) -> Vec<super::api::PluginCommand> {
-        #[cfg(feature = "plugins")]
-        {
-            if let Some(ref mut manager) = self.inner {
-                return manager.process_commands_until_hook_completed(hook_name, timeout);
-            }
-            Vec::new()
-        }
-        #[cfg(not(feature = "plugins"))]
-        {
-            let _ = (hook_name, timeout);
-            Vec::new()
-        }
     }
 
     /// Get the state snapshot handle for updating editor state.
@@ -396,6 +466,24 @@ impl PluginManager {
         self.inner
             .as_ref()
             .map(|m| m.execute_action_async(action_name, args_json, request_id))
+    }
+    #[cfg(feature = "plugins")]
+    pub fn execute_action_async_with_invocation(
+        &self,
+        action_name: &str,
+        args_json: Option<String>,
+        request_id: Option<u64>,
+        invocation: Option<fresh_core::api::PluginInvocation>,
+    ) -> Option<anyhow::Result<fresh_plugin_runtime::thread::oneshot::Receiver<anyhow::Result<()>>>>
+    {
+        self.inner.as_ref().map(|manager| {
+            manager.execute_action_async_with_invocation(
+                action_name,
+                args_json,
+                request_id,
+                invocation,
+            )
+        })
     }
 
     /// List all loaded plugins.
@@ -459,6 +547,24 @@ impl PluginManager {
         })
     }
 
+    #[cfg(feature = "plugins")]
+    pub fn load_plugins_from_dir_with_config_request_and_kind(
+        &self,
+        dir: &Path,
+        plugin_configs: &HashMap<String, PluginConfig>,
+        kind: fresh_plugin_runtime::runtime::PluginLoadKind,
+    ) -> Option<
+        fresh_plugin_runtime::thread::oneshot::Receiver<
+            fresh_plugin_runtime::thread::PluginsDirLoadResult,
+        >,
+    > {
+        self.inner.as_ref().and_then(|manager| {
+            manager
+                .load_plugins_from_dir_with_config_request_and_kind(dir, plugin_configs, kind)
+                .ok()
+        })
+    }
+
     /// Submit a "load plugin from source" request without blocking.
     /// Returns `None` when the plugin runtime is inactive.
     #[cfg(feature = "plugins")]
@@ -470,6 +576,21 @@ impl PluginManager {
     ) -> Option<fresh_plugin_runtime::thread::oneshot::Receiver<anyhow::Result<()>>> {
         self.inner.as_ref().and_then(|m| {
             m.load_plugin_from_source_request(source, name, is_typescript)
+                .ok()
+        })
+    }
+
+    #[cfg(feature = "plugins")]
+    pub fn load_plugin_from_source_request_with_kind(
+        &self,
+        source: &str,
+        name: &str,
+        is_typescript: bool,
+        kind: fresh_plugin_runtime::runtime::PluginLoadKind,
+    ) -> Option<fresh_plugin_runtime::thread::oneshot::Receiver<anyhow::Result<()>>> {
+        self.inner.as_ref().and_then(|manager| {
+            manager
+                .load_plugin_from_source_request_with_kind(source, name, is_typescript, kind)
                 .ok()
         })
     }
@@ -527,6 +648,20 @@ impl PluginManager {
             false
         }
     }
+    /// Targeted non-blocking subscriber check.
+    pub fn has_subscriber(&self, plugin: &str, hook_name: &str) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            self.inner
+                .as_ref()
+                .is_some_and(|manager| manager.has_subscriber(plugin, hook_name))
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = (plugin, hook_name);
+            false
+        }
+    }
 
     /// Resolve an async callback in the plugin runtime
     #[cfg(feature = "plugins")]
@@ -545,6 +680,20 @@ impl PluginManager {
     ) {
         let _ = (callback_id, result_json);
     }
+    /// Resolve only when `callback_id` belongs to this exact loaded instance.
+    pub fn resolve_callback_for(
+        &self,
+        plugin_instance_id: fresh_core::api::PluginInstanceId,
+        callback_id: fresh_core::api::JsCallbackId,
+        result_json: String,
+    ) {
+        #[cfg(feature = "plugins")]
+        if let Some(inner) = &self.inner {
+            inner.resolve_callback_for(plugin_instance_id, callback_id, result_json);
+        }
+        #[cfg(not(feature = "plugins"))]
+        let _ = (plugin_instance_id, callback_id, result_json);
+    }
 
     /// Reject an async callback in the plugin runtime
     #[cfg(feature = "plugins")]
@@ -558,5 +707,19 @@ impl PluginManager {
     #[cfg(not(feature = "plugins"))]
     pub fn reject_callback(&self, callback_id: fresh_core::api::JsCallbackId, error: String) {
         let _ = (callback_id, error);
+    }
+    /// Reject only when `callback_id` belongs to this exact loaded instance.
+    pub fn reject_callback_for(
+        &self,
+        plugin_instance_id: fresh_core::api::PluginInstanceId,
+        callback_id: fresh_core::api::JsCallbackId,
+        error: String,
+    ) {
+        #[cfg(feature = "plugins")]
+        if let Some(inner) = &self.inner {
+            inner.reject_callback_for(plugin_instance_id, callback_id, error);
+        }
+        #[cfg(not(feature = "plugins"))]
+        let _ = (plugin_instance_id, callback_id, error);
     }
 }

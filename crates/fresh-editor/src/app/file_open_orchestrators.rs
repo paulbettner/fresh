@@ -656,59 +656,53 @@ impl Editor {
         &mut self,
         uri: &crate::app::types::LspUri,
     ) -> anyhow::Result<BufferId> {
-        let translation = self.authority().path_translation.clone();
+        let window_id = self.active_window;
+        let buffer_id = self.open_lsp_uri_target_in_window(window_id, uri)?;
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.set_active_buffer(buffer_id);
+        }
+        Ok(buffer_id)
+    }
+
+    pub(crate) fn open_lsp_uri_target_in_window(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        uri: &crate::app::types::LspUri,
+    ) -> anyhow::Result<BufferId> {
+        let window = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow::anyhow!("source window is closed"))?;
+        let translation = window.authority().path_translation.clone();
         let host_path = uri
             .to_host_path(translation.as_ref())
             .ok_or_else(|| anyhow::anyhow!("URI is not a file path"))?;
-
-        // Case 1: file is reachable on the host filesystem (either
-        // local authority, or workspace-mounted on a devcontainer).
-        // `open_file` focuses, which is what callers (goto-def,
-        // workspace edits) expect — they want the cursor to land in
-        // the destination buffer afterward.
-        if self.authority().filesystem.exists(&host_path) {
-            return self.open_file(&host_path);
+        if window.authority().filesystem.exists(&host_path) {
+            return self
+                .windows
+                .get_mut(&window_id)
+                .expect("source window checked above")
+                .open_file_no_focus(&host_path);
         }
-
-        // Case 2: container-only fetch. Only meaningful when the
-        // active authority can route a `cat` through to the
-        // container — `path_translation` being set is the proxy for
-        // "this is a container authority". Local + SSH authorities
-        // skip straight to the error case.
         if translation.is_some() {
-            // The container-side path is the URI's raw path. Calling
-            // `to_host_path` with `None` returns the wire-side path
-            // verbatim (no translation applied) — exactly what we
-            // need for `cat <path>` inside the container.
             let container_path = uri.to_host_path(None).ok_or_else(|| {
                 anyhow::anyhow!("URI is not a file path (container-side decode failed)")
             })?;
-            let buffer_id = self.fetch_and_open_container_file(container_path, uri.clone())?;
-            // Match `open_file`'s focus behaviour so the cursor
-            // assertion in callers (goto-def's `MoveCursor` event)
-            // applies to the right buffer.
-            self.set_active_buffer(buffer_id);
-            return Ok(buffer_id);
+            return self.fetch_and_open_container_file_in_window(
+                window_id,
+                container_path,
+                uri.clone(),
+            );
         }
-
-        // Case 3: nothing we can open.
         Err(anyhow::anyhow!(
             "could not open {}: file not found",
             host_path.display()
         ))
     }
 
-    /// Run `cat <container_path>` through the active authority's
-    /// process spawner and open the result as a read-only buffer
-    /// tagged with the wire URI. Helper for [`Self::open_lsp_uri_target`].
-    ///
-    /// On `cat` exit-code 0 the bytes become the buffer's contents.
-    /// On any error (no tokio runtime, spawner failure, non-zero
-    /// exit) we return `Err` with a message that includes the
-    /// container path and stderr's first line — enough for the
-    /// caller's status-line surface.
-    fn fetch_and_open_container_file(
+    fn fetch_and_open_container_file_in_window(
         &mut self,
+        window_id: fresh_core::WindowId,
         container_path: std::path::PathBuf,
         uri: crate::app::types::LspUri,
     ) -> anyhow::Result<BufferId> {
@@ -718,19 +712,23 @@ impl Editor {
                 container_path.display()
             )
         })?;
-
-        let spawner = self.authority().process_spawner.clone();
+        let spawner = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow::anyhow!("source window is closed"))?
+            .authority()
+            .process_spawner
+            .clone();
         let path_arg = container_path.to_string_lossy().into_owned();
         let result = runtime
             .block_on(spawner.spawn("cat".into(), vec![path_arg], None))
-            .map_err(|e| {
+            .map_err(|error| {
                 anyhow::anyhow!(
                     "could not open {} from container: {}",
                     container_path.display(),
-                    e
+                    error
                 )
             })?;
-
         if result.exit_code != 0 {
             let first_stderr_line = result
                 .stderr
@@ -744,46 +742,48 @@ impl Editor {
                 first_stderr_line
             );
         }
-
-        self.open_container_only_file(container_path, uri, result.stdout.into_bytes())
+        self.open_container_only_file_in_window(
+            window_id,
+            container_path,
+            uri,
+            result.stdout.into_bytes(),
+        )
     }
 
-    /// Build a buffer from already-fetched container content. The
-    /// buffer's `file_path` is the in-container path (so further LSP
-    /// requests carry the right URI) and the buffer is read-only —
-    /// there is no host writeback path for files that exist only
-    /// inside the container. LSP stays enabled so a follow-up
-    /// goto-def from the fetched buffer works.
     pub(crate) fn open_container_only_file(
         &mut self,
         container_path: std::path::PathBuf,
         uri: crate::app::types::LspUri,
         content: Vec<u8>,
     ) -> anyhow::Result<BufferId> {
-        // Don't double-open. The file_path matches by container path,
-        // since that's what we set after build.
-        let already_open = self
-            .buffers()
+        self.open_container_only_file_in_window(self.active_window, container_path, uri, content)
+    }
+
+    pub(crate) fn open_container_only_file_in_window(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        container_path: std::path::PathBuf,
+        uri: crate::app::types::LspUri,
+        content: Vec<u8>,
+    ) -> anyhow::Result<BufferId> {
+        let window = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| anyhow::anyhow!("source window is closed"))?;
+        if let Some(buffer_id) = window
+            .buffers
             .iter()
             .find(|(_, state)| state.buffer.file_path() == Some(container_path.as_path()))
-            .map(|(id, _)| *id);
-        if let Some(id) = already_open {
-            return Ok(id);
+            .map(|(id, _)| *id)
+        {
+            return Ok(buffer_id);
         }
 
-        // Build the buffer from the fetched bytes and pin its
-        // file_path to the container path. The host filesystem ref
-        // here is mostly cosmetic — the buffer is read-only so save
-        // never runs through it.
         let mut buffer = crate::model::buffer::Buffer::from_bytes(
             content,
-            Arc::clone(&self.authority().filesystem),
+            Arc::clone(&window.authority().filesystem),
         );
         buffer.rename_file_path(container_path.clone());
-
-        // Detect language from the container path (the basename's
-        // extension is what matters; the directory tree is
-        // container-side and won't match host-relative globs anyway).
         let first_line = buffer.first_line_lossy();
         let detected =
             crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
@@ -795,10 +795,6 @@ impl Editor {
             );
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
         state.editing_disabled = true;
-
-        // Buffer settings — same resolution as `open_file_no_focus` so the
-        // rendered look is consistent. Container-fetched buffers should obey
-        // the user's editor config like any other read-only buffer.
         state.apply_buffer_config(&self.config);
         state
             .margins
@@ -806,54 +802,44 @@ impl Editor {
         state.apply_occurrence_highlight(self.config.editor.highlight_occurrences);
 
         let buffer_id = self.alloc_buffer_id();
-        self.windows
-            .get_mut(&self.active_window)
-            .map(|w| &mut w.buffers)
-            .expect("active window present")
-            .insert(buffer_id, state);
-        self.active_window_mut()
+        let line_numbers = self.config.editor.line_numbers;
+        let highlight_current_line = self.config.editor.highlight_current_line;
+        let wrap_indent = self.config.editor.wrap_indent;
+        let rulers = self.config.editor.rulers.clone();
+        let scroll_offset = self.config.editor.scroll_offset;
+        let window = self
+            .windows
+            .get_mut(&window_id)
+            .expect("source window checked above");
+        window.buffers.insert(buffer_id, state);
+        window
             .event_logs
             .insert(buffer_id, crate::model::event::EventLog::new());
-
         let mut metadata =
             super::types::BufferMetadata::with_container_file(container_path.clone(), uri);
-        // Notify the LSP servers about the newly opened file so
-        // hover / further goto-def in the fetched buffer works. The
-        // URI we cached is already the wire-form URI, so the LSP
-        // sees the right path.
-        self.notify_lsp_file_opened(&container_path, buffer_id, &mut metadata);
-        self.active_window_mut()
-            .buffer_metadata
-            .insert(buffer_id, metadata);
+        window.notify_lsp_file_opened(&container_path, buffer_id, &mut metadata);
+        window.buffer_metadata.insert(buffer_id, metadata);
 
-        // Wire the buffer into a tab on the preferred split, mirroring
-        // the host-file path. Skip `watch_file` — there's no host
-        // file to inotify, and the spawned-fetch is one-shot.
-        let target_split = self.active_window().preferred_split_for_file();
-        let line_wrap = self.active_window().resolve_line_wrap_for_buffer(buffer_id);
-        let wrap_column = self
-            .active_window()
-            .resolve_wrap_column_for_buffer(buffer_id);
-        if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+        let target_split = window.preferred_split_for_file();
+        let line_wrap = window.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = window.resolve_wrap_column_for_buffer(buffer_id);
+        if let Some(view_state) = window
+            .split_view_states_mut()
+            .expect("window must have a populated split layout")
             .get_mut(&target_split)
         {
             view_state.add_buffer(buffer_id);
-            let buf_state = view_state.ensure_buffer_state(buffer_id);
-            buf_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-                line_numbers: self.config.editor.line_numbers,
-                highlight_current_line: self.config.editor.highlight_current_line,
+            let buffer_state = view_state.ensure_buffer_state(buffer_id);
+            buffer_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
+                line_numbers,
+                highlight_current_line,
                 line_wrap,
-                wrap_indent: self.config.editor.wrap_indent,
+                wrap_indent,
                 wrap_column,
-                rulers: self.config.editor.rulers.clone(),
-                scroll_offset: self.config.editor.scroll_offset,
+                rulers,
+                scroll_offset,
             });
         }
-
         Ok(buffer_id)
     }
 }

@@ -125,8 +125,11 @@ mod stable_id {
     use fresh::config_io::DirectoryContext;
     use fresh::model::filesystem::StdFileSystem;
     use fresh::workspace::{
-        encode_path_for_filename, find_workspace_file_by_root, get_workspaces_dir, Workspace,
+        encode_path_for_filename, find_workspace_file_by_root_in,
+        inspect_workspace_create_attempt_in, inspect_workspace_persistence_in, Workspace,
+        WorkspaceError,
     };
+    use fresh_core::api::WorkspaceCreateAttemptInventory;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -153,13 +156,12 @@ mod stable_id {
         .unwrap()
     }
 
-    /// All workspace files in the (process-global) workspaces dir whose name
-    /// starts with `project`'s encoded root. Unique temp roots per test keep
-    /// parallel tests from seeing each other's files.
-    fn files_for_root(project: &Path) -> Vec<PathBuf> {
+    /// All workspace files in this test's `DirectoryContext` whose name starts
+    /// with `project`'s encoded root.
+    fn files_for_root(dir_context: &DirectoryContext, project: &Path) -> Vec<PathBuf> {
         let canonical = project.canonicalize().unwrap();
         let prefix = encode_path_for_filename(&canonical);
-        let dir = get_workspaces_dir().unwrap();
+        let dir = dir_context.workspaces_dir();
         match std::fs::read_dir(dir) {
             Ok(entries) => entries
                 .flatten()
@@ -198,7 +200,7 @@ mod stable_id {
             e1.open_file(&project.join("a.txt")).unwrap();
             e1.save_workspace().unwrap();
             e1.save_workspace().unwrap();
-            let files = files_for_root(&project);
+            let files = files_for_root(&dir_context, &project);
             assert_eq!(files.len(), 1, "repeated saves reuse one file: {files:?}");
             first_id = read_stable_id(&files[0]).expect("saved workspace carries a stable_id");
         }
@@ -214,7 +216,7 @@ mod stable_id {
         );
         e2.save_workspace().unwrap();
 
-        let files = files_for_root(&project);
+        let files = files_for_root(&dir_context, &project);
         assert_eq!(
             files.len(),
             1,
@@ -243,12 +245,14 @@ mod stable_id {
             let mut ws = e.capture_workspace();
             ws.stable_id = None;
             ws.label = Some("legacy-label".to_string());
-            ws.save().unwrap();
-            let files = files_for_root(&project);
+            ws.save_in(&dir_context).unwrap();
+            let files = files_for_root(&dir_context, &project);
             assert_eq!(files.len(), 1);
             assert_eq!(
                 files[0],
-                fresh::workspace::get_workspace_path(&project).unwrap(),
+                dir_context
+                    .workspaces_dir()
+                    .join(format!("{}.json", encode_path_for_filename(&project))),
                 "an id-less snapshot lands at the legacy root-keyed name"
             );
             files[0].clone()
@@ -267,7 +271,7 @@ mod stable_id {
             !legacy_path.exists(),
             "the superseded legacy file is retired on save"
         );
-        let files = files_for_root(&project);
+        let files = files_for_root(&dir_context, &project);
         assert_eq!(
             files.len(),
             1,
@@ -275,7 +279,7 @@ mod stable_id {
         );
         assert_eq!(read_stable_id(&files[0]).as_deref(), Some(adopted.as_str()));
 
-        let loaded = Workspace::load(&project)
+        let loaded = Workspace::load_in(&dir_context, &project)
             .unwrap()
             .expect("loadable by root");
         assert_eq!(
@@ -291,8 +295,9 @@ mod stable_id {
         let project = sandbox.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
 
-        let dir = get_workspaces_dir().unwrap();
+        let dir = dir_context.workspaces_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let encoded = encode_path_for_filename(&project);
 
@@ -315,7 +320,9 @@ mod stable_id {
         )
         .unwrap();
 
-        let loaded = Workspace::load(&project).unwrap().expect("resolvable");
+        let loaded = Workspace::load_in(&dir_context, &project)
+            .unwrap()
+            .expect("resolvable");
         assert_eq!(
             loaded.label.as_deref(),
             Some("new"),
@@ -324,9 +331,11 @@ mod stable_id {
 
         // Deleting the workspace removes every variant, so a killed workspace
         // can't resurrect from the stale duplicate.
-        Workspace::delete(&project).unwrap();
-        assert!(files_for_root(&project).is_empty());
-        assert!(find_workspace_file_by_root(&project).unwrap().is_none());
+        Workspace::delete_in(&dir_context, &project).unwrap();
+        assert!(files_for_root(&dir_context, &project).is_empty());
+        assert!(find_workspace_file_by_root_in(&dir_context, &project)
+            .unwrap()
+            .is_none());
     }
 
     /// An encoded root that is a *prefix* of another's (`/a` vs `/a.b`) must
@@ -341,17 +350,20 @@ mod stable_id {
         std::fs::create_dir_all(&long).unwrap();
         let short = short.canonicalize().unwrap();
         let long = long.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
 
         let mut ws_long = Workspace::new(long.clone());
         ws_long.label = Some("long-root".to_string());
         ws_long.stable_id = Some("ws-test-long".to_string());
-        ws_long.save().unwrap();
+        ws_long.save_in(&dir_context).unwrap();
 
         assert!(
-            Workspace::load(&short).unwrap().is_none(),
+            Workspace::load_in(&dir_context, &short).unwrap().is_none(),
             "the short root must not resolve to the longer root's file"
         );
-        let loaded = Workspace::load(&long).unwrap().expect("long root loads");
+        let loaded = Workspace::load_in(&dir_context, &long)
+            .unwrap()
+            .expect("long root loads");
         assert_eq!(loaded.label.as_deref(), Some("long-root"));
     }
 
@@ -365,8 +377,9 @@ mod stable_id {
         let project = sandbox.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
 
-        let dir = get_workspaces_dir().unwrap();
+        let dir = dir_context.workspaces_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let encoded = encode_path_for_filename(&project);
 
@@ -389,17 +402,17 @@ mod stable_id {
             serde_json::to_vec(&legacy).unwrap(),
         )
         .unwrap();
-        assert_eq!(files_for_root(&project).len(), 2);
+        assert_eq!(files_for_root(&dir_context, &project).len(), 2);
 
         // A second window saves under its own id.
         let mut current = Workspace::new(project.clone());
         current.label = Some("current".to_string());
         current.saved_at = 200;
         current.stable_id = Some("ws-current".to_string());
-        current.save().unwrap();
+        current.save_in(&dir_context).unwrap();
 
         // The legacy file is retired; both co-tenant id-files survive.
-        let ids: std::collections::BTreeSet<String> = files_for_root(&project)
+        let ids: std::collections::BTreeSet<String> = files_for_root(&dir_context, &project)
             .iter()
             .filter_map(|p| read_stable_id(p))
             .collect();
@@ -415,7 +428,7 @@ mod stable_id {
             "the legacy root-keyed file must be retired"
         );
 
-        Workspace::delete(&project).unwrap();
+        Workspace::delete_in(&dir_context, &project).unwrap();
     }
 
     /// `delete_by_id` removes only the named identity's file; co-tenant
@@ -427,8 +440,9 @@ mod stable_id {
         let project = sandbox.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
 
-        let dir = get_workspaces_dir().unwrap();
+        let dir = dir_context.workspaces_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let encoded = encode_path_for_filename(&project);
 
@@ -441,11 +455,11 @@ mod stable_id {
             )
             .unwrap();
         }
-        assert_eq!(files_for_root(&project).len(), 2);
+        assert_eq!(files_for_root(&dir_context, &project).len(), 2);
 
-        Workspace::delete_by_id(&project, "ws-a").unwrap();
+        Workspace::delete_by_id_in(&dir_context, &project, "ws-a").unwrap();
 
-        let survivors: Vec<Option<String>> = files_for_root(&project)
+        let survivors: Vec<Option<String>> = files_for_root(&dir_context, &project)
             .iter()
             .map(|p| read_stable_id(p))
             .collect();
@@ -455,9 +469,9 @@ mod stable_id {
             "only the named identity is deleted; the co-tenant survives"
         );
         // Deleting an already-absent identity is a no-op success.
-        Workspace::delete_by_id(&project, "ws-a").unwrap();
+        Workspace::delete_by_id_in(&dir_context, &project, "ws-a").unwrap();
 
-        Workspace::delete(&project).unwrap();
+        Workspace::delete_in(&dir_context, &project).unwrap();
     }
 
     /// `delete` removes *every* file claiming the root — id-keyed and legacy —
@@ -468,8 +482,9 @@ mod stable_id {
         let project = sandbox.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
 
-        let dir = get_workspaces_dir().unwrap();
+        let dir = dir_context.workspaces_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let encoded = encode_path_for_filename(&project);
 
@@ -484,15 +499,17 @@ mod stable_id {
             ws.stable_id = id.map(str::to_string);
             std::fs::write(dir.join(name), serde_json::to_vec(&ws).unwrap()).unwrap();
         }
-        assert_eq!(files_for_root(&project).len(), 3);
+        assert_eq!(files_for_root(&dir_context, &project).len(), 3);
 
-        Workspace::delete(&project).unwrap();
+        Workspace::delete_in(&dir_context, &project).unwrap();
 
         assert!(
-            files_for_root(&project).is_empty(),
+            files_for_root(&dir_context, &project).is_empty(),
             "delete must remove every variant claiming the root"
         );
-        assert!(find_workspace_file_by_root(&project).unwrap().is_none());
+        assert!(find_workspace_file_by_root_in(&dir_context, &project)
+            .unwrap()
+            .is_none());
     }
 
     /// `load_by_id` targets one exact co-tenant, unlike `load`, which returns
@@ -503,8 +520,9 @@ mod stable_id {
         let project = sandbox.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
 
-        let dir = get_workspaces_dir().unwrap();
+        let dir = dir_context.workspaces_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let encoded = encode_path_for_filename(&project);
 
@@ -523,12 +541,16 @@ mod stable_id {
 
         // `load` returns the freshest (ws-b / "beta")...
         assert_eq!(
-            Workspace::load(&project).unwrap().unwrap().label.as_deref(),
+            Workspace::load_in(&dir_context, &project)
+                .unwrap()
+                .unwrap()
+                .label
+                .as_deref(),
             Some("beta")
         );
         // ...but `load_by_id` returns each specific identity.
         assert_eq!(
-            Workspace::load_by_id(&project, "ws-a")
+            Workspace::load_by_id_in(&dir_context, &project, "ws-a")
                 .unwrap()
                 .unwrap()
                 .label
@@ -536,14 +558,121 @@ mod stable_id {
             Some("alpha")
         );
         assert_eq!(
-            Workspace::load_by_id(&project, "ws-b")
+            Workspace::load_by_id_in(&dir_context, &project, "ws-b")
                 .unwrap()
                 .unwrap()
                 .label
                 .as_deref(),
             Some("beta")
         );
+        assert!(
+            Workspace::load_by_id_in(&dir_context, &project, "ws-missing")
+                .unwrap()
+                .is_none()
+        );
 
-        Workspace::delete(&project).unwrap();
+        Workspace::delete_in(&dir_context, &project).unwrap();
+    }
+
+    #[test]
+    fn load_by_id_rejects_content_claiming_another_identity() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let project = sandbox.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
+        let dir = dir_context.workspaces_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let encoded = encode_path_for_filename(&project);
+        let mut workspace = Workspace::new(project.clone());
+        workspace.stable_id = Some("ws-actual".to_string());
+        std::fs::write(
+            dir.join(format!("{encoded}.ws-requested.json")),
+            serde_json::to_vec(&workspace).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Workspace::load_by_id_in(&dir_context, &project, "ws-requested"),
+            Err(WorkspaceError::IdentityMismatch { .. })
+        ));
+        assert!(matches!(
+            Workspace::delete_by_id_in(&dir_context, &project, "ws-requested"),
+            Err(WorkspaceError::IdentityMismatch { .. })
+        ));
+        assert!(dir.join(format!("{encoded}.ws-requested.json")).exists());
+
+        Workspace::delete_in(&dir_context, &project).unwrap_err();
+        std::fs::remove_file(dir.join(format!("{encoded}.ws-requested.json"))).unwrap();
+    }
+
+    #[test]
+    fn strict_persistence_inventory_rejects_corrupt_matching_files() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let project = sandbox.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
+        let dir = dir_context.workspaces_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let encoded = encode_path_for_filename(&project);
+        let corrupt = dir.join(format!("{encoded}.ws-corrupt.json"));
+        std::fs::write(&corrupt, b"{not-json").unwrap();
+
+        assert!(inspect_workspace_persistence_in(&dir_context, &project).is_err());
+        assert!(corrupt.exists(), "strict rejection must preserve the file");
+
+        std::fs::remove_file(corrupt).unwrap();
+    }
+    #[test]
+    fn create_attempt_inventory_reports_unreadable_and_ambiguous_state() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let project = sandbox.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let dir_context = DirectoryContext::for_testing(&sandbox.path().join("data-home"));
+        let dir = dir_context.workspaces_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut first = Workspace::new(project.clone());
+        first.stable_id = Some("ws-create-first".to_string());
+        first
+            .session_plugin_state
+            .entry("orchestrator".to_string())
+            .or_default()
+            .insert("create_attempt".to_string(), serde_json::json!("attempt-1"));
+        first.save_in(&dir_context).unwrap();
+        assert!(matches!(
+            inspect_workspace_create_attempt_in(
+                &dir_context,
+                "attempt-1",
+                Some(&project),
+                None,
+            ),
+            WorkspaceCreateAttemptInventory::Found { workspace_id, .. }
+                if workspace_id == "ws-create-first"
+        ));
+
+        let encoded = encode_path_for_filename(&project);
+        let unreadable = dir.join(format!("{encoded}.ws-unreadable.json"));
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(matches!(
+            inspect_workspace_create_attempt_in(&dir_context, "attempt-1", Some(&project), None,),
+            WorkspaceCreateAttemptInventory::Error { .. }
+        ));
+        std::fs::remove_dir(&unreadable).unwrap();
+
+        let mut second = Workspace::new(project.clone());
+        second.stable_id = Some("ws-create-second".to_string());
+        second
+            .session_plugin_state
+            .entry("orchestrator".to_string())
+            .or_default()
+            .insert("create_attempt".to_string(), serde_json::json!("attempt-1"));
+        second.save_in(&dir_context).unwrap();
+        assert!(matches!(
+            inspect_workspace_create_attempt_in(&dir_context, "attempt-1", Some(&project), None,),
+            WorkspaceCreateAttemptInventory::Error { .. }
+        ));
     }
 }

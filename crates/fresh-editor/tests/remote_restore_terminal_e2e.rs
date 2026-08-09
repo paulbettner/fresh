@@ -52,7 +52,10 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use common::harness::{EditorTestHarness, HarnessOptions};
 use fresh::config_io::DirectoryContext;
-use fresh::services::authority::{RemoteAgentSpec, RemoteTransportSpec, SessionAuthoritySpec};
+use fresh::services::authority::{
+    connect_ssh_authority, RemoteAgentSpec, RemoteTransportSpec, SessionAuthoritySpec,
+};
+use fresh::services::remote::ConnectionParams;
 use fresh_core::api::PluginCommand;
 
 // --------------------------------------------------------------------------
@@ -243,11 +246,53 @@ impl SshServer {
                     "GlobalKnownHostsFile=/dev/null".to_string(),
                 ],
             },
+            verified_anchor: None,
+            canonical_root: None,
             base_env: Vec::new(),
             window: true,
             label: Some(label.to_string()),
             command: None,
         })
+    }
+
+    fn verified_spec(
+        &self,
+        remote_path: &Path,
+        label: &str,
+        dir_context: &DirectoryContext,
+    ) -> SessionAuthoritySpec {
+        let params = ConnectionParams {
+            user: Some(self.user.clone()),
+            host: "127.0.0.1".to_string(),
+            port: Some(self.port),
+            identity_file: Some(self.identity.clone()),
+            extra_args: vec![
+                "-o".to_string(),
+                format!("UserKnownHostsFile={}", self.known_hosts.display()),
+                "-o".to_string(),
+                "GlobalKnownHostsFile=/dev/null".to_string(),
+            ],
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("remote identity runtime");
+        let (_authority, _keepalive, identity) = runtime
+            .block_on(connect_ssh_authority(
+                params,
+                Some(remote_path.to_string_lossy().into_owned()),
+                None,
+                dir_context.clone(),
+                None,
+            ))
+            .expect("verify SSH tenant identity");
+        let mut spec = self.spec(remote_path, label);
+        let SessionAuthoritySpec::RemoteAgent(agent) = &mut spec else {
+            unreachable!("SSH helper always returns a remote-agent spec");
+        };
+        agent.set_verified_identity(&identity);
+        spec
     }
 }
 
@@ -311,18 +356,16 @@ fn restored_remote_terminal_reconnects_over_ssh_after_restart() -> anyhow::Resul
         h.editor_mut().set_active_window(a);
         h.editor_mut().open_terminal();
         h.wait_until(|h| h.screen_to_string().contains("*Terminal"))?;
-        h.editor_mut()
-            .set_session_authority_spec(a, server.spec(&remote_a, "ssh-remote-A"));
-
+        let verified_a = server.verified_spec(&remote_a, "ssh-remote-A", &dir_context);
+        h.editor_mut().set_session_authority_spec(a, verified_a);
         // Session B — a second remote session (materialized so it persists) to
         // prove the restart restores *multiple* dormant remotes.
         let b = h
             .editor_mut()
             .create_window_at(remote_b.clone(), "ssh-remote-B".to_string());
         h.editor_mut().set_active_window(b);
-        h.editor_mut()
-            .set_session_authority_spec(b, server.spec(&remote_b, "ssh-remote-B"));
-
+        let verified_b = server.verified_spec(&remote_b, "ssh-remote-B", &dir_context);
+        h.editor_mut().set_session_authority_spec(b, verified_b);
         // Persist every window's workspace (layout + terminal + authority_spec).
         h.editor_mut().save_all_windows_workspaces()?;
     } // harness dropped == editor shut down.

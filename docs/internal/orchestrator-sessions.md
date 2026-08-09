@@ -288,9 +288,12 @@ when the ids differ — an unguarded close would kill the terminal just spawned.
 
 ### 4.4 Plugin-level agent state
 
-The dock additionally shows a coarse agent state inferred from terminal output
-(e.g. working/idle, plus richer running/awaiting/ready/errored glyphs derived in
-the plugin). This is display-only and not part of the persistence model.
+For an active OMP companion, authenticated live snapshots are authoritative for
+the dock's exact footer status, working/idle/error state, approval attention,
+tool count, model, context, goal, and todo facets. When the snapshot expires or
+the companion is unsupported, Orchestrator falls back to its existing OSC and
+terminal-output activity heuristics. The live facets are ephemeral display
+state; only the terminal's exact resume argv is persisted.
 
 ---
 
@@ -452,24 +455,34 @@ The New Session form fields (Phases 1–5 **shipped**):
 - **Input history** — per-field MRU (Up/Down), global per user, capped, stored
   under the data dir's `orchestrator/`.
 
-Creation is atomic via the host API:
+Local creation runs asynchronously under a durable per-attempt journal. Git,
+filesystem, prompt-injection, and window effects are recorded before mutation;
+cancel/error paths compensate every owned effect before retiring the pending
+record. The host publishes the window and its identity metadata atomically:
 
 ```ts
-editor.createWindowWithTerminal({ root, label, cwd: root,
-  command: launchArgv, resume: resumeArgv });
-editor.setWindowState("project_path", effectiveProjectPath);
-editor.setWindowState("shared_worktree", sharedWorktree);
+const result = await editor.createWindowWithTerminal({
+  root,
+  label,
+  cwd: root,
+  command: launchArgv,
+  resume: resumeArgv,
+  relaunch: relaunchArgv,
+  companion,
+  selectedAgent: true,
+  activate: visit,
+  initialState: { project_path, shared_worktree, create_attempt: attemptId },
+});
 ```
 
-`createWindowWithTerminal` is dispatched into core, which enforces
-**one-session-per-canonical-directory** (reuses an existing window if `root` is
-already open) and persists the `command` / `resume` argv onto the terminal. The
-two `setWindowState` keys land in the window's `session_plugin_state` and are
-read back at boot.
+Core enforces **one session per canonical directory** and persists the launch,
+relaunch, resume, selected-agent, companion, and initial session-state metadata.
+The journal records the returned durable workspace id before clearing the
+temporary `create_attempt` marker, closing the crash gap around publication.
 
-Type-aware New Session forms for SSH/Kubernetes backends
-(NEW_SESSION_DIALOG_WIREFRAMES.md, segmented-tab "Option A") are **designed, not
-shipped** — today's form is the local worktree/folder flow.
+Type-aware SSH and Kubernetes forms are shipped and attach through the remote
+agent authority. The devcontainer tab is present but currently reports that
+plugin-to-plugin attach is unsupported.
 
 ---
 
@@ -526,19 +539,21 @@ Implemented (shipped):
   legacy-migration chain with `.bak` safety.
 - Lazy materialization (inert → warm on first dive), cwd-scoped boot selection,
   quit-time save that won't clobber unmaterialized seeds.
-- Dock + Open dialog + New Session form + preview, PR pills, project scoping,
-  multi-select Stop/Archive/Delete.
+- Dock + Open dialog + type-aware Local/SSH/Kubernetes New Session form +
+  preview, PR pills, project scoping, multi-select Stop/Archive/Delete.
+- Journaled asynchronous local creation with cancellation compensation and
+  crash-safe window identity publication.
 - Per-session backends (Local/Plugin/RemoteAgent), Live/Dormant restore,
   reconnect-on-activate, per-session trust + env, type-enforced isolation.
 - Agent resume (provision/continue), resume-spec persistence, deferred-to-dive
-  rejoin.
+  rejoin, and authenticated OMP native-TUI companion state with fallback.
 - One-session-per-canonical-directory enforcement.
 
 Planned / aspirational (in design docs, not in code):
 
 - Cross-machine session recovery via a `refs/heads/<user>/fresh-sessions` branch.
 - Warm background remote sessions surviving restart (keepalives).
-- Type-aware SSH/Kubernetes New Session form (segmented tabs).
+- Devcontainer creation from the New Session form.
 - Dock as a first-class `KeyContext` chrome (resolves focus gaps F1/F2).
 - Broader agent registry, per-resume confirm policy, path/branch completion.
 - Collapsible project-group headers (currently a flat list with per-row tag).
@@ -572,7 +587,7 @@ unless confirmed against code here.
 - `PER_SESSION_BACKENDS_DESIGN.md` — SessionProfile, Live/Dormant, per-session
   trust/env. *Phases 1–4 shipped; warm-background deferred.* (Also see
   `AUTHORITY_DESIGN.md`, `K8S_AUTHORITY_DESIGN.md`.)
-- `NEW_SESSION_DIALOG_WIREFRAMES.md` — type-aware SSH/Kube form. *Designed, not
-  shipped.*
+- `NEW_SESSION_DIALOG_WIREFRAMES.md` — type-aware backend form. *SSH/Kubernetes
+  shipped; devcontainer attach remains pending.*
 - `design-decisions.md` #3 (CLI subcommands) and #8 (dual-socket client/server
   persistence) — *shipped, but a different "session" subsystem; see §1/§9.*

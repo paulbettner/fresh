@@ -13,14 +13,15 @@
 mod common;
 
 use fresh::config::Config;
-use fresh::workspace::{find_workspace_file_by_root, Workspace};
+use fresh::config_io::DirectoryContext;
+use fresh::workspace::{find_workspace_file_by_root_in, Workspace};
 use std::path::Path;
 use tempfile::TempDir;
 
 use common::harness::EditorTestHarness;
 
-fn read_workspace(working_dir: &Path) -> Option<Workspace> {
-    let path = find_workspace_file_by_root(working_dir).ok()??;
+fn read_workspace(dir_context: &DirectoryContext, working_dir: &Path) -> Option<Workspace> {
+    let path = find_workspace_file_by_root_in(dir_context, working_dir).ok()??;
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -61,15 +62,17 @@ fn save_with_only_virtual_buffer_does_not_clobber_real_workspace() {
     let project_dir = temp.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
     let project_dir = project_dir.canonicalize().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp.path());
 
     let real_file = project_dir.join("kept.txt");
     std::fs::write(&real_file, "important user content").unwrap();
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    let mut harness = EditorTestHarness::with_shared_dir_context(
         80,
         24,
         Config::default(),
         project_dir.clone(),
+        dir_context.clone(),
     )
     .unwrap();
 
@@ -77,7 +80,8 @@ fn save_with_only_virtual_buffer_does_not_clobber_real_workspace() {
     harness.open_file(&real_file).unwrap();
     harness.editor_mut().save_workspace().unwrap();
 
-    let initial = read_workspace(&project_dir).expect("first save should write the workspace");
+    let initial =
+        read_workspace(&dir_context, &project_dir).expect("first save should write the workspace");
     assert!(
         !initial.has_no_real_content(),
         "sanity: first save must record the open file"
@@ -112,7 +116,7 @@ fn save_with_only_virtual_buffer_does_not_clobber_real_workspace() {
     // empty workspace and lose `kept.txt`.
     harness.editor_mut().save_workspace().unwrap();
 
-    let after = read_workspace(&project_dir)
+    let after = read_workspace(&dir_context, &project_dir)
         .expect("workspace file must still exist; the guard skips the write, not delete it");
     assert!(
         !after.has_no_real_content(),
@@ -167,12 +171,14 @@ fn closing_restored_terminal_with_only_dashboard_drops_it_from_workspace() {
     let project_dir = temp.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
     let project_dir = project_dir.canonicalize().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp.path());
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    let mut harness = EditorTestHarness::with_shared_dir_context(
         80,
         24,
         Config::default(),
         project_dir.clone(),
+        dir_context.clone(),
     )
     .unwrap();
 
@@ -185,7 +191,8 @@ fn closing_restored_terminal_with_only_dashboard_drops_it_from_workspace() {
     // First save: a terminal is open. It lands on disk, and it is the only
     // thing there — no file/unnamed content to preserve.
     harness.editor_mut().save_workspace().unwrap();
-    let initial = read_workspace(&project_dir).expect("first save should write the workspace");
+    let initial =
+        read_workspace(&dir_context, &project_dir).expect("first save should write the workspace");
     assert_eq!(
         initial.terminals.len(),
         1,
@@ -212,7 +219,8 @@ fn closing_restored_terminal_with_only_dashboard_drops_it_from_workspace() {
     // The save must drop the now-closed terminal rather than preserve it.
     harness.editor_mut().save_workspace().unwrap();
 
-    let after = read_workspace(&project_dir).expect("workspace file must still exist");
+    let after =
+        read_workspace(&dir_context, &project_dir).expect("workspace file must still exist");
     assert!(
         after.terminals.is_empty(),
         "a closed terminal must not survive in the saved workspace (it would be \
@@ -236,21 +244,23 @@ fn closing_real_files_without_virtual_buffer_overwrites_workspace() {
     let project_dir = temp.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
     let project_dir = project_dir.canonicalize().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp.path());
 
     let real_file = project_dir.join("once.txt");
     std::fs::write(&real_file, "first session").unwrap();
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    let mut harness = EditorTestHarness::with_shared_dir_context(
         80,
         24,
         Config::default(),
         project_dir.clone(),
+        dir_context.clone(),
     )
     .unwrap();
 
     harness.open_file(&real_file).unwrap();
     harness.editor_mut().save_workspace().unwrap();
-    let before = read_workspace(&project_dir).unwrap();
+    let before = read_workspace(&dir_context, &project_dir).unwrap();
     let before_has_once = before.split_states.values().any(|s| {
         s.open_tabs.iter().any(|t| {
             use fresh::workspace::SerializedTabRef;
@@ -274,7 +284,8 @@ fn closing_real_files_without_virtual_buffer_overwrites_workspace() {
     harness.editor_mut().force_close_buffer(real_id).unwrap();
     harness.editor_mut().save_workspace().unwrap();
 
-    let after = read_workspace(&project_dir).expect("workspace file must still exist");
+    let after =
+        read_workspace(&dir_context, &project_dir).expect("workspace file must still exist");
     let after_has_once = after.split_states.values().any(|s| {
         s.open_tabs.iter().any(|t| {
             use fresh::workspace::SerializedTabRef;
@@ -287,4 +298,91 @@ fn closing_real_files_without_virtual_buffer_overwrites_workspace() {
          the saved workspace, but once.txt is still listed: {:#?}",
         after.split_states
     );
+}
+
+#[test]
+fn virtual_save_guard_reads_the_exact_same_root_workspace_id() {
+    let temp = TempDir::new().unwrap();
+    let project_dir = temp.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let project_dir = project_dir.canonicalize().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp.path());
+    let alpha = project_dir.join("alpha.txt");
+    let beta = project_dir.join("beta.txt");
+    std::fs::write(&alpha, "alpha").unwrap();
+    std::fs::write(&beta, "beta").unwrap();
+
+    let mut harness = EditorTestHarness::with_shared_dir_context(
+        80,
+        24,
+        Config::default(),
+        project_dir.clone(),
+        dir_context.clone(),
+    )
+    .unwrap();
+    let alpha_window = harness.editor().active_session_id();
+    harness.open_file(&alpha).unwrap();
+    harness.editor_mut().save_workspace().unwrap();
+
+    let beta_window = harness
+        .editor_mut()
+        .create_window_at(project_dir.clone(), "beta tenant".to_string());
+    harness.open_file(&beta).unwrap();
+    harness.editor_mut().save_workspace().unwrap();
+    let beta_stable_id = harness.editor().active_window().stable_id.clone();
+
+    // Make the sibling workspace the freshest root match, but with no real
+    // content. A root-only lookup would now consult this sibling and allow the
+    // beta tenant's real snapshot to be overwritten by its virtual-only state.
+    harness.editor_mut().set_active_window(alpha_window);
+    let alpha_buffer = harness
+        .editor()
+        .active_window()
+        .buffer_metadata
+        .iter()
+        .find_map(|(id, metadata)| {
+            metadata
+                .file_path()
+                .is_some_and(|path| path.ends_with("alpha.txt"))
+                .then_some(*id)
+        })
+        .unwrap();
+    harness
+        .editor_mut()
+        .force_close_buffer(alpha_buffer)
+        .unwrap();
+    harness.editor_mut().save_workspace().unwrap();
+
+    harness.editor_mut().set_active_window(beta_window);
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .create_virtual_buffer("Dashboard".to_string(), "dashboard".to_string(), true);
+    close_unnamed_buffers(&mut harness);
+    let beta_buffer = harness
+        .editor()
+        .active_window()
+        .buffer_metadata
+        .iter()
+        .find_map(|(id, metadata)| {
+            metadata
+                .file_path()
+                .is_some_and(|path| path.ends_with("beta.txt"))
+                .then_some(*id)
+        })
+        .unwrap();
+    harness
+        .editor_mut()
+        .force_close_buffer(beta_buffer)
+        .unwrap();
+    harness.editor_mut().save_workspace().unwrap();
+
+    let persisted = Workspace::load_by_id_in(&dir_context, &project_dir, &beta_stable_id)
+        .unwrap()
+        .expect("beta tenant workspace remains present");
+    assert!(persisted.split_states.values().any(|split| {
+        split.open_tabs.iter().any(|tab| {
+            matches!(tab, fresh::workspace::SerializedTabRef::File(path) if path.ends_with("beta.txt"))
+        })
+    }));
 }

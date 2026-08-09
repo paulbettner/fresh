@@ -67,6 +67,7 @@ fn spawn_session_terminal(window: &mut fresh::app::window::Window, argv: &[&str]
             title: None,
             env: std::collections::HashMap::new(),
             companion: None,
+            script_capability: None,
         })
         .expect("session terminal should spawn");
     window.terminal_commands.insert(terminal_id, argv);

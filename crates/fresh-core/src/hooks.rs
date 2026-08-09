@@ -427,13 +427,12 @@ pub enum HookArgs {
     },
 
     /// Authenticated structured state from the exact live OMP companion PTY.
-    /// The editor supplies both identity fields and the launch executable;
-    /// no capability or raw frame material crosses this hook boundary.
+    /// The editor supplies the exact terminal identity; no capability or raw
+    /// frame material crosses this hook boundary.
     OmpCompanionSnapshot {
         window_id: u64,
         terminal_id: u64,
         received_at_ms: u64,
-        launch_executable: String,
         snapshot: OmpCompanionSnapshotV1,
     },
 

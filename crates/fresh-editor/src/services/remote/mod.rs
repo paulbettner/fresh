@@ -29,6 +29,7 @@ pub use connection::{
     DEFAULT_HEARTBEAT_INTERVAL,
 };
 pub use connection::{ConnectionParams, SshConnection, SshError};
+pub(crate) use filesystem::is_remote_absolute_path;
 pub use filesystem::RemoteFileSystem;
 pub use protocol::{
     decode_base64, encode_base64, ls_params, read_params, stat_params, sudo_write_params,

@@ -758,12 +758,13 @@ impl Editor {
         // labelling shortcuts, not menu-shape changes — they fall
         // through to the derived branches below.
         use crate::view::ui::status_bar::RemoteIndicatorOverride;
+        let remote_indicator_override = self.active_window().remote_indicator_override.clone();
         let override_handled = matches!(
-            self.remote_indicator_override,
+            &remote_indicator_override,
             Some(RemoteIndicatorOverride::Connecting { .. })
                 | Some(RemoteIndicatorOverride::FailedAttach { .. })
         );
-        if let Some(over) = self.remote_indicator_override.clone() {
+        if let Some(over) = remote_indicator_override {
             match over {
                 RemoteIndicatorOverride::Connecting { label } => {
                     let suffix = label
@@ -1382,12 +1383,12 @@ impl Editor {
     /// - anything else — logged and ignored.
     pub fn handle_remote_indicator_action(&mut self, action_key: &str) {
         if action_key == "detach" {
-            self.remote_indicator_override = None;
+            self.active_window_mut().remote_indicator_override = None;
             self.clear_authority();
             return;
         }
         if action_key == "clear_override" {
-            self.remote_indicator_override = None;
+            self.active_window_mut().remote_indicator_override = None;
             return;
         }
         if action_key == "reconnect" || action_key == "retry_reconnect" {

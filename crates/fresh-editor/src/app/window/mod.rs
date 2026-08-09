@@ -103,8 +103,20 @@ pub struct ExitedTerminal {
     /// Scrollback/log files to keep appending to, so a restart continues the
     /// transcript rather than starting blank.
     pub backing_path: Option<PathBuf>,
+    /// Append-only rendered scrollback history continued by terminal restarts.
+    pub history_path: Option<PathBuf>,
+    /// Exact append-only history boundary covered by `backing_path` when it is
+    /// an immutable save-generation delta.
+    pub backing_history_end: Option<u64>,
+    /// Generation encoded in the immutable checkpoint filename.
+    pub checkpoint_generation: Option<String>,
     pub log_path: Option<PathBuf>,
-    /// Launch argv (`Window::terminal_commands`), absent for a plain shell.
+    /// Target for a legacy combined transcript that could not yet be copied
+    /// into the append-only history namespace. While present no PTY is spawned;
+    /// restart retries the migration before continuing the transcript.
+    pub pending_history_migration: Option<PathBuf>,
+    /// Clean relaunch argv (`Window::terminal_commands`), with an empty vector
+    /// representing the durable plain-shell marker.
     pub command: Option<Vec<String>>,
     /// Agent-resume argv (`Window::terminal_resume_commands`) — the argv that
     /// rejoins the agent's conversation (`claude --resume <id>`) instead of
@@ -184,11 +196,11 @@ pub struct TerminalBuffer {
     /// (Ctrl+Space, Shift+PageUp, wheel-up, process exit).
     ///
     /// Implicit scrollback is an implementation detail of drag-to-select, so
-    /// it also *ends* automatically: completing the gesture (copying the
-    /// selection) or abandoning it (a bare click) resumes the live grid.
-    /// Engaging with the scrollback as a view — scrolling it — clears the
-    /// marker, converting the visit to an explicit one that only ends by the
-    /// explicit rules. Invariant: `drag_scrollback_splits ⊆
+    /// it also *ends* automatically: an explicit Copy or a bare click resumes
+    /// the live grid. Mouse-up publishes the selection to the host clipboard
+    /// but leaves it parked so a terminal emulator's native copy shortcut can
+    /// still read it. Scrolling converts the visit to an explicit one that only
+    /// ends by the explicit rules. Invariant: `drag_scrollback_splits ⊆
     /// scrollback_splits`, maintained by `set_scrollback_in` (any transition
     /// through the sole mutator clears the marker; the drag path re-marks
     /// afterwards).
@@ -494,9 +506,13 @@ pub struct Window {
     /// live/scrollback interaction mode. See [`TerminalBuffer`].
     pub terminal_buffers: HashMap<BufferId, TerminalBuffer>,
 
-    /// Backing files for terminal buffers (the rendered visible-screen
-    /// + scrollback content the buffer actually displays).
+    /// Atomically replaced read-only checkpoint combining append-only rendered
+    /// history with the current visible screen.
     pub terminal_backing_files: HashMap<crate::services::terminal::TerminalId, std::path::PathBuf>,
+
+    /// Append-only rendered scrollback written by the PTY reader. Visible
+    /// screen checkpoints never share or truncate these files.
+    pub terminal_history_files: HashMap<crate::services::terminal::TerminalId, std::path::PathBuf>,
 
     /// Raw log files for terminal buffers (the unfiltered byte stream
     /// from the PTY, used for replay / save-history).
@@ -539,6 +555,10 @@ pub struct Window {
     /// — disconnected, awaiting reconnect. See
     /// `docs/internal/PER_SESSION_BACKENDS_DESIGN.md`.
     pub authority_spec: crate::services::authority::SessionAuthoritySpec,
+    /// Plugin-supplied Remote Indicator override for this exact window.
+    /// Kept with the owning session so background lifecycle updates cannot
+    /// bleed into whichever window happens to be active later.
+    pub remote_indicator_override: Option<crate::view::ui::status_bar::RemoteIndicatorOverride>,
 
     /// Error from the most recent failed *reconnect* of this dormant remote
     /// workspace (the dive-triggered `reconnect_dormant_session_if_needed`
@@ -912,19 +932,19 @@ pub struct Window {
         crate::services::terminal::TerminalId,
         fresh_core::api::TerminalCompanion,
     >,
+    /// OMP companion terminal selected for this window. This remains set while
+    /// the terminal is exited-but-restartable and is remapped on respawn.
+    pub tracked_agent_terminal: Option<crate::services::terminal::TerminalId>,
 
-    /// Terminals whose child was handed a `FRESH_CMD_TOKEN` capability token
-    /// (`allowScript`), mapped to the token that terminal's *current*
-    /// incarnation carries.
+    /// Terminals granted script access (`allowScript`), mapped to the token
+    /// held by their current live child. `None` retains the durable grant while
+    /// no child is live, so exit can revoke the capability immediately and a
+    /// later restart can mint a fresh window-bound token.
     ///
-    /// Membership — not the token value — is what survives a restart: it is
-    /// persisted as the workspace's `script_access` flag and re-minted on
-    /// restore, because the token table is in-memory and process-global, so
-    /// the string a previous run handed out means nothing to this one. The
-    /// value is kept so a respawn can revoke the token its predecessor held
-    /// instead of leaving it in the table for the life of the process.
+    /// Only membership is persisted as workspace `script_access`; token values
+    /// are process-local secrets and never cross a save/restore boundary.
     pub terminal_script_tokens:
-        std::collections::HashMap<crate::services::terminal::TerminalId, String>,
+        std::collections::HashMap<crate::services::terminal::TerminalId, Option<String>>,
 
     /// Terminals whose process has quit while their buffer stayed open,
     /// keyed by that buffer. Everything needed to respawn the same process
@@ -967,6 +987,8 @@ pub struct Window {
     pub previous_click_time: Option<std::time::Instant>,
     pub previous_click_position: Option<(u16, u16)>,
     pub click_count: u8,
+    pub(crate) previous_click_target: Option<crate::app::types::MouseClickTarget>,
+    pub previous_click_layout_generation: u64,
 
     /// GPM software-cursor position for this window (when GPM is
     /// active and we draw our own cursor).
@@ -2133,6 +2155,7 @@ impl Window {
             file_mod_times: HashMap::new(),
             plugin_state: HashMap::new(),
             authority_spec: crate::services::authority::SessionAuthoritySpec::Local,
+            remote_indicator_override: None,
             remote_reconnect_error: None,
             lsp,
             panel_ids: HashMap::new(),
@@ -2142,6 +2165,7 @@ impl Window {
             terminal_manager: crate::services::terminal::TerminalManager::new(id),
             terminal_buffers: HashMap::new(),
             terminal_backing_files: HashMap::new(),
+            terminal_history_files: HashMap::new(),
             terminal_log_files: HashMap::new(),
             terminal_explicit_titles: std::collections::HashSet::new(),
             terminal_fg_poll_at: None,
@@ -2256,6 +2280,8 @@ impl Window {
             terminal_commands: std::collections::HashMap::new(),
             terminal_resume_commands: std::collections::HashMap::new(),
             terminal_companions: std::collections::HashMap::new(),
+            tracked_agent_terminal: None,
+
             terminal_script_tokens: std::collections::HashMap::new(),
             exited_terminals: HashMap::new(),
             plugin_dev_workspaces: HashMap::new(),
@@ -2266,6 +2292,8 @@ impl Window {
             previous_click_time: None,
             previous_click_position: None,
             click_count: 0,
+            previous_click_target: None,
+            previous_click_layout_generation: 0,
             mouse_cursor_position: None,
             gpm_active: false,
             menu_bar_visible: resources.config.editor.show_menu_bar,
@@ -2329,6 +2357,11 @@ impl Window {
     /// window, never shared with another.
     pub fn authority(&self) -> &crate::services::authority::Authority {
         &self.authority
+    }
+
+    /// Filesystem operation manager bound to this window's authority.
+    pub fn filesystem_manager(&self) -> &crate::services::fs::FsManager {
+        &self.resources.fs_manager
     }
 
     /// Allocate the next globally-unique `BufferId`.
@@ -4228,7 +4261,11 @@ mod exited_terminal_tests {
             rows: 24,
             cwd: None,
             backing_path: None,
+            history_path: None,
+            backing_history_end: None,
+            checkpoint_generation: None,
             log_path: None,
+            pending_history_migration: None,
             command: command.map(argv),
             resume: resume.map(argv),
             ephemeral: true,

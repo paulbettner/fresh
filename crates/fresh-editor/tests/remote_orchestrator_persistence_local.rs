@@ -66,6 +66,22 @@ impl RecordingRemoteFs {
             .cloned()
             .collect()
     }
+
+    fn global_state_paths(&self) -> Vec<PathBuf> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| {
+                let components: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+                components.windows(2).any(|pair| {
+                    pair[0] == std::ffi::OsStr::new("orchestrator")
+                        && pair[1] == std::ffi::OsStr::new("state")
+                })
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl FileSystem for RecordingRemoteFs {
@@ -225,16 +241,29 @@ fn orchestrator_registry_read_stays_local_in_remote_mode() {
     .unwrap();
 
     let fs = Arc::new(RecordingRemoteFs::new());
-    let _harness = EditorTestHarness::create(
+    let mut harness = EditorTestHarness::create(
         100,
         40,
         HarnessOptions::new()
             .with_working_dir(project)
-            .with_shared_dir_context(dir_context)
+            .with_shared_dir_context(dir_context.clone())
             .with_filesystem(fs.clone() as Arc<dyn FileSystem + Send + Sync>)
             .with_empty_plugins_dir(),
     )
     .expect("create harness with remote-marker filesystem");
+
+    #[cfg(feature = "plugins")]
+    {
+        use fresh_core::api::PluginCommand;
+        harness
+            .editor_mut()
+            .handle_plugin_command(PluginCommand::SetGlobalState {
+                plugin_name: "orchestrator".into(),
+                key: "remote-host-local-regression".into(),
+                value: Some(serde_json::json!(true)),
+            })
+            .expect("persist global state while a remote authority is active");
+    }
 
     // The orchestrator registry is a local artifact: none of its directory
     // listings or per-file reads may have been routed through the remote
@@ -245,4 +274,20 @@ fn orchestrator_registry_read_stays_local_in_remote_mode() {
         "orchestrator session-registry I/O leaked onto the remote authority \
          filesystem: {leaked:?}"
     );
+    #[cfg(feature = "plugins")]
+    {
+        let leaked = fs.global_state_paths();
+        assert!(
+            leaked.is_empty(),
+            "orchestrator global-state I/O leaked onto the remote authority filesystem: {leaked:?}"
+        );
+        let state_path = dir_context
+            .data_dir
+            .join("orchestrator")
+            .join("state")
+            .join("orchestrator.json");
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["remote-host-local-regression"], true);
+    }
 }
