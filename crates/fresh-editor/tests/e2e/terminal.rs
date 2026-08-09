@@ -13,7 +13,7 @@
 
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
-use fresh::config::{Config, TerminalShellConfig};
+use fresh::config::{Config, TerminalMouseForwarding, TerminalShellConfig};
 use fresh::services::terminal::TerminalState;
 use portable_pty::{native_pty_system, PtySize};
 
@@ -859,6 +859,90 @@ fn test_terminal_state_initialization() {
 
     // Cursor should be visible
     assert!(state.cursor_visible());
+}
+
+/// Animated output must preserve live scrollback, while keyboard input returns
+/// the pane to the active prompt.
+#[test]
+#[cfg(not(windows))]
+fn test_live_terminal_scrollback_output_and_key_behavior() {
+    let mut harness = harness_or_return!(80, 24);
+    harness
+        .editor_mut()
+        .set_terminal_jump_to_end_on_output(false);
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"for i in $(seq 1 80); do echo HISTORY-$i; done\n");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("HISTORY-80"))
+        .unwrap();
+
+    let buffer_id = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("active buffer should be a terminal");
+    {
+        let handle = harness
+            .editor()
+            .terminal_manager()
+            .get(terminal_id)
+            .expect("terminal handle should exist");
+        let mut state = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.scroll_lines(-5);
+        assert!(
+            !state.cursor_visible(),
+            "fixture should be reading scrollback"
+        );
+    }
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"printf '\\rANIMATED_STATUS_TICK'\n");
+    harness.wait_for_async_quiescence(3).unwrap();
+
+    {
+        let handle = harness
+            .editor()
+            .terminal_manager()
+            .get(terminal_id)
+            .expect("terminal handle should still exist");
+        let state = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !state.cursor_visible(),
+            "new output must preserve a nonzero live-terminal display offset"
+        );
+    }
+
+    harness
+        .send_key(KeyCode::Char('x'), KeyModifiers::NONE)
+        .unwrap();
+
+    let handle = harness
+        .editor()
+        .terminal_manager()
+        .get(terminal_id)
+        .expect("terminal handle should still exist after input");
+    let state = handle
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        state.cursor_visible(),
+        "terminal key input must return the live grid to the active prompt"
+    );
 }
 
 /// Test terminal bold text attribute
@@ -3872,6 +3956,94 @@ fn test_wheel_forwarded_as_mouse_report_when_mouse_tracked() {
         .editor_mut()
         .active_window_mut()
         .send_terminal_input(b"\x04");
+}
+
+/// `mouse_forwarding = "never"` reserves the wheel for Fresh even when the
+/// child enabled mouse reporting. The wheel must enter read-only scrollback
+/// instead of disappearing into the PTY.
+#[test]
+#[cfg(not(windows))]
+fn test_mouse_forwarding_never_keeps_wheel_in_fresh_scrollback() {
+    let mut harness = harness_or_return!(80, 24);
+    harness.editor_mut().config_mut().terminal.mouse_forwarding = TerminalMouseForwarding::Never;
+    harness
+        .editor_mut()
+        .set_terminal_jump_to_end_on_output(false);
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    let buffer_id = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("active buffer should be a terminal");
+    if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
+        if let Ok(mut state) = handle.state.lock() {
+            state.process_output(b"\x1b[?1000h");
+        }
+    }
+    assert!(
+        harness
+            .editor()
+            .active_window()
+            .terminal_wants_mouse(buffer_id),
+        "fixture should emulate a mouse-tracking child"
+    );
+
+    harness.mouse_scroll_up(10, 10).unwrap();
+    assert!(
+        !harness.editor().is_terminal_mode(),
+        "Fresh-owned wheel should enter terminal scrollback"
+    );
+}
+
+/// `mouse_forwarding = "never"` also reserves plain drag gestures for Fresh,
+/// so a mouse-tracking child cannot swallow selection before Ctrl+C copies it.
+#[test]
+#[cfg(not(windows))]
+fn test_mouse_forwarding_never_allows_drag_select_and_copy() {
+    let mut harness = harness_or_return!(120, 30);
+    harness.editor_mut().config_mut().terminal.mouse_forwarding = TerminalMouseForwarding::Never;
+    let (col, row) = terminal_with_marker(&mut harness, "XNEVER_COPY_ME");
+
+    let buffer_id = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("active buffer should be a terminal");
+    if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
+        if let Ok(mut state) = handle.state.lock() {
+            state.process_output(b"\x1b[?1000h");
+        }
+    }
+    assert!(
+        harness
+            .editor()
+            .active_window()
+            .terminal_wants_mouse(buffer_id),
+        "fixture should emulate a mouse-tracking child"
+    );
+
+    drag_select_row(&mut harness, col, col + 8, row).unwrap();
+    assert!(
+        primary_selection_active(&harness),
+        "Fresh-owned drag should create a terminal text selection"
+    );
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert_eq!(
+        harness.editor_mut().clipboard_content_for_test(),
+        "XNEVER_CO",
+        "Ctrl+C should copy text selected over a mouse-tracking child"
+    );
+    assert!(
+        harness.editor().is_terminal_mode(),
+        "Ctrl+C should resume the live terminal after copying"
+    );
 }
 
 /// Test that arrow keys work in programs that enable application cursor keys (DECCKM).

@@ -2107,7 +2107,13 @@ impl Window {
     ) {
         let app_cursor = self
             .get_active_terminal_state()
-            .map(|s| s.is_app_cursor())
+            .map(|mut state| {
+                let app_cursor = state.is_app_cursor();
+                if !state.cursor_visible() {
+                    state.scroll_to_bottom();
+                }
+                app_cursor
+            })
             .unwrap_or(false);
         if let Some(bytes) =
             crate::services::terminal::pty::key_to_pty_bytes(code, modifiers, app_cursor)

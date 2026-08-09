@@ -114,6 +114,13 @@ impl KeyboardConfig {
     }
 }
 
+const SMARTY_FRESH_GHOSTTY_ENV: &str = "SMARTY_FRESH_GHOSTTY_PASSTHROUGH";
+const SMARTY_FRESH_TERMINAL_RECTS_CONTEXT: &str = "smarty-fresh-terminal-rects-v1";
+
+pub fn smarty_fresh_ghostty_passthrough_enabled() -> bool {
+    std::env::var_os(SMARTY_FRESH_GHOSTTY_ENV).is_some()
+}
+
 /// Tracks which terminal modes have been enabled and provides cleanup.
 ///
 /// Use `TerminalModes::enable()` to set up the terminal, then call `undo()`
@@ -125,6 +132,7 @@ pub struct TerminalModes {
     mouse_capture: bool,
     keyboard_enhancement: bool,
     bracketed_paste: bool,
+    smarty_fresh_ghostty_passthrough: bool,
 }
 
 impl TerminalModes {
@@ -142,6 +150,7 @@ impl TerminalModes {
     /// On error, automatically undoes any partially enabled modes.
     pub fn enable(keyboard_config: Option<&KeyboardConfig>) -> Result<Self> {
         let mut modes = Self::new();
+        modes.smarty_fresh_ghostty_passthrough = smarty_fresh_ghostty_passthrough_enabled();
         let keyboard_config = keyboard_config.cloned().unwrap_or_default();
 
         // Enable raw mode
@@ -239,12 +248,48 @@ impl TerminalModes {
         Ok(modes)
     }
 
+    pub fn report_smarty_fresh_terminal_rects<I>(&self, rects: I) -> std::io::Result<()>
+    where
+        I: IntoIterator<Item = ratatui::layout::Rect>,
+    {
+        if !self.smarty_fresh_ghostty_passthrough {
+            return Ok(());
+        }
+
+        let rects: Vec<_> = rects.into_iter().take(8).collect();
+        let mut out = stdout().lock();
+        if rects.is_empty() {
+            write!(
+                out,
+                "\x1b]3008;end={SMARTY_FRESH_TERMINAL_RECTS_CONTEXT}\x1b\\"
+            )?;
+        } else {
+            write!(
+                out,
+                "\x1b]3008;start={SMARTY_FRESH_TERMINAL_RECTS_CONTEXT};rects="
+            )?;
+            for (index, rect) in rects.iter().enumerate() {
+                if index > 0 {
+                    out.write_all(b"|")?;
+                }
+                write!(out, "{},{},{},{}", rect.x, rect.y, rect.width, rect.height)?;
+            }
+            out.write_all(b"\x1b\\")?;
+        }
+        out.flush()
+    }
+
     /// Restore terminal to original state by disabling all enabled modes.
     ///
     /// This is safe to call multiple times - it tracks what was enabled
     /// and only disables those modes.
     #[allow(clippy::let_underscore_must_use)]
     pub fn undo(&mut self) {
+        if self.smarty_fresh_ghostty_passthrough {
+            let _ = self.report_smarty_fresh_terminal_rects(std::iter::empty());
+            self.smarty_fresh_ghostty_passthrough = false;
+        }
+
         // Best-effort terminal teardown — if stdout is broken, we can't recover.
         // Disable mouse capture
         // On Windows, skip crossterm's DisableMouseCapture (same reason as enable).

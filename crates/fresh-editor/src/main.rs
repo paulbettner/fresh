@@ -1784,6 +1784,9 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
 
     tracing::info!("Config loaded");
     config.apply_runtime_flags();
+    if terminal_modes::smarty_fresh_ghostty_passthrough_enabled() {
+        config.terminal.mouse_drag_selects = false;
+    }
 
     // CLI flag overrides config
     if args.no_upgrade_check {
@@ -6006,6 +6009,9 @@ where
                 stdout().execute(crossterm::terminal::BeginSynchronizedUpdate)?;
                 terminal.draw(|frame| editor.render(frame))?;
                 stdout().execute(crossterm::terminal::EndSynchronizedUpdate)?;
+                terminal_modes.report_smarty_fresh_terminal_rects(
+                    editor.smarty_fresh_live_terminal_rects(),
+                )?;
             }
             tracing::info!(target: "paste_timing", "render: {}ms (paste_pending={})", r0.elapsed().as_millis(), was_paste_pending);
             last_render = Instant::now();
