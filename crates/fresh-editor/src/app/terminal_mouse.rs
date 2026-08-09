@@ -429,16 +429,26 @@ impl super::Editor {
             return Ok(());
         };
 
-        // Resolve both grid positions to byte positions. Columns are taken
-        // as byte offsets into the line (terminal rows are overwhelmingly
-        // single-width; `snap_to_char_boundary` keeps multi-byte glyphs
-        // safe), and subsequent drag motion refines through the standard
-        // width-aware `handle_text_selection_drag` path anyway.
-        let anchor =
+        // Cursor selections are end-exclusive, while terminal selections own
+        // the cells under both ends of the drag. Resolve the pointer cell to
+        // its end when dragging right, and the origin cell to its end when
+        // dragging left.
+        let anchor_start =
             self.terminal_grid_byte_at(split_id, buffer_id, content_rect, origin_col, origin_row);
-        let head = self.terminal_grid_byte_at(split_id, buffer_id, content_rect, col, row);
-        let (Some(anchor), Some(head)) = (anchor, head) else {
+        let head_start = self.terminal_grid_byte_at(split_id, buffer_id, content_rect, col, row);
+        let (Some(anchor_start), Some(head_start)) = (anchor_start, head_start) else {
             return Ok(());
+        };
+        let (anchor, head) = if head_start >= anchor_start {
+            (
+                anchor_start,
+                self.terminal_grid_cell_end(buffer_id, head_start),
+            )
+        } else {
+            (
+                self.terminal_grid_cell_end(buffer_id, anchor_start),
+                head_start,
+            )
         };
 
         if let Some(view_state) = self
@@ -671,5 +681,30 @@ impl super::Editor {
             .buffer
             .line_col_to_position(top_line + grid_row, grid_col);
         Some(state.buffer.snap_to_char_boundary(pos))
+    }
+
+    /// Return the byte boundary after the terminal cell that starts at `pos`.
+    /// Empty cells past the rendered line stay collapsed at the line end.
+    pub(super) fn terminal_grid_cell_end(&self, buffer_id: BufferId, pos: usize) -> usize {
+        let Some(state) = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.get(&buffer_id))
+        else {
+            return pos;
+        };
+        let (line, col) = state.buffer.position_to_line_col(pos);
+        let Some(bytes) = state.buffer.get_line(line) else {
+            return pos;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let trimmed = text.trim_end_matches(['\n', '\r']);
+        if col >= trimmed.len() {
+            return pos;
+        }
+        state.buffer.line_col_to_position(
+            line,
+            crate::primitives::grapheme::next_grapheme_boundary(trimmed, col),
+        )
     }
 }
