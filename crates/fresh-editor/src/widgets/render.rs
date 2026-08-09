@@ -4036,34 +4036,33 @@ fn wrap_entry_between(
         // Tail-truncate at the byte where the display width reaches
         // `inner_width`, then if there's room make the final column an
         // `…` so the cut is visible (mirrors `pad_or_truncate_cols`).
-        let byte_cutoff = crate::primitives::display_width::byte_offset_at_visual_column(
+        let source_cutoff = crate::primitives::display_width::grapheme_prefix_len_at_width(
             &child.text,
-            inner_width,
+            inner_width.saturating_sub(usize::from(inner_width >= 2)),
         );
-        child.text.truncate(byte_cutoff);
+        child.text.truncate(source_cutoff);
         if inner_width >= 2 {
-            while crate::primitives::display_width::str_width(&child.text)
-                > inner_width.saturating_sub(1)
-            {
-                child.text.pop();
-            }
             child.text.push('…');
         }
         let w = crate::primitives::display_width::str_width(&child.text);
         for _ in 0..inner_width.saturating_sub(w) {
             child.text.push(' ');
         }
-        let byte_cutoff = child.text.len();
-        // Drop any overlay that would now reference past the
-        // truncation point; clamp the rest.
+        // Drop any overlay outside the retained source text; the rendered
+        // ellipsis and padding have no corresponding source bytes.
         child.inline_overlays.retain_mut(|o| {
-            if o.start >= byte_cutoff {
+            if o.start >= source_cutoff {
                 return false;
             }
-            if o.end > byte_cutoff {
-                o.end = byte_cutoff;
-            }
-            true
+            o.start = crate::primitives::grapheme::snap_to_grapheme_boundary(
+                &child.text,
+                o.start.min(source_cutoff),
+            );
+            o.end = crate::primitives::grapheme::snap_to_grapheme_boundary(
+                &child.text,
+                o.end.min(source_cutoff),
+            );
+            o.start < o.end
         });
     }
 
@@ -4449,18 +4448,13 @@ fn fit_label(label: &str, width: usize) -> String {
         return pad_label(label, width);
     }
     // Truncate to width-1 columns, then append '…'.
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in label.chars() {
-        let cw = str_width(&ch.to_string());
-        if used + cw > width.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
+    let keep = crate::primitives::display_width::grapheme_prefix_len_at_width(
+        label,
+        width.saturating_sub(1),
+    );
+    let mut out = String::from(&label[..keep]);
     out.push('…');
-    used += 1;
+    let used = str_width(&out);
     out.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
     out
 }
@@ -4782,17 +4776,15 @@ pub fn dual_sanitize_included(options: &[DualListOption], included: &[String]) -
         .collect()
 }
 
-/// Truncate-or-pad a string to exactly `width` display columns
-/// (char-approximate; adequate for the ASCII labels DualList shows).
+/// Truncate-or-pad a string to exactly `width` display columns.
 fn cell(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() >= width {
-        chars[..width].iter().collect()
-    } else {
-        let mut out: String = chars.iter().collect();
-        out.extend(std::iter::repeat_n(' ', width - chars.len()));
-        out
-    }
+    let keep = crate::primitives::display_width::grapheme_prefix_len_at_width(s, width);
+    let mut out = String::from(&s[..keep]);
+    out.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(crate::primitives::display_width::str_width(&out)),
+    ));
+    out
 }
 
 /// Column width used for each DualList column given the panel width.
@@ -5393,13 +5385,34 @@ pub fn render_tree_row(
         None
     };
     let checkbox_extra = checkbox_glyph.map(|g| g.len() + 1).unwrap_or(0);
+    let body_width = (panel_width as usize)
+        .saturating_sub(indent_cols)
+        .saturating_sub(2)
+        .saturating_sub(checkbox_extra);
+    let mut body = node.text.clone();
+    body.normalize_widths();
+    let split = body
+        .properties
+        .get("align")
+        .and_then(|value| (value.as_str() == Some("between")).then_some(value))
+        .and_then(|_| body.properties.get("splitByte"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|&byte| byte <= body.text.len() && body.text.is_char_boundary(byte));
+    if let Some(split) = split {
+        let priority = body
+            .properties
+            .get("rightPriorityByte")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|&byte| {
+                byte >= split && byte <= body.text.len() && body.text.is_char_boundary(byte)
+            });
+        fit_between(&mut body, split, priority, body_width);
+    }
 
     let mut text = String::with_capacity(
-        indent_cols
-            + disclosure_glyph.len()
-            + separator.len()
-            + checkbox_extra
-            + node.text.text.len(),
+        indent_cols + disclosure_glyph.len() + separator.len() + checkbox_extra + body.text.len(),
     );
     for _ in 0..indent_cols {
         text.push(' ');
@@ -5418,13 +5431,12 @@ pub fn render_tree_row(
         None
     };
     let body_start = text.len();
-    text.push_str(&node.text.text);
+    text.push_str(&body.text);
 
     // Carry over the plugin's inline overlays, shifted right by
     // `body_start` so they land on the correct bytes after the
     // prefix.
-    let mut overlays: Vec<InlineOverlay> = node
-        .text
+    let mut overlays: Vec<InlineOverlay> = body
         .inline_overlays
         .iter()
         .map(|o| {
@@ -5480,8 +5492,8 @@ pub fn render_tree_row(
         // The plugin's own row-level properties (e.g. file-row
         // metadata) carry through unchanged so existing
         // mouse_click handlers still see them.
-        properties: node.text.properties.clone(),
-        style: node.text.style.clone(),
+        properties: body.properties,
+        style: body.style,
         inline_overlays: overlays,
         // segments / pad / truncate hints are consumed by the
         // caller before render_tree_row is invoked (see
@@ -5588,6 +5600,102 @@ pub(crate) fn tree_node_rows(
 pub(crate) fn tree_max_scroll(heights: &[u32], visible_rows: u32) -> u32 {
     heights.iter().sum::<u32>().saturating_sub(visible_rows)
 }
+/// Fit an `align: between` row to its real host-provided width. The right group
+/// is authoritative; only the left prefix is elided when both groups overflow.
+/// If the full right group itself overflows, `right_priority` identifies the
+/// suffix that must survive (for example a PR badge after transient status).
+/// Entries are normalized before this point, so overlay offsets are bytes.
+fn fit_between(
+    entry: &mut TextPropertyEntry,
+    split: usize,
+    right_priority: Option<usize>,
+    inner_width: usize,
+) {
+    let original = std::mem::take(&mut entry.text);
+    let split = crate::primitives::grapheme::snap_to_grapheme_boundary(&original, split);
+    let full_right_width = crate::primitives::display_width::str_width(&original[split..]);
+    let right_origin = right_priority
+        .map(|priority| crate::primitives::grapheme::snap_to_grapheme_boundary(&original, priority))
+        .filter(|&priority| priority >= split)
+        .filter(|_| full_right_width > inner_width)
+        .unwrap_or(split);
+    let right = &original[right_origin..];
+    if right.is_empty() {
+        entry.text = original;
+        return;
+    }
+
+    let right_width = crate::primitives::display_width::str_width(right);
+    let left = &original[..split];
+    let left_budget = if right_width >= inner_width {
+        0
+    } else {
+        inner_width.saturating_sub(right_width + usize::from(!left.is_empty()))
+    };
+    let left_width = crate::primitives::display_width::str_width(left);
+    let (left_keep, left_text, elided) = if left_width <= left_budget {
+        (split, left.to_string(), false)
+    } else if left_budget == 0 {
+        (0, String::new(), false)
+    } else {
+        let keep = crate::primitives::display_width::grapheme_prefix_len_at_width(
+            left,
+            left_budget.saturating_sub(1),
+        );
+        let mut text = left[..keep].to_string();
+        text.push('…');
+        (keep, text, true)
+    };
+
+    let left_width = crate::primitives::display_width::str_width(&left_text);
+    let pad = inner_width.saturating_sub(left_width + right_width);
+    let right_start = left_text.len() + pad;
+    let left_output_len = left_text.len();
+    entry.text = left_text;
+    entry.text.push_str(&" ".repeat(pad));
+    entry.text.push_str(right);
+
+    let original_len = original.len();
+    let mut overlays = Vec::with_capacity(entry.inline_overlays.len() * 2);
+    for overlay in std::mem::take(&mut entry.inline_overlays) {
+        debug_assert_eq!(overlay.unit, OffsetUnit::Byte);
+        let overlay_start = crate::primitives::grapheme::snap_to_grapheme_boundary(
+            &original,
+            overlay.start.min(original_len),
+        );
+        let overlay_end = crate::primitives::grapheme::snap_to_grapheme_boundary(
+            &original,
+            overlay.end.min(original_len),
+        );
+        if overlay_start >= overlay_end {
+            continue;
+        }
+
+        let kept_end = overlay_end.min(left_keep);
+        let covers_ellipsis = elided && overlay_start <= left_keep && overlay_end > left_keep;
+        if overlay_start < kept_end || covers_ellipsis {
+            let mut kept = overlay.clone();
+            kept.start = overlay_start.min(left_keep);
+            kept.end = kept_end;
+            if covers_ellipsis {
+                kept.end = left_output_len;
+            }
+            if kept.start < kept.end {
+                overlays.push(kept);
+            }
+        }
+
+        let right_old_start = overlay_start.max(right_origin);
+        let right_old_end = overlay_end;
+        if right_old_start < right_old_end {
+            let mut kept = overlay;
+            kept.start = right_start + right_old_start - right_origin;
+            kept.end = right_start + right_old_end - right_origin;
+            overlays.push(kept);
+        }
+    }
+    entry.inline_overlays = overlays;
+}
 
 /// Render a card node as a rounded box spanning the panel width:
 /// a `╭─…─╮` top border (the primary row — its full-width `select`
@@ -5619,60 +5727,45 @@ fn render_tree_card(node: &TreeNode, item_height: u32, panel_width: u32) -> Rend
     };
     let content_row = |src: TextPropertyEntry| -> TextPropertyEntry {
         let mut src = src;
-        // A row carrying the `align: "right"` entry property is padded
-        // out to the card's *actual* inner width here, where that width
-        // is known exactly — plugin-side padding could only estimate the
-        // dock's responsive/dragged width and drifted at other widths.
-        // The pad is ASCII spaces (1 byte == 1 char each), so shifting
-        // overlay offsets by the pad length is unit-correct for both
-        // byte- and char-unit overlays.
+        src.normalize_widths();
         let align = src
             .properties
             .get("align")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // `align: "between"` splits the row into a left group and a
-        // right one flush against the border — the card equivalent of
-        // the flex spacer a widget `Row` gets. The split point is a byte
-        // offset into the row's own text (`splitByte`), so the plugin
-        // says *where* the groups meet and the host, which alone knows
-        // the card's real width, decides how much space goes between
-        // them. Overflowing rows get a single separating space and fall
-        // through to the usual end-truncation.
-        let split = if align == "between" {
+        let split = (align == "between")
+            .then(|| {
+                src.properties
+                    .get("splitByte")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .filter(|&b| b <= src.text.len() && src.text.is_char_boundary(b))
+            })
+            .flatten();
+        let priority = split.and_then(|split| {
             src.properties
-                .get("splitByte")
+                .get("rightPriorityByte")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
-                .filter(|&b| b <= src.text.len() && src.text.is_char_boundary(b))
-        } else {
-            None
-        };
-        // Where the padding goes: the row's start (right-aligned) or the
-        // group boundary (space-between).
-        let pad_at = match (align.as_str(), split) {
-            ("right", _) => Some(0),
-            ("between", Some(b)) => Some(b),
-            _ => None,
-        };
-        if let Some(at) = pad_at {
-            let width = src.text.chars().count();
-            // A "between" row always keeps at least one space between
-            // the groups so they can't run together when the card is too
-            // narrow to hold both.
-            let pad_cols = inner_width.saturating_sub(width).max(usize::from(at > 0));
-            if pad_cols > 0 {
-                let pad = " ".repeat(pad_cols);
-                src.text.insert_str(at, &pad);
-                // The pad is ASCII spaces (1 byte == 1 char each), so
-                // shifting the overlays that sit after it is unit-correct
-                // for both byte- and char-unit overlays.
-                for o in src.inline_overlays.iter_mut().filter(|o| o.start >= at) {
-                    o.start += pad.len();
-                    o.end += pad.len();
+                .filter(|&b| b >= split && b <= src.text.len() && src.text.is_char_boundary(b))
+        });
+
+        match (align.as_str(), split) {
+            ("right", _) => {
+                let width = crate::primitives::display_width::str_width(&src.text);
+                let pad_cols = inner_width.saturating_sub(width);
+                if pad_cols > 0 {
+                    src.text.insert_str(0, &" ".repeat(pad_cols));
+                    for overlay in &mut src.inline_overlays {
+                        debug_assert_eq!(overlay.unit, OffsetUnit::Byte);
+                        overlay.start += pad_cols;
+                        overlay.end += pad_cols;
+                    }
                 }
             }
+            ("between", Some(split)) => fit_between(&mut src, split, priority, inner_width),
+            _ => {}
         }
         let mut e = wrap_entry_between(src, inner_width, "│", "│");
         strip_trailing_newline(&mut e);
@@ -5735,7 +5828,7 @@ pub struct RenderedTextInput {
 /// Render a `TextInput`.
 ///
 /// Layout: `Label: [<inner>]` (or `[<inner>]` with no label).
-/// `<inner>` is exactly `field_width` chars wide when
+/// `<inner>` is exactly `field_width` terminal cells wide when
 /// `field_width > 0` — short values pad with trailing spaces, long
 /// values head-truncate with `…` so the cursor (typically near the
 /// tail) stays visible. With `field_width == 0` the input grows
@@ -5776,14 +5869,16 @@ pub fn render_text_input(
     // user "overwrites" the hint as they type.
     let show_placeholder = value.is_empty() && placeholder.is_some();
 
-    // Compute the user-cursor's char position within `value`. We
-    // operate in bytes here, which is correct for the cursor on
-    // ASCII; multibyte chars resolve via is_char_boundary checks.
-    let raw_cursor_byte = if cursor_byte < 0 {
-        value.len()
-    } else {
-        (cursor_byte as usize).min(value.len())
-    };
+    // Cursor offsets arrive as bytes, but rendering and style ranges must
+    // never land inside a user-visible grapheme cluster.
+    let raw_cursor_byte = crate::primitives::grapheme::snap_to_grapheme_boundary(
+        value,
+        if cursor_byte < 0 {
+            value.len()
+        } else {
+            (cursor_byte as usize).min(value.len())
+        },
+    );
 
     // Breadcrumbs for mapping a mouse click column back to a value
     // byte (click-to-position-cursor). Set by the head-truncation
@@ -5802,71 +5897,54 @@ pub fn render_text_input(
         let cursor = if focused { Some(0usize) } else { None };
         (inner, cursor)
     } else if show_placeholder {
-        // Constant-width placeholder: pad / truncate the hint to
-        // the same total_inner width the value would occupy, so
-        // the bracketed field has a stable visual size whether
-        // the user has typed yet or not. Same `pad_extra = 1`
-        // rule as the value path (under `full_width`) so the
-        // closing bracket doesn't shift on focus.
+        // Constant-width placeholder: pad / truncate the hint to the same
+        // cell width as the value would occupy.
         let target = field_width as usize;
         let pad_extra = if focused || full_width { 1 } else { 0 };
         let total_inner = target + pad_extra;
         let raw = placeholder.unwrap_or("");
-        let raw_chars: Vec<char> = raw.chars().collect();
-        let inner = if raw_chars.len() <= total_inner {
-            let mut s = raw.to_string();
-            while s.chars().count() < total_inner {
-                s.push(' ');
-            }
-            s
-        } else {
-            // Tail-truncate the placeholder with `…` so a long
-            // hint doesn't bleed past the field.
-            let keep = total_inner.saturating_sub(1);
-            let prefix: String = raw_chars.iter().take(keep).collect();
-            format!("{}…", prefix)
-        };
+        let keep = crate::primitives::display_width::grapheme_prefix_len_at_width(
+            raw,
+            total_inner.saturating_sub(usize::from(
+                crate::primitives::display_width::str_width(raw) > total_inner,
+            )),
+        );
+        let mut inner = String::from(&raw[..keep]);
+        if keep < raw.len() && total_inner > 0 {
+            inner.push('…');
+        }
+        inner.extend(std::iter::repeat_n(
+            ' ',
+            total_inner.saturating_sub(crate::primitives::display_width::str_width(&inner)),
+        ));
         let cursor = if focused { Some(0usize) } else { None };
         (inner, cursor)
     } else if field_width > 0 {
-        // Constant-width. Visible value occupies `target` chars;
-        // when focused (or when the caller asked for `full_width`,
-        // which stabilises the visual width across focus
-        // transitions) we add one trailing pad space so the cursor
-        // never lands on the closing bracket.
+        // Constant-width. The value and trailing cursor pad are measured in
+        // terminal cells, never UTF-8 scalar values.
         let target = field_width as usize;
         let pad_extra = if focused || full_width { 1 } else { 0 };
         let total_inner = target + pad_extra;
-        let value_chars: Vec<char> = value.chars().collect();
-        if value_chars.len() <= target {
-            // Short or exact-fit value: pad with trailing spaces
-            // to total_inner. Cursor at byte k of value lands at
-            // byte k of inner.
+        if crate::primitives::display_width::str_width(value) <= target {
             let mut padded = value.to_string();
-            while padded.chars().count() < total_inner {
-                padded.push(' ');
-            }
+            padded.extend(std::iter::repeat_n(
+                ' ',
+                total_inner.saturating_sub(crate::primitives::display_width::str_width(&padded)),
+            ));
             (padded, Some(raw_cursor_byte))
         } else {
-            // Long value: head-truncate to fit `target - 1` value
-            // chars + 1 ellipsis. When focused, append a trailing
-            // pad space (cursor parks there at end-of-value).
-            let keep = target - 1;
-            let drop_chars = value_chars.len() - keep;
-            let mut dropped_bytes = 0usize;
-            for ch in value_chars.iter().take(drop_chars) {
-                dropped_bytes += ch.len_utf8();
-            }
+            let dropped_bytes = crate::primitives::display_width::grapheme_suffix_start_at_width(
+                value,
+                target.saturating_sub(1),
+            );
             let tail = &value[dropped_bytes..];
             let mut s = String::with_capacity("…".len() + tail.len() + pad_extra);
             s.push('…');
             s.push_str(tail);
-            for _ in 0..pad_extra {
-                s.push(' ');
-            }
-            // Cursor: if it sits in the dropped prefix, clamp to
-            // right after the `…` glyph; otherwise translate
-            // through the truncation.
+            s.extend(std::iter::repeat_n(
+                ' ',
+                total_inner.saturating_sub(crate::primitives::display_width::str_width(&s)),
+            ));
             let cursor_in_inner = if raw_cursor_byte < dropped_bytes {
                 "…".len()
             } else {
@@ -5876,16 +5954,18 @@ pub fn render_text_input(
             ellipsis_bytes = "…".len();
             (s, Some(cursor_in_inner))
         }
-    } else if max_visible_chars > 0 && value.chars().count() > max_visible_chars as usize {
-        // Legacy max_visible_chars path: tail-truncate with `…`
-        // (drops the *tail*, not the head — matches the original
-        // cursor-invisible v1 behaviour for callers still using it).
-        let chars: Vec<char> = value.chars().collect();
-        let take = (max_visible_chars as usize).saturating_sub(1);
-        let start = chars.len().saturating_sub(take);
-        let tail: String = chars[start..].iter().collect();
-        let s = format!("…{}", tail);
-        (s, Some(raw_cursor_byte.min(value.len())))
+    } else if max_visible_chars > 0
+        && crate::primitives::display_width::str_width(value) > max_visible_chars as usize
+    {
+        // Legacy fixed-width path: preserve the tail in cell columns.
+        let start = crate::primitives::display_width::grapheme_suffix_start_at_width(
+            value,
+            (max_visible_chars as usize).saturating_sub(1),
+        );
+        (
+            format!("…{}", &value[start..]),
+            Some(raw_cursor_byte.min(value.len())),
+        )
     } else {
         // No fixed width and no truncation: render the value as-is.
         // When focused we still need somewhere for the cursor to
@@ -5953,12 +6033,18 @@ pub fn render_text_input(
     let inner_is_truncated = inner.starts_with('…');
     if focused && !inner_is_truncated {
         if let Some((sel_start, sel_end)) = selection {
-            // Clamp to the visible value bytes. `inner` may have
-            // trailing padding (spaces) when `field_width > 0` —
-            // selection never extends into the pad area.
+            // Clamp to whole visible graphemes. `inner` may have trailing
+            // padding (spaces) when `field_width > 0`; selection never
+            // extends into that padding.
             let visible_value_len = value.len();
-            let s = sel_start.min(sel_end).min(visible_value_len);
-            let e = sel_start.max(sel_end).min(visible_value_len);
+            let s = crate::primitives::grapheme::snap_to_grapheme_boundary(
+                value,
+                sel_start.min(sel_end).min(visible_value_len),
+            );
+            let e = crate::primitives::grapheme::snap_to_grapheme_boundary(
+                value,
+                sel_start.max(sel_end).min(visible_value_len),
+            );
             if e > s {
                 overlays.push(InlineOverlay {
                     start: inner_byte_start + s,
@@ -6254,26 +6340,24 @@ fn byte_to_line_col(value: &str, byte: usize) -> (usize, usize) {
     (line, byte - line_start)
 }
 
-/// Pad `line` with trailing spaces to `target` chars, or
-/// tail-truncate with `…` if it overflows. Operates on chars to keep
-/// the visual width predictable for ASCII; multibyte chars count as
-/// one char each (terminal column width != char count for CJK, but
-/// that's an acceptable v1 limitation matching `TextInput`).
+/// Pad `line` with trailing spaces to `target` terminal cells, or
+/// tail-truncate with `…` without splitting a grapheme cluster.
 fn pad_or_truncate_line(line: &str, target: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= target {
-        let mut out = line.to_string();
-        let pad = target - chars.len();
-        for _ in 0..pad {
-            out.push(' ');
-        }
-        out
-    } else {
-        let keep = target.saturating_sub(1);
-        let mut out: String = chars.iter().take(keep).collect();
+    let keep = crate::primitives::display_width::grapheme_prefix_len_at_width(
+        line,
+        target.saturating_sub(usize::from(
+            crate::primitives::display_width::str_width(line) > target,
+        )),
+    );
+    let mut out = String::from(&line[..keep]);
+    if keep < line.len() && target > 0 {
         out.push('…');
-        out
     }
+    out.extend(std::iter::repeat_n(
+        ' ',
+        target.saturating_sub(crate::primitives::display_width::str_width(&out)),
+    ));
+    out
 }
 
 /// Assemble a wrapping Row: pack inline pieces onto lines no wider than
@@ -6370,56 +6454,32 @@ fn merge_inline(merged: &mut TextPropertyEntry, next: &mut TextPropertyEntry) {
     // the styled child as its sole element.
 }
 
-/// Pad / truncate `text` to exactly `cols` display columns, in
-/// place. Uses char count as the display-width approximation —
-/// good for ASCII; wide-char-aware width would need
-/// `unicode-width`, but no current caller relies on that.
-///
-/// When truncating, the final visible column is replaced with `…`
-/// so the cut is visually distinguishable from a value that
-/// happens to be exactly `cols` long. Degenerate `cols == 0` and
-/// `cols == 1` (no room for the ellipsis itself) fall back to a
-/// plain cut.
+/// Pad / truncate `text` to exactly `cols` display columns, on extended
+/// grapheme boundaries. A trailing `…` marks a non-degenerate truncation.
 fn pad_or_truncate_cols(text: &mut String, cols: usize) {
-    // Measure in display columns, not chars: a `漢` or `😀` is one char
-    // but two columns, and char-counted padding pushed every border to
-    // the right of a wide glyph out of alignment.
     let cur = crate::primitives::display_width::str_width(text);
     if cur < cols {
-        for _ in 0..(cols - cur) {
-            text.push(' ');
-        }
+        text.extend(std::iter::repeat_n(' ', cols - cur));
     } else if cur > cols {
-        // Cut at the byte where the display width reaches `cols`, then
-        // if we have room make the last column an `…` so the truncation
-        // is visible. A wide glyph straddling the cut is dropped whole,
-        // leaving a one-column gap the pad below fills.
-        let cutoff = crate::primitives::display_width::byte_offset_at_visual_column(text, cols);
-        text.truncate(cutoff);
+        let keep = crate::primitives::display_width::grapheme_prefix_len_at_width(
+            text,
+            cols.saturating_sub(usize::from(cols >= 2)),
+        );
+        text.truncate(keep);
         if cols >= 2 {
-            while crate::primitives::display_width::str_width(text) > cols.saturating_sub(1) {
-                text.pop();
-            }
             text.push('…');
         }
-        let w = crate::primitives::display_width::str_width(text);
-        for _ in 0..cols.saturating_sub(w) {
-            text.push(' ');
-        }
+        text.extend(std::iter::repeat_n(
+            ' ',
+            cols.saturating_sub(crate::primitives::display_width::str_width(text)),
+        ));
     }
 }
 
-/// Clamp `idx` to `s.len()`, then walk it down to the nearest
-/// char boundary. Byte-unit inline overlays computed against a
-/// pre-truncation line must pass through this after the line is
-/// column-truncated, so they can never index inside a multi-byte
-/// char (the panic the span splitter raises on `text[a..b]`).
+/// Clamp `idx` to a grapheme boundary so style spans never split a user-
+/// visible character after a row has been column-truncated.
 fn snap_down_to_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+    crate::primitives::grapheme::snap_to_grapheme_boundary(s, idx)
 }
 
 /// Horizontal-zip pass for a Row that contains ≥1 multi-line
@@ -8183,6 +8243,87 @@ mod tests {
     }
 
     #[test]
+    fn fixed_width_text_and_borders_keep_graphemes_whole() {
+        let zwj = "👩\u{200d}👩\u{200d}👧\u{200d}👦";
+        let value = format!("e\u{301}{zwj}x");
+        let input = render_text_input(
+            &value,
+            value.len() as i32,
+            None,
+            false,
+            "",
+            None,
+            0,
+            3,
+            false,
+        );
+        assert_eq!(input.entry.text, "[…x ]");
+
+        let mut row = value;
+        pad_or_truncate_cols(&mut row, 3);
+        assert_eq!(crate::primitives::display_width::str_width(&row), 3);
+        assert_eq!(row, "e\u{301}… ");
+
+        let bordered = wrap_entry_between(
+            TextPropertyEntry::text(&format!("e\u{301}{zwj}x")),
+            3,
+            "│",
+            "│",
+        );
+        assert_eq!(bordered.text, "│e\u{301}… │\n");
+        assert_eq!(
+            crate::primitives::display_width::str_width(bordered.text.strip_suffix('\n').unwrap()),
+            5
+        );
+
+        let mut styled = TextPropertyEntry::text(&format!("e\u{301}{zwj}x"));
+        let first_grapheme_end = "e\u{301}".len();
+        styled.inline_overlays.push(InlineOverlay {
+            start: first_grapheme_end,
+            end: styled.text.len(),
+            style: OverlayOptions::default(),
+            properties: Default::default(),
+            unit: OffsetUnit::Byte,
+        });
+        let styled = wrap_entry_between(styled, 3, "│", "│");
+        assert!(styled.inline_overlays.is_empty());
+
+        let selected = render_text_input("e\u{301}x", 3, Some((1, 3)), true, "", None, 0, 0, false);
+        assert!(selected
+            .entry
+            .inline_overlays
+            .iter()
+            .any(|overlay| overlay.start == 1 && overlay.end == 1 + "e\u{301}".len()));
+    }
+
+    #[test]
+    fn between_rows_snap_inline_overlay_edges_to_graphemes() {
+        let left = "e\u{301}left";
+        let mut entry = TextPropertyEntry::text(format!("{left}right"));
+        entry.inline_overlays.push(InlineOverlay {
+            start: 1,
+            end: left.len(),
+            style: OverlayOptions::default(),
+            properties: Default::default(),
+            unit: OffsetUnit::Byte,
+        });
+
+        fit_between(&mut entry, left.len(), None, 16);
+
+        let overlay = entry.inline_overlays.first().unwrap();
+        assert_eq!(overlay.start, 0);
+        assert_eq!(&entry.text[overlay.start..overlay.end], left);
+    }
+
+    #[test]
+    fn cjk_rows_use_terminal_columns_not_scalar_count() {
+        let mut row = "中文x".to_string();
+        pad_or_truncate_cols(&mut row, 4);
+        assert_eq!(row, "中… ");
+        assert_eq!(crate::primitives::display_width::str_width(&row), 4);
+    }
+
+    #[test]
     fn raw_inside_col_offsets_following_hits() {
         let spec = WidgetSpec::Col {
             children: vec![
@@ -8568,7 +8709,12 @@ mod tests {
 
     /// One `align: "between"` card row: `left` and `right` groups meet
     /// at `splitByte`, rendered in a card `width` columns wide.
-    fn between_card_row(left: &str, right: &str, width: u32) -> String {
+    fn between_card_row_with_priority(
+        left: &str,
+        right: &str,
+        priority: Option<usize>,
+        width: u32,
+    ) -> String {
         let mut node = tnode("name", 0, false);
         let mut line = TextPropertyEntry::text(format!("{left}{right}"));
         line.properties.insert(
@@ -8579,6 +8725,12 @@ mod tests {
             "splitByte".to_string(),
             serde_json::Value::Number((left.len() as u64).into()),
         );
+        if let Some(priority) = priority {
+            line.properties.insert(
+                "rightPriorityByte".to_string(),
+                serde_json::Value::Number(((left.len() + priority) as u64).into()),
+            );
+        }
         node.extra_lines = vec![line];
         let spec = WidgetSpec::Tree {
             nodes: vec![node],
@@ -8594,6 +8746,10 @@ mod tests {
         let out = render_spec(&spec, &HashMap::new(), "", width);
         // Top border, name row, the split row, bottom border.
         out.entries[2].text.trim_end_matches('\n').to_string()
+    }
+
+    fn between_card_row(left: &str, right: &str, width: u32) -> String {
+        between_card_row_with_priority(left, right, None, width)
     }
 
     /// A card row (the orchestrator dock's workspace cards) can ask for
@@ -8630,6 +8786,61 @@ mod tests {
             !row.contains("ijPR"),
             "a full row still separates the groups, got {row:?}"
         );
+    }
+
+    #[test]
+    fn tree_card_between_alignment_uses_display_width_for_wide_glyphs() {
+        let row = between_card_row("界界 workspace", "承認待ち", 24);
+        assert_eq!(
+            crate::primitives::display_width::str_width(&row),
+            24,
+            "the card must occupy its real display width: {row:?}"
+        );
+        assert!(
+            row.ends_with("承認待ち│"),
+            "the authoritative wide-glyph status stays flush right: {row:?}"
+        );
+    }
+    #[test]
+    fn tree_card_between_alignment_preserves_priority_suffix_when_status_overflows() {
+        let status = "Awaiting approval   ";
+        let pr = "PR #42";
+        let row = between_card_row_with_priority(
+            "workspace",
+            &format!("{status}{pr}"),
+            Some(status.len()),
+            12,
+        );
+        assert!(row.ends_with("PR #42│"), "priority badge was lost: {row:?}");
+        assert!(
+            !row.contains("Awaiting"),
+            "transient status should yield to the priority badge: {row:?}"
+        );
+    }
+
+    #[test]
+    fn plain_tree_between_alignment_preserves_compact_right_status() {
+        let left = "very-long-workspace-name";
+        let right = "Awaiting approval";
+        let mut node = tnode(&format!("{left}{right}"), 0, false);
+        node.text.properties.insert(
+            "align".to_string(),
+            serde_json::Value::String("between".to_string()),
+        );
+        node.text.properties.insert(
+            "splitByte".to_string(),
+            serde_json::Value::Number((left.len() as u64).into()),
+        );
+
+        let row = render_tree_row(&node, false, false, 1, false, 24)
+            .entry
+            .text;
+        assert_eq!(crate::primitives::display_width::str_width(&row), 24);
+        assert!(
+            row.ends_with(right),
+            "the compact row must preserve the full right status: {row:?}"
+        );
+        assert!(row.contains('…'), "the decorative left label should elide");
     }
 
     #[test]

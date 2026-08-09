@@ -15,11 +15,16 @@
 //! * mouse clicks land on dock widgets (the "New Task… ▾" button opens
 //!   the create dropdown).
 
-use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
+use crate::common::fail_retirement_write_fs::FailRetirementWriteFs;
+use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
 use crate::common::tracing::init_tracing_from_env;
 use crossterm::event::{KeyCode, KeyModifiers};
+use fresh::config_io::DirectoryContext;
+use fresh_core::api::PluginCommand;
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A git project with the orchestrator plugin (+ shared lib) installed.
 fn setup_project(name: &str) -> (tempfile::TempDir, PathBuf) {
@@ -526,8 +531,8 @@ fn next_window_cycles_only_dock_visible_sessions() {
 }
 
 /// Rows a dock card occupies below its name row in card view: the
-/// remaining content row (branch/project + PR) plus the bottom border.
-/// Mirrors the plugin's `DOCK_CARD_HEIGHT` (2 content rows).
+/// remaining content row (branch/project + OMP status/PR) plus the bottom
+/// border. Mirrors the plugin's `DOCK_CARD_HEIGHT` (2 content rows).
 const DOCK_CARD_ROWS_BELOW_NAME: u16 = 2;
 
 /// Column of the dock's right-edge divider (the "wall") on the title row.
@@ -983,17 +988,13 @@ fn dock_right_border_drag_resizes_and_persists() {
 }
 
 #[test]
-fn dock_show_empty_toggle_flips_on_click() {
-    // The "show empty" toggle defaults to ON (show every workspace,
-    // including trivial ones) so a freshly created empty workspace stays
-    // visible instead of vanishing behind the hide-trivial filter.
-    // Clicking it flips the checkbox `[v]` → `[ ]`, proving the dock toggle
-    // is wired to the shared hide-trivial filter.
+fn dock_show_empty_toggle_flips_on_click_and_space() {
+    // Mouse establishes focus on the Toggle; Space must use that focused
+    // control's standard smart-key path rather than the dock list path.
     let (_tmp, root) = setup_project("alphaproj");
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
             .unwrap();
-    h.render().unwrap();
     open_dock(&mut h);
     // The trivial-sessions toggle now lives in the collapsible Filters
     // section — open it first.
@@ -1011,29 +1012,22 @@ fn dock_show_empty_toggle_flips_on_click() {
     h.mouse_click(3, trow).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[ ] show empty"))
         .unwrap();
+
+    // The clicked toggle keeps focus. Space restores the checked state through
+    // the same standard Toggle activation path as keyboard-only focus would.
+    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("[v] show empty"))
+        .unwrap();
 }
 
 #[test]
-fn picker_space_toggles_focused_checkbox_not_list() {
-    // OPEN_MODE binds Space to `orchestrator_toggle_select`
-    // unconditionally — it has to, to keep Space out of the filter
-    // text input (the host's `dispatch_floating_widget_key` defers any
-    // explicitly-bound mode key, including bare chars, before the text-
-    // input path). Without context-sensitivity, Space toggles the
-    // sessions-list multi-select even while focus is on the
-    // "Show all worktrees" / "Show empty/1-file" filter checkbox above
-    // the list.
-    //
-    // With the fix, `toggleSelectCurrent` branches on the focused
-    // widget (mirrored from the existing `focus` widget_event): Space
-    // on `worktree-show` toggles that checkbox, not the list.
+fn picker_space_routes_focused_toggle_without_toggling_the_list() {
     let (_tmp, root) = setup_project("alphaproj");
     let mut h =
         EditorTestHarness::with_config_and_working_dir(140, 40, Default::default(), root.clone())
             .unwrap();
     h.render().unwrap();
 
-    // Open the centered picker via the command palette.
     h.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     h.wait_for_prompt().unwrap();
@@ -1041,8 +1035,6 @@ fn picker_space_toggles_focused_checkbox_not_list() {
     h.wait_until(|h| h.screen_to_string().contains("Orchestrator: Open"))
         .unwrap();
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    // Wait until the picker is fully mounted: the header is painted,
-    // the worktree filter row is visible, and the list shows alphaproj.
     h.wait_until(|h| {
         let s = h.screen_to_string();
         s.contains("ORCHESTRATOR :: Workspaces")
@@ -1051,32 +1043,26 @@ fn picker_space_toggles_focused_checkbox_not_list() {
     })
     .unwrap();
 
-    // Sanity: focus opens on the sessions list, so Space toggles the
-    // list multi-select. This guards against the test landing focus
-    // elsewhere by accident on a future picker re-layout.
+    // Space selects a row while the sessions list owns focus.
     h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[x] alphaproj"))
         .unwrap();
-    // Reset before the focus walk.
     h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[ ] alphaproj"))
         .unwrap();
 
-    // Tab cycle is spec-order: new-session → scope-toggle →
-    // worktree-show → hide-trivial → filter → sessions. Three
-    // Shift+Tabs from `sessions` land on `worktree-show`.
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-
-    // Space here must toggle `worktree-show`, NOT the list.
-    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    // Clicking the toggle both changes it and gives it focus. The following
+    // Space must route back to that toggle, not the sessions list.
+    let (col, row) = pos_of(&h, "Show all worktrees");
+    h.mouse_click(col, row).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[v] Show all worktrees"))
+        .unwrap();
+    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("[ ] Show all worktrees"))
         .unwrap();
     assert!(
         h.screen_to_string().contains("[ ] alphaproj"),
-        "Space while focus is on the worktree-show checkbox must not \
-         toggle the list. Screen:\n{}",
+        "Space while the worktree toggle is focused must not select the list. Screen:\n{}",
         h.screen_to_string()
     );
 }
@@ -2382,14 +2368,17 @@ fn dock_context_menu_confirm_cancel_returns_to_menu() {
 }
 
 #[test]
-fn dock_context_menu_archive_shows_confirmation() {
+fn dock_context_menu_archive_is_disabled_for_in_place_session() {
     let (_tmp, mut h) = open_dock_context_menu("alphaproj");
 
     let (acol, arow) = pos_of(&h, "Archive");
     h.mouse_click(acol, arow).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("Confirm Archive"))
-        .unwrap();
-    h.assert_screen_contains("Cancel");
+    h.tick_and_render().unwrap();
+    assert!(
+        !h.screen_to_string().contains("Confirm Archive"),
+        "an in-place session must not enter the archive transaction. Screen:\n{}",
+        h.screen_to_string()
+    );
 }
 
 /// The menu is an unobtrusive popup anchored at the click, not a centered
@@ -2437,6 +2426,289 @@ fn dock_context_menu_click_outside_dismisses() {
 }
 
 // ── folder tree ───────────────────────────────────────────────────────────
+
+/// Persisted folder data is untrusted and may be stale after concurrent
+/// editors or interrupted writes. Loading repairs duplicate ids and parent
+/// cycles. A later mutation re-reads durable state instead of overwriting a
+/// peer's write, then allocates an id unique in the merged model.
+#[test]
+fn dock_repairs_folder_graph_and_allocates_a_unique_id() {
+    let (_tmp, root) = setup_project("alphaproj");
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
+            .unwrap();
+    h.render().unwrap();
+
+    // Seed the legacy split keys. Opening the dock must read and migrate them
+    // into the single versioned envelope before any mutation occurs.
+    for (key, value) in [
+        (
+            "orchestrator.dock.folders",
+            json!([
+                { "id": "df1", "name": "Alpha", "parent": "df2" },
+                { "id": "df2", "name": "Beta", "parent": "df1" },
+                { "id": "df1", "name": "Duplicate", "parent": null },
+            ]),
+        ),
+        ("orchestrator.dock.folder_counter", json!(0)),
+        (
+            "orchestrator.dock.expanded",
+            json!(["folder:df1", "folder:df2"]),
+        ),
+    ] {
+        h.editor_mut()
+            .handle_plugin_command(PluginCommand::SetGlobalState {
+                plugin_name: "orchestrator".into(),
+                key: key.into(),
+                value: Some(value),
+            })
+            .unwrap();
+    }
+    h.editor_mut().update_plugin_state_snapshot();
+
+    open_dock(&mut h);
+    h.wait_until(|h| {
+        let screen = h.screen_to_string();
+        screen.contains("Alpha") && screen.contains("Beta")
+    })
+    .unwrap();
+    h.assert_screen_not_contains("Duplicate");
+
+    // Simulate another editor committing a folder after this plugin cached its
+    // repaired render model. The local create below must merge this durable
+    // write rather than replacing it with the stale Alpha/Beta cache.
+    h.wait_until(|h| {
+        h.editor()
+            .plugin_global_state()
+            .get("orchestrator")
+            .is_some_and(|state| state.contains_key("orchestrator.dock.model"))
+    })
+    .unwrap();
+    h.editor_mut()
+        .handle_plugin_command(PluginCommand::SetGlobalState {
+            plugin_name: "orchestrator".into(),
+            key: "orchestrator.dock.model".into(),
+            value: Some(json!({
+                "version": 1,
+                "folders": [
+                    { "id": "df1", "name": "Alpha", "parent": "df2" },
+                    { "id": "df2", "name": "Beta", "parent": "df1" },
+                    { "id": "df1", "name": "Duplicate", "parent": null },
+                    { "id": "df9", "name": "External", "parent": null },
+                ],
+                "assignments": {},
+                "expanded": ["folder:df1", "folder:df2"],
+                "names": {},
+                "folderCounter": 9,
+            })),
+        })
+        .unwrap();
+    h.editor_mut().update_plugin_state_snapshot();
+
+    let new_row = row_of(&h, "New Task") as u16;
+    h.mouse_click(4, new_row).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("New Folder"))
+        .unwrap();
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Folder name"))
+        .unwrap();
+    h.type_text("Gamma").unwrap();
+    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| {
+        let screen = h.screen_to_string();
+        !screen.contains("Folder name") && screen.contains("Gamma")
+    })
+    .unwrap();
+
+    let plugin_state = h
+        .editor()
+        .plugin_global_state()
+        .get("orchestrator")
+        .expect("orchestrator global state");
+    let model = &plugin_state["orchestrator.dock.model"];
+    assert_eq!(model["version"].as_u64(), Some(1));
+    let folders = model["folders"].as_array().expect("folder array");
+    let ids: std::collections::HashSet<String> = folders
+        .iter()
+        .map(|folder| folder["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        folders.len(),
+        "persisted folder ids must be unique"
+    );
+    assert!(
+        ids.contains("df9"),
+        "the peer's durable folder must survive the merge"
+    );
+    assert!(
+        ids.contains("df10"),
+        "new id must advance beyond every durable id"
+    );
+    assert_eq!(
+        model["folderCounter"].as_u64(),
+        Some(10),
+        "counter must advance to the allocated unique id",
+    );
+
+    let parents: std::collections::HashMap<String, Option<String>> = folders
+        .iter()
+        .map(|folder| {
+            (
+                folder["id"].as_str().unwrap().to_string(),
+                folder["parent"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    for start in parents.keys() {
+        let mut seen = std::collections::HashSet::new();
+        let mut current = Some(start.clone());
+        while let Some(id) = current {
+            assert!(
+                seen.insert(id.clone()),
+                "persisted folder graph must be acyclic; cycle reached from {start}",
+            );
+            current = parents.get(&id).cloned().flatten();
+        }
+    }
+}
+
+/// A peer editor may replace the durable dock envelope while this plugin's
+/// render cache is stale. Closing and reopening the dock must adopt the peer's
+/// complete folder/name/assignment/expansion snapshot, not retain any fragment
+/// of the previous view.
+#[test]
+fn dock_reopen_refreshes_the_complete_canonical_model() {
+    let (tmp, root) = setup_project("alphaproj");
+    let dir_context = DirectoryContext::for_testing(&tmp.path().join("data-home"));
+    let mut h = EditorTestHarness::create(
+        120,
+        32,
+        HarnessOptions::new()
+            .with_working_dir(root.clone())
+            .with_shared_dir_context(dir_context.clone())
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    h.render().unwrap();
+    open_dock(&mut h);
+    run_palette_command(&mut h, "Orchestrator: Toggle Dock");
+    h.wait_until(|h| !h.screen_to_string().contains("New Task"))
+        .unwrap();
+
+    let root_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let mut assignments = serde_json::Map::new();
+    assignments.insert(root_key.clone(), json!("df1"));
+    let mut names = serde_json::Map::new();
+    names.insert(root_key, json!("Canonical Workspace"));
+    let state_path = dir_context
+        .data_dir
+        .join("orchestrator/state/orchestrator.json");
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&json!({
+            "orchestrator.dock.model": {
+                "version": 1,
+                "folders": [
+                    { "id": "df1", "name": "Canonical Folder", "parent": null },
+                ],
+                "assignments": assignments,
+                "expanded": ["folder:df1"],
+                "names": names,
+                "folderCounter": 1,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    open_dock(&mut h);
+    h.wait_until(|h| {
+        let screen = h.screen_to_string();
+        screen.contains("Canonical Workspace")
+            && screen
+                .lines()
+                .any(|line| line.contains("Canonical Folder") && line.contains("(1)"))
+    })
+    .unwrap();
+}
+
+/// Creating a folder changes four logical fields at once (folder list,
+/// counter, expansion, and optional assignment). If the one durable envelope
+/// write fails, the previous envelope must remain byte-for-byte complete;
+/// there is no split-key prefix for another editor to observe.
+#[test]
+fn failed_dock_mutation_leaves_the_previous_envelope_intact() {
+    let (tmp, root) = setup_project("alphaproj");
+    let dir_context = DirectoryContext::for_testing(&tmp.path().join("data-home"));
+    let root_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let mut assignments = serde_json::Map::new();
+    assignments.insert(root_key.clone(), json!("df1"));
+    let mut names = serde_json::Map::new();
+    names.insert(root_key, json!("Before Failure"));
+    let state_path = dir_context
+        .data_dir
+        .join("orchestrator/state/orchestrator.json");
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let before = json!({
+        "orchestrator.dock.model": {
+            "version": 1,
+            "folders": [
+                { "id": "df1", "name": "Keep", "parent": null },
+            ],
+            "assignments": assignments,
+            "expanded": ["folder:df1"],
+            "names": names,
+            "folderCounter": 1,
+        },
+    });
+    fs::write(&state_path, serde_json::to_vec_pretty(&before).unwrap()).unwrap();
+
+    let fault_fs = Arc::new(FailRetirementWriteFs::dock_model(
+        state_path.parent().unwrap().to_path_buf(),
+        "Fails".into(),
+    ));
+    let mut h = EditorTestHarness::create(
+        120,
+        32,
+        HarnessOptions::new()
+            .with_working_dir(root.clone())
+            .with_shared_dir_context(dir_context)
+            .without_empty_plugins_dir()
+            .with_filesystem(fault_fs.clone()),
+    )
+    .unwrap();
+    h.render().unwrap();
+    open_dock(&mut h);
+    h.wait_until(|h| {
+        let screen = h.screen_to_string();
+        screen.contains("Keep") && screen.contains("Before Failure")
+    })
+    .unwrap();
+
+    fault_fs.arm();
+    let new_row = row_of(&h, "New Task") as u16;
+    h.mouse_click(4, new_row).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("New Folder"))
+        .unwrap();
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Folder name"))
+        .unwrap();
+    h.type_text("Fails").unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|_| !fault_fs.is_armed()).unwrap();
+
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        after, before,
+        "failed mutation persisted a partial dock model"
+    );
+}
 
 /// The "New Task… ▾" dropdown can create a folder, and a session's
 /// context menu can file it into that folder — the dock's hierarchical
@@ -2544,7 +2816,7 @@ fn dock_new_folder_dialog_enter_on_cancel_cancels() {
 
 /// The mouse wheel scrolls the dock's session tree in the default card
 /// density. The wheel handler used to compare the *row* budget against
-/// the *node* count, so with 3-row cards `max_scroll` collapsed to 0 and
+/// the *node* count, so with multi-row cards `max_scroll` collapsed to 0 and
 /// the wheel was dead exactly when the card list overflowed.
 #[test]
 fn dock_card_tree_wheel_scrolls_when_overflowing() {
@@ -2553,8 +2825,8 @@ fn dock_card_tree_wheel_scrolls_when_overflowing() {
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
             .unwrap();
-    // Enough sessions that the bordered 5-row cards overflow a 32-row
-    // screen (~5 visible cards): 13 nodes total.
+    // Enough sessions that the bordered 4-row cards overflow a 32-row
+    // screen (~6 visible cards): 13 nodes total.
     for i in 1..=12 {
         h.editor_mut()
             .create_window_at(root.join(format!("wt-bb{i:02}")), format!("bb{i:02}"));
@@ -2569,7 +2841,7 @@ fn dock_card_tree_wheel_scrolls_when_overflowing() {
     h.assert_screen_not_contains("bb12");
 
     // Wheel down one notch: the view scrolls by 3 *rows*, not whole
-    // cards — the top card (aaaproj, 5 rows) is partially clipped, so
+    // cards — the top card (aaaproj, 4 rows) is partially clipped, so
     // its name row leaves the screen while the next card (bb01) is
     // still fully visible. Node-granular scrolling (the old behaviour)
     // would have pushed bb01 and bb02 off together.
@@ -2581,7 +2853,7 @@ fn dock_card_tree_wheel_scrolls_when_overflowing() {
     .unwrap();
 
     // Keep wheeling: the offset clamps at max-scroll (rows), which puts
-    // the last card on screen. 13 nodes × 5 rows = 65 total rows, ~26
+    // the last card on screen. 13 nodes × 4 rows = 52 total rows, ~26
     // visible → well under 20 notches of 3 rows each.
     for _ in 0..20 {
         h.mouse_scroll_down(5, 15).unwrap();
@@ -2647,7 +2919,7 @@ fn dock_menu_key_opens_context_menu_and_arrows_navigate() {
 
 /// Card density draws each session as a rounded bordered card — the
 /// `╭─…─╮` pill look the dock had before the folder-tree redesign, which
-/// the tree rendering dropped (cards were three flat text rows; issue
+/// the tree rendering dropped (cards were two flat text rows; issue
 /// #2703). Compact density stays border-free.
 #[test]
 fn dock_card_view_draws_card_borders() {
@@ -2860,7 +3132,7 @@ fn dock_hint_bar_not_padded_when_tree_overflows() {
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
             .unwrap();
-    // Six extra sessions: seven 5-row cards (35 rows) overflow the
+    // Six extra sessions: seven 4-row cards (28 rows) overflow the
     // ~26-row list budget of a 32-row frame.
     for i in 1..=6 {
         h.editor_mut()
@@ -2914,72 +3186,69 @@ fn dock_hint_bar_stays_pinned_after_folder_collapse() {
     })
     .unwrap();
 
-    // Pre-collapse steady state: the card is visible (git probe landed
-    // its "clean" line) AND the hint bar is pinned to the dock bottom.
-    // A single semantic wait rides out interleaved probe re-renders.
+    // Pre-collapse steady state: the card is visible and the hint bar is
+    // pinned to the dock bottom. A single semantic wait rides out interleaved
+    // probe re-renders.
     let hint_row = |s: &str| s.lines().position(|l| l.contains("F2 menu"));
     h.wait_until(|h| {
-        let s = h.screen_to_string();
-        s.contains("clean") && hint_row(&s) == Some(31)
+        dock_card_name_row(h, "alphaproj").is_some() && hint_row(&h.screen_to_string()) == Some(31)
     })
     .unwrap();
 
     // Click the folder's disclosure glyph (col 0 of its row) to collapse
-    // it — the card disappears, shrinking the tree by 5 rows — and the
+    // it — the card disappears, shrinking the tree by 4 rows — and the
     // hint bar re-pins to the bottom rather than floating up with the
     // shorter tree.
     let folder_row = row_of(&h, "Docs") as u16;
     h.mouse_click(0, folder_row).unwrap();
     h.wait_until(|h| {
-        let s = h.screen_to_string();
-        !s.contains("clean") && hint_row(&s) == Some(31)
+        dock_card_name_row(h, "alphaproj").is_none() && hint_row(&h.screen_to_string()) == Some(31)
     })
     .unwrap();
 }
 
 // ── session-row density content ────────────────────────────────────────────
 
-/// Compact density keeps each session to a lean single line — state
-/// glyph + name — with no branch suffix (the branch lives on the card
-/// density's second line).
+/// Card density uses exactly two content rows. The branch/project stays on the
+/// continuation row and never crowds the name/git row.
 #[test]
-fn dock_compact_rows_drop_branch_name() {
+fn dock_card_keeps_branch_off_name_row() {
     let (_tmp, root) = setup_project("alphaproj");
+    let branch = "review-branch-row";
+    assert!(std::process::Command::new("git")
+        .args(["checkout", "-q", "-b", branch])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
     let mut h =
         EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
             .unwrap();
     h.render().unwrap();
     open_dock(&mut h);
 
-    // Wait for the git probe: the card's second line shows the branch
-    // marker + summary ("clean" — fresh repo, no upstream, no HEAD
-    // diff). The same probe caches the session's branch name, which the
-    // compact row used to trail as a "▸<branch>" suffix.
-    h.wait_until(|h| h.screen_to_string().contains("clean"))
-        .unwrap();
-
-    // Flip the density to compact.
-    expand_filters(&mut h);
-    let vrow = row_of(&h, "view: card") as u16;
-    h.mouse_click(3, vrow).unwrap();
-
-    // Final steady state, waited on semantically: compact density active
-    // AND the session row (dock column, left of the wall) carries the
-    // name but no branch marker — even though the git probe has already
-    // cached the branch (the "clean" gate above), which the compact row
-    // used to trail as a "▸<branch>" suffix.
     h.wait_until(|h| {
-        if !h.screen_to_string().contains("view: compact") {
-            return false;
-        }
         let Some(name_row) = dock_card_name_row(h, "alphaproj") else {
             return false;
         };
         let wall = dock_wall_col(h) as usize;
-        let dock_part: String = h.screen_row_text(name_row).chars().take(wall).collect();
-        !dock_part.contains('▸')
+        let name: String = h.screen_row_text(name_row).chars().take(wall).collect();
+        let continuation: String = h.screen_row_text(name_row + 1).chars().take(wall).collect();
+        !name.contains(branch) && continuation.contains(branch)
     })
     .unwrap();
+
+    let name_row = dock_card_name_row(&h, "alphaproj").unwrap();
+    let name = h.screen_row_text(name_row);
+    let continuation = h.screen_row_text(name_row + 1);
+    assert!(
+        !name.contains(branch),
+        "branch leaked onto name row: {name}"
+    );
+    assert!(
+        continuation.contains(branch),
+        "branch must render exactly one row below the name: {continuation}"
+    );
 }
 
 /// Card density right-aligns the git summary against the card's right
@@ -3867,6 +4136,73 @@ fn view_menu_row_toggles_the_dock_with_a_live_checkbox() {
 
 // ── workspace rename stays per-workspace across co-tenants ─────────────────
 
+/// Legacy root-keyed names and folder assignments are safe only while one
+/// live workspace owns that root. Once a tab extraction creates a co-tenant,
+/// neither stable workspace may inherit the ambiguous root fallback.
+#[test]
+fn extracted_co_tenants_ignore_ambiguous_legacy_root_metadata() {
+    let (tmp, root) = setup_project("alphaproj");
+    let root_key = root.canonicalize().unwrap().to_string_lossy().to_string();
+    let mut assignments = serde_json::Map::new();
+    assignments.insert(root_key.clone(), json!("df1"));
+    let mut names = serde_json::Map::new();
+    names.insert(root_key, json!("Legacy Root Name"));
+    let dir_context = DirectoryContext::for_testing(tmp.path());
+    let state_path = dir_context
+        .data_dir
+        .join("orchestrator/state/orchestrator.json");
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&json!({
+            "orchestrator.dock.folders": [
+                { "id": "df1", "name": "Legacy Folder", "parent": null },
+            ],
+            "orchestrator.dock.assignments": assignments,
+            "orchestrator.dock.names": names,
+            "orchestrator.dock.expanded": ["folder:df1"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut h = EditorTestHarness::create(
+        160,
+        45,
+        HarnessOptions::new()
+            .with_working_dir(root.clone())
+            .with_shared_dir_context(dir_context)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    h.render().unwrap();
+    h.open_file(&root.join("readme.txt")).unwrap();
+    h.render().unwrap();
+    run_palette_command(&mut h, "Extract Tab to New Workspace");
+    h.wait_until(|h| {
+        h.screen_to_string()
+            .contains("Extracted readme.txt into workspace alphaproj (2)")
+    })
+    .unwrap();
+
+    open_dock(&mut h);
+    h.wait_until(|h| h.screen_to_string().contains("alphaproj (2)"))
+        .unwrap();
+    let screen = h.screen_to_string();
+    assert!(
+        !screen.contains("Legacy Root Name"),
+        "ambiguous legacy name must not rename both co-tenants. Screen:\n{screen}",
+    );
+    let folder_row = screen
+        .lines()
+        .find(|line| line.contains("Legacy Folder"))
+        .expect("legacy folder remains visible");
+    assert!(
+        !folder_row.contains('('),
+        "ambiguous legacy assignment must not file either co-tenant. Row: {folder_row}",
+    );
+}
+
 /// Renaming a workspace extracted from a tab ("Extract Tab to New
 /// Workspace") must rename ONLY that workspace. The extracted co-tenant
 /// shares the source's project root, and manual names used to be persisted
@@ -4033,5 +4369,51 @@ fn moving_extracted_co_tenant_workspace_to_folder_leaves_original_unfiled() {
             .any(|l| l.contains("alphaproj") && !l.contains("(2)") && !l.contains("Docs")),
         "the original workspace should still render as its own top-level row, \
          got screen:\n{screen}"
+    );
+}
+
+#[test]
+fn modal_selection_follows_workspace_identity_across_reorder() {
+    let (tmp, root) = setup_project("alphaproj");
+    let beta_root = tmp.path().join("betaproj");
+    fs::create_dir(&beta_root).unwrap();
+    let mut h =
+        EditorTestHarness::with_config_and_working_dir(120, 32, Default::default(), root.clone())
+            .unwrap();
+    let beta_id = h
+        .editor_mut()
+        .create_window_at(beta_root.clone(), "betaproj".to_string());
+    h.render().unwrap();
+
+    h.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    h.wait_for_prompt().unwrap();
+    h.type_text("Orchestrator: Open").unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Orchestrator: Open"))
+        .unwrap();
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| {
+        let screen = h.screen_to_string();
+        screen.contains("ORCHESTRATOR :: Workspaces")
+            && screen.contains("alphaproj")
+            && screen.contains("betaproj")
+    })
+    .unwrap();
+
+    // Select beta while alpha is the current-project-first row. Activating beta
+    // externally then moves beta to row zero and forces a modal refresh.
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.tick_and_render().unwrap();
+    h.editor_mut().set_active_window(beta_id);
+    h.wait_until(|h| row_of(h, "betaproj") < row_of(h, "alphaproj"))
+        .unwrap();
+
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| !h.screen_to_string().contains("ORCHESTRATOR :: Workspaces"))
+        .unwrap();
+    assert_eq!(
+        h.editor().active_window().root,
+        beta_root,
+        "modal refresh must retain the selected workspace id instead of the old row index",
     );
 }

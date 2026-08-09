@@ -11,27 +11,24 @@
 //     form with three optional fields (session name, agent
 //     command, branch), allocates a worktree-rooted session and
 //     spawns the agent in a terminal attached to it.
-//   - "Orchestrator: Kill Selected" closes the session whose row is
-//     currently highlighted in the open prompt.
+//   - Stop / Archive / Delete lifecycle actions operate on exact sessions.
 //   - Agent state column updates from terminal_output regex and
 //     terminal_exit code: RUNNING / AWAITING / READY / ERRORED.
 
 import {
-  activate,
   button,
   col,
+  divider,
   dropdown,
   flexSpacer,
   FloatingWidgetPanel,
   hintBar,
-  divider,
   key as widgetKey,
   labeledSection,
   list,
+  overlay,
   raw,
   row,
-  wrappingRow,
-  overlay,
   spacer,
   styledRow,
   text,
@@ -39,27 +36,50 @@ import {
   toggle,
   tree,
   treeNode,
-  windowEmbed,
   type WidgetSpec,
+  windowEmbed,
+  wrappingRow,
 } from "./lib/widgets.ts";
+import {
+  OmpCompanionController,
+  type OmpCompanionControllerSession,
+} from "./lib/omp_companion_controller.ts";
+import type { OmpCompanionSnapshotPayload } from "./lib/omp_companion.ts";
+import {
+  DurableCreateTransaction,
+  type LeaseHeartbeat,
+  startLeaseHeartbeat,
+} from "./lib/orchestrator_create_transaction.ts";
+import {
+  parseSshExtraArgs,
+  parseSshInput,
+  type RemoteInputError,
+} from "./lib/remote_input.ts";
+
+interface TrustedOrchestratorHost {
+  on(
+    eventName: "omp_companion_snapshot",
+    handler: (payload: OmpCompanionSnapshotPayload) => void,
+  ): void;
+}
 
 const editor = getEditor();
+// This event is deliberately absent from the public HookEventMap. The host
+// admits this view only after authenticating the byte-bound bundled plugin.
+const trustedOrchestratorHost = editor as unknown as TrustedOrchestratorHost;
 
 // =============================================================================
 // Types
 // =============================================================================
 
-// A session's coarse activity, inferred from its agent terminal:
-//   "working" — the terminal emitted output within the last
-//               IDLE_AFTER_MS (the agent is actively producing).
-//   "idle"    — quiet: waiting for input, finished, exited, or just
-//               sitting. Also the honest default before we've seen any
-//               output, since we have no evidence of work yet.
-// This is deliberately only two states: it's all the terminal-output
-// signal can honestly support. We don't poll the process, so "working"
-// means "printing", not "alive" — an agent that goes quiet to think
-// reads as idle until it prints again.
-type AgentState = "working" | "idle";
+// A session's coarse activity. A live OMP companion snapshot is authoritative;
+// otherwise the companion controller preserves the existing OSC/output fallback:
+//   "working" — a structured working state, an active OSC command, or terminal
+//               output within IDLE_AFTER_MS.
+//   "idle"    — a structured resting state, an ended OSC command, or no recent
+//               terminal output.
+// This deliberately stays coarse: the dock only needs an activity signal, while
+// the native terminal remains the detailed agent UI.
 
 // One row in the completion popup. `kind: "history"` items
 // render with a leading `↶` marker + italic styling so the user
@@ -69,7 +89,7 @@ type AgentState = "working" | "idle";
 // marker + style.
 type CompletionItem = { value: string; kind?: "history" };
 
-interface AgentSession {
+interface AgentSession extends OmpCompanionControllerSession {
   // Editor's stable session id.
   id: number;
   // Durable workspace identity (`ws-…`) reported by the host window.
@@ -82,27 +102,25 @@ interface AgentSession {
   // Resolved display name shown in the dock / picker. Computed by
   // `workspaceDisplayName` from three sources, most-specific first: a
   // manual rename (`renameWorkspace`, persisted per workspace), else an
-  // auto-name tracking the terminal's tab title (constant workspace
-  // prefix + the terminal/process title), else `hostLabel`.
+  // auto-name tracking the terminal's stable task title (constant workspace
+  // prefix + terminal/process title, without an OMP loader frame), else
+  // `hostLabel`.
   label: string;
   // The raw label the host reports for this window (root basename for a
   // fresh session). The stable fallback when there's no manual rename and
   // no terminal to track — kept separate from `label` so the resolver can
   // recompute the display name without losing the host's own name.
   hostLabel: string;
-  // Last-seen terminal tab title (combined foreground process + OSC title,
-  // the same string shown on the terminal's tab). Drives the auto-name
+  // Last-seen stable terminal task title (combined foreground process + OSC
+  // title, with a transient OMP loader frame removed). Drives the auto-name
   // when the workspace hasn't been manually renamed. `undefined` until the
   // session's terminal reports a non-default title.
   terminalTitle?: string;
-  // Latest explicit OSC activity signal from the session's terminal (OSC
-  // 133 command markers / OSC 9;4 progress): `true` = a command/task is
-  // running, `false` = it has finished. When set, this is authoritative for
-  // the working/idle indicator (see `sessionState`), so an agent that goes
-  // quiet mid-command still reads "working" and a finished one flips to
-  // idle at once. `undefined`/`null` ⇒ no signal, fall back to output
-  // timing.
-  oscRunning?: boolean | null;
+  // Current OMP loader frame parsed from the tab title. Kept out of
+  // `terminalTitle` so the workspace name stays stable while the frame spins.
+  terminalSpinner?: string;
+  // OSC activity is retained per owned terminal by the companion controller;
+  // the session no longer mirrors a second, independently mutable copy.
   // Absolute filesystem root.
   root: string;
   // Canonical project root this session belongs to (set at
@@ -114,17 +132,11 @@ interface AgentSession {
   // `true` if the session was created with the worktree
   // checkbox unchecked (shared worktree / non-git path).
   sharedWorktree: boolean;
-  // The terminal id Orchestrator spawned in this session, if any.
-  terminalId: number | null;
-  // Coarse activity, recomputed from `lastOutputAt` at render time
-  // (see `sessionState`). Not authoritative on its own — the timestamp
-  // is. ("active" — the focused window — is computed separately from
-  // `editor.activeWindow()`.)
-  state: AgentState;
+  // Exact window + terminal identity of Orchestrator's selected agent.
+  terminalId: WindowTerminalId | null;
   // Wall-clock ms of the most recent terminal_output for this session,
-  // or null if it has never produced output (or has no terminal). This
-  // is the real signal; `state` is just `Date.now() - lastOutputAt`
-  // bucketed against IDLE_AFTER_MS.
+  // or null if it has never produced output (or has no terminal). The
+  // companion controller buckets this against IDLE_AFTER_MS at read time.
   lastOutputAt: number | null;
   // Wall-clock ms when orchestrator.new fired createWindow.
   createdAt: number;
@@ -133,8 +145,7 @@ interface AgentSession {
   // Discovered rows carry a synthetic negative `id`, no
   // `terminalId`, and dive by *attaching* a new session to
   // `root` rather than switching to an existing window. They are
-  // dropped from `orchestratorSessions` the moment a real window
-  // is opened at the same `root`.
+  // dropped only after a real window at the same `root` is confirmed active.
   discovered?: boolean;
   // Branch checked out in this worktree (best-effort, for
   // display). Set for discovered rows; left undefined for live
@@ -179,53 +190,58 @@ interface AgentSession {
 type RemoteFacet = NonNullable<AgentSession["remote"]>;
 type CreateSpec =
   | {
-      backend: "local";
-      // Directory the session roots at (typed value or resolved default).
-      projectPath: string;
-      // Explicit workspace name; "" ⇒ auto-generate at create time.
-      name: string;
-      // Agent command; "" ⇒ a bare terminal.
-      cmd: string;
-      // Enable the agent's auto/reduced-approval mode (adds the agent's
-      // documented flag, e.g. `claude --permission-mode auto`). Only honoured
-      // for a command that resolves to a known agent with an `auto` flag;
-      // ignored for a bare terminal / unknown command.
-      auto: boolean;
-      // Initial prompt to hand the agent at launch (positional or via the
-      // agent's prompt flag). "" ⇒ no prompt. Only applied to a resolved agent
-      // that documents a prompt argument; never replayed on resume.
-      startPrompt: string;
-      // Inject the Fresh CLI system prompt + mint a capability token so the
-      // agent can drive the editor from the shell. Only honoured for a command
-      // that resolves to an agent with a `systemPrompt` strategy.
-      teachFreshCli: boolean;
-      // "Checkout branch": an existing branch/ref to check out (worktree) or
-      // switch to (in-place). "" ⇒ the detected default branch (worktree only).
-      branch: string;
-      // "New branch name": when set, create the worktree on a freshly-cut
-      // branch off the checkout branch (or default). "" ⇒ no new branch.
-      // Ignored in the non-worktree (in-place checkout) path.
-      newBranch: string;
-      // Create a fresh worktree (only honoured when the path is a git tree).
-      createWorktree: boolean;
-      // Row label + project shown on the pending dock row.
-      displayLabel: string;
-      displayProject: string;
-    }
+    backend: "local";
+    // Directory the session roots at (typed value or resolved default).
+    projectPath: string;
+    // Explicit workspace name; "" ⇒ auto-generate at create time.
+    name: string;
+    // Agent command; "" ⇒ a bare terminal.
+    cmd: string;
+    // Enable the agent's auto/reduced-approval mode (adds the agent's
+    // documented flag, e.g. `claude --permission-mode auto`). Only honoured
+    // for a command that resolves to a known agent with an `auto` flag;
+    // ignored for a bare terminal / unknown command.
+    auto: boolean;
+    // Initial prompt to hand the agent at launch (positional or via the
+    // agent's prompt flag). "" ⇒ no prompt. Only applied to a resolved agent
+    // that documents a prompt argument; never replayed on resume.
+    startPrompt: string;
+    // Inject the Fresh CLI system prompt + mint a capability token so the
+    // agent can drive the editor from the shell. Only honoured for a command
+    // that resolves to an agent with a `systemPrompt` strategy.
+    teachFreshCli: boolean;
+    // "Checkout branch": an existing branch/ref to check out (worktree) or
+    // switch to (in-place). "" ⇒ the detected default branch (worktree only).
+    branch: string;
+    // "New branch name": when set, create the worktree on a freshly-cut
+    // branch off the checkout branch (or default). "" ⇒ no new branch.
+    // Ignored in the non-worktree (in-place checkout) path.
+    newBranch: string;
+    // Create a fresh worktree (only honoured when the path is a git tree).
+    createWorktree: boolean;
+    // Row label + project shown on the pending dock row.
+    displayLabel: string;
+    displayProject: string;
+  }
   | {
-      backend: "ssh" | "kubernetes";
-      // The host payload handed to `attachRemoteAgent`.
-      spec: RemoteAgentSpec;
-      // Facet stamped on both the born window and the pending placeholder.
-      facet: RemoteFacet;
-      displayLabel: string;
-      displayProject: string;
-      // The command to persist as `orchestrator.last_cmd` on success (ssh
-      // remembers it), or "" to persist nothing.
-      persistCmd: string;
-    };
+    backend: "ssh" | "kubernetes";
+    // The host payload handed to `attachRemoteAgent`.
+    spec: RemoteAgentSpec;
+    // Facet stamped on both the born window and the pending placeholder.
+    facet: RemoteFacet;
+    displayLabel: string;
+    displayProject: string;
+    // The command to persist as `orchestrator.last_cmd` on success (ssh
+    // remembers it), or "" to persist nothing.
+    persistCmd: string;
+  };
 
 interface PendingCreate {
+  // Durable identity for this one create attempt. Never reused by a retry.
+  attemptId: string;
+  // Restored rows may reconcile effects from their own journal; fresh creates
+  // never adopt a target merely because it already exists.
+  restored: boolean;
   // `"creating"` while the background create/connect runs; `"error"` once it
   // has failed; `"paused"` for a row restored from a previous session that
   // hasn't been resumed yet. Both `error` and `paused` offer retry / dismiss.
@@ -300,6 +316,45 @@ interface PrInfo {
 // =============================================================================
 
 const orchestratorSessions = new Map<number, AgentSession>();
+const ompCompanion = new OmpCompanionController<AgentSession>({
+  getSession: (windowId) => orchestratorSessions.get(windowId),
+  reconcileSessions,
+  activeWindowId: () => editor.activeWindow(),
+  now: () => Date.now(),
+  delay: (ms) => editor.delay(ms),
+  sendCommand: (terminal, type, target) =>
+    editor.sendOmpCompanionCommand(terminal, type, target),
+  t: (key, args) => args === undefined ? editor.t(key) : editor.t(key, args),
+  setStatus: (message) => editor.setStatus(message),
+  refreshUi: () => refreshOpenDialog(false),
+  refreshSessionLabel: applyResolvedLabel,
+});
+
+// Host hooks can arrive as soon as createWindowWithTerminal publishes the
+// window, before the async create transaction installs its final metadata.
+// Update that reconciled object in place so early terminal/OMP observations
+// and the companion expiry identity survive publication.
+function publishLiveSession(candidate: AgentSession): AgentSession {
+  const current = orchestratorSessions.get(candidate.id);
+  if (!current) {
+    orchestratorSessions.set(candidate.id, candidate);
+    return candidate;
+  }
+
+  ompCompanion.rebindTerminal(current, candidate.terminalId);
+  current.stableId = candidate.stableId ?? current.stableId;
+  current.hostLabel = candidate.hostLabel;
+  current.root = candidate.root;
+  current.projectPath = candidate.projectPath;
+  current.sharedWorktree = candidate.sharedWorktree;
+  current.createdAt = Math.min(current.createdAt, candidate.createdAt);
+  current.branch = candidate.branch ?? current.branch;
+  if (candidate.remote) current.remote = candidate.remote;
+  current.discovered = undefined;
+  current.pending = undefined;
+  applyResolvedLabel(current);
+  return current;
+}
 
 // Permanent display slot for each session, keyed by its canonical root
 // (NOT its id — a discovered worktree keeps its slot when it opens and its
@@ -321,11 +376,6 @@ function stableOrderKey(s: AgentSession): number {
   return order;
 }
 
-// Facet to stamp onto the next born-attached remote window when it surfaces in
-// `reconcileSessions` (via the core `window_created` hook). Set just before
-// `attachRemoteAgent({ window: true })`, consumed by the first new live window.
-let pendingRemoteFacet: AgentSession["remote"] | null = null;
-
 // Stable synthetic ids for discovered (on-disk, not-yet-opened)
 // worktrees, keyed by canonical path. Live windows own the
 // positive id space (editor `WindowId`s); discovered rows take
@@ -345,6 +395,65 @@ function discoveredIdFor(path: string): number {
   return id;
 }
 
+// Every gesture may share the physical window-creation flight, but activation
+// belongs to the latest user intent. The flight therefore creates an inactive
+// window; each caller independently proves its selection is still current
+// before taking focus.
+interface WorktreeAttachFlight {
+  root: string;
+  projectPath: string;
+  label: string;
+  branch?: string;
+  discoveredIds: Set<number>;
+  promise: Promise<number>;
+  session?: AgentSession;
+  completed: boolean;
+}
+const worktreeAttachFlights = new Map<string, WorktreeAttachFlight>();
+
+interface WorktreeActivationIntent {
+  token: number;
+  activeWindow: number;
+  dockSelectionKey?: string;
+  dive: boolean;
+}
+let worktreeFocusToken = 0;
+
+function invalidateWorktreeActivation(): void {
+  worktreeFocusToken += 1;
+}
+
+function beginWorktreeActivation(
+  dive: boolean,
+  dockSelectionKey?: string,
+): WorktreeActivationIntent {
+  return {
+    token: ++worktreeFocusToken,
+    activeWindow: editor.activeWindow(),
+    dockSelectionKey,
+    dive,
+  };
+}
+
+function captureDockWorktreeActivation(
+  dive: boolean,
+): WorktreeActivationIntent {
+  return {
+    token: worktreeFocusToken,
+    activeWindow: editor.activeWindow(),
+    dockSelectionKey: openDialog?.dockSelKey ?? undefined,
+    dive,
+  };
+}
+
+function worktreeIntentStillSelected(
+  intent: WorktreeActivationIntent,
+): boolean {
+  return intent.token === worktreeFocusToken &&
+    (intent.dockSelectionKey === undefined ||
+      openDialog?.dockSelKey === intent.dockSelectionKey);
+}
+
 // Pending (being-created) placeholder rows take ids from a range well
 // below the discovered-worktree ids (which count down from `-2`), so the
 // two synthetic id spaces can never collide in `orchestratorSessions`.
@@ -353,19 +462,12 @@ function allocPendingId(): number {
   return nextPendingId--;
 }
 
-// Only one remote attach may be in flight at a time. The host's
-// `cancelRemoteAgent()` cancels *every* in-flight connect, so
-// backgrounding two concurrent remote creates would let cancelling one
-// tear down the other. Remote pending rows therefore run one at a time:
-// `remoteAttachBusy` gates the in-flight connect and `remoteCreateQueue`
-// holds the pending ids waiting their turn. Local creates have no such
-// constraint and run immediately, in parallel.
-let remoteAttachBusy = false;
-const remoteCreateQueue: number[] = [];
-// The pending id whose remote connect is currently in flight (null when
-// none). Dismissing exactly this row must tear the connect down via
-// `cancelRemoteAgent`; a queued row hasn't started one.
-let remoteInFlightId: number | null = null;
+// Request-scoped remote attach handles. Remote creates may connect in parallel;
+// dismissing one row cancels only the request owned by that row.
+const remoteAttachRequests = new Map<
+  string,
+  { readonly requestId: number; cancel(): void }
+>();
 
 // New-session form state. `null` ⇒ the floating form isn't
 // open. Each field's `value` + `cursor` mirrors what the host
@@ -383,8 +485,16 @@ type SessionBackend = "local" | "ssh" | "kubernetes" | "devcontainer";
 const SESSION_BACKENDS: { id: SessionBackend; label: string; key: string }[] = [
   { id: "local", label: editor.t("backend.local"), key: "type-local" },
   { id: "ssh", label: editor.t("backend.ssh"), key: "type-ssh" },
-  { id: "kubernetes", label: editor.t("backend.kubernetes"), key: "type-kubernetes" },
-  { id: "devcontainer", label: editor.t("backend.devcontainer"), key: "type-devcontainer" },
+  {
+    id: "kubernetes",
+    label: editor.t("backend.kubernetes"),
+    key: "type-kubernetes",
+  },
+  {
+    id: "devcontainer",
+    label: editor.t("backend.devcontainer"),
+    key: "type-devcontainer",
+  },
 ];
 
 interface NewSessionForm {
@@ -509,11 +619,21 @@ interface NewSessionForm {
   // history rows mixed into the completion popup — Up/Down on a
   // history-bearing field reopens the popup, where historical
   // entries appear after live completion candidates.)
-  historyCursor: { project_path: number; name: number; cmd: number; branch: number };
+  historyCursor: {
+    project_path: number;
+    name: number;
+    cmd: number;
+    branch: number;
+  };
   // Saved draft text per field: when the user first presses Up
   // we squirrel away whatever was in `value` so Down can
   // restore it.
-  historyDraft: { project_path: string; name: string; cmd: string; branch: string };
+  historyDraft: {
+    project_path: string;
+    name: string;
+    cmd: string;
+    branch: string;
+  };
   // Inline-dropdown completion state. `field` names which input
   // the suggestion list belongs to; the list is only rendered
   // while that input is focused. `items` is the post-filter set
@@ -575,6 +695,7 @@ interface CreateFolderDialogState {
   renameSessionId: number | null;
 }
 let createFolderDialog: CreateFolderDialogState | null = null;
+let createFolderSubmitting = false;
 let createFolderPanel: FloatingWidgetPanel | null = null;
 // Mirror of the dialog's focused widget key, kept in sync from the
 // host's authoritative `focus` widget_events. The dialog's mode-level
@@ -783,14 +904,19 @@ type DockMenuTarget =
   | { kind: "session"; id: number }
   | { kind: "folder"; id: string };
 type DockMenuState =
-  | { target: DockMenuTarget; anchorCol: number; anchorRow: number; stage: "menu" }
   | {
-      target: { kind: "session"; id: number };
-      anchorCol: number;
-      anchorRow: number;
-      stage: "confirm";
-      action: "archive" | "delete";
-    };
+    target: DockMenuTarget;
+    anchorCol: number;
+    anchorRow: number;
+    stage: "menu";
+  }
+  | {
+    target: { kind: "session"; id: number };
+    anchorCol: number;
+    anchorRow: number;
+    stage: "confirm";
+    action: "archive" | "delete";
+  };
 let dockMenuPanel: FloatingWidgetPanel | null = null;
 let dockMenuState: DockMenuState | null = null;
 // Default dock width on a "typical" terminal, and the bounds the
@@ -844,12 +970,8 @@ let dockFocus: "list" | "filter" = "list";
 let dockDiveBlur = false;
 // Full focused-widget mirror for the open dialog (both dock and
 // centered-picker modes). Updated from every `focus` widget_event.
-// Used by `toggleSelectCurrent` so a Space keypress while focus is
-// on a filter checkbox toggles *that* checkbox rather than the list
-// — see the OPEN_MODE `["Space", "orchestrator_toggle_select"]`
-// binding below for why the mode binding can't be made conditional
-// upstream (it has to swallow Space unconditionally to keep it out
-// of the filter text-input).
+// Used by the Space handler: bulk selection belongs only to the sessions
+// list, while every other focused widget receives its normal smart-key action.
 let pickerFocusKey: string = "sessions";
 // Scope is remembered across opens of the picker (module state
 // survives dialog close). Defaults to "all" so the picker opens
@@ -872,7 +994,7 @@ let lastShowWorktrees: boolean | null = null;
 // checkbox (Alt+I) opts back into hiding the throwaway single-file /
 // restored-shell rows.
 let lastHideTrivial: boolean | null = null;
-// Dock card density. "card" (default) shows the three-line rounded pill;
+// Dock card density. "card" (default) shows the two-line rounded pill;
 // "compact" shows one line per session. Read all over the render path,
 // so it stays a plain value rather than a config lookup; the dock
 // re-seeds it from the `defaultView` setting on open unless the user has
@@ -980,86 +1102,238 @@ interface DockFolder {
   parent: string | null; // parent folder id; null = top level
 }
 
+const DOCK_MODEL_KEY = "orchestrator.dock.model";
+const DOCK_MODEL_VERSION = 1;
 const FOLDERS_KEY = "orchestrator.dock.folders";
 const ASSIGN_KEY = "orchestrator.dock.assignments";
 const EXPANDED_KEY = "orchestrator.dock.expanded";
 const FOLDER_COUNTER_KEY = "orchestrator.dock.folder_counter";
+const WORKSPACE_NAMES_KEY = "orchestrator.dock.names";
 
 const FOLDER_NODE_PREFIX = "folder:";
 const SESSION_NODE_PREFIX = "session:";
 const FOLDER_GLYPH = "▤";
 
-// Lazily-hydrated in-memory caches, written through to global state on
-// every mutation so a later read (or the next launch) sees the change.
-let dockFolders: DockFolder[] | null = null;
-let dockAssign: Record<string, string> | null = null;
-let dockExpanded: Set<string> | null = null;
+interface DockModelSnapshot {
+  folders: DockFolder[];
+  assign: Record<string, string>;
+  expanded: Set<string>;
+  names: Record<string, string>;
+  folderCounter: number;
+}
 
-function loadFolders(): DockFolder[] {
-  if (dockFolders) return dockFolders;
-  const raw = editor.getGlobalState(FOLDERS_KEY);
+interface DockModelRead {
+  snapshot: DockModelSnapshot;
+  legacy: boolean;
+}
+
+// Rendering reads one cached snapshot, never independently cached fragments.
+// The cache is replaced from the durable envelope at every dock/picker open
+// and after every leased transaction.
+let dockModelCache: DockModelSnapshot | null = null;
+let dockModelMigrationInFlight = false;
+
+function parseFolders(raw: unknown): DockFolder[] {
   const out: DockFolder[] = [];
+  const ids = new Set<string>();
   if (Array.isArray(raw)) {
-    for (const e of raw) {
-      if (e && typeof e === "object") {
-        const rec = e as Record<string, unknown>;
-        const id = rec.id;
-        const name = rec.name;
-        const parent = rec.parent;
-        if (typeof id === "string" && typeof name === "string") {
-          out.push({ id, name, parent: typeof parent === "string" ? parent : null });
-        }
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") continue;
+      const rec = entry as Record<string, unknown>;
+      if (
+        typeof rec.id !== "string" || rec.id.length === 0 ||
+        typeof rec.name !== "string" || ids.has(rec.id)
+      ) continue;
+      ids.add(rec.id);
+      out.push({
+        id: rec.id,
+        name: rec.name,
+        parent: typeof rec.parent === "string" ? rec.parent : null,
+      });
+    }
+  }
+
+  const byId = new Map(out.map((folder) => [folder.id, folder]));
+  for (const folder of out) {
+    if (folder.parent && !byId.has(folder.parent)) folder.parent = null;
+  }
+  // Repair hostile/stale persisted cycles deterministically. Breaking the
+  // first edge encountered for each reachable cycle keeps every folder visible
+  // and makes the recursive renderer/counting helpers total.
+  for (const folder of out) {
+    const seen = new Set<string>();
+    let current: DockFolder | undefined = folder;
+    while (current?.parent) {
+      if (seen.has(current.id)) {
+        folder.parent = null;
+        break;
+      }
+      seen.add(current.id);
+      current = byId.get(current.parent);
+    }
+  }
+  return out;
+}
+
+function parseStringRecord(
+  raw: unknown,
+  keepEmpty = true,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof value === "string" && (keepEmpty || value.length > 0)) {
+        out[key] = value;
       }
     }
   }
-  dockFolders = out;
   return out;
 }
 
-function saveFolders(): void {
-  editor.setGlobalState(FOLDERS_KEY, (dockFolders ?? []) as unknown as object);
+function parseExpanded(raw: unknown): Set<string> {
+  const out = new Set<string>();
+  if (Array.isArray(raw)) {
+    for (const value of raw) if (typeof value === "string") out.add(value);
+  }
+  return out;
+}
+
+function emptyDockModel(): DockModelSnapshot {
+  return {
+    folders: [],
+    assign: {},
+    expanded: new Set<string>(),
+    names: {},
+    folderCounter: 0,
+  };
+}
+
+function parseDockModelEnvelope(raw: unknown): DockModelSnapshot | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (record.version !== DOCK_MODEL_VERSION) return null;
+  const rawCounter = record.folderCounter;
+  return {
+    folders: parseFolders(record.folders),
+    assign: parseStringRecord(record.assignments),
+    expanded: parseExpanded(record.expanded),
+    names: parseStringRecord(record.names, false),
+    folderCounter: typeof rawCounter === "number" && rawCounter >= 0
+      ? Math.floor(rawCounter)
+      : 0,
+  };
+}
+
+function readDockModelSnapshot(): DockModelRead {
+  const persisted = inspectPersistedPluginState();
+  const value = (key: string): unknown =>
+    persisted === null ? editor.getGlobalState(key) : persisted[key];
+  const envelope = value(DOCK_MODEL_KEY);
+  if (envelope !== undefined && envelope !== null) {
+    return {
+      snapshot: parseDockModelEnvelope(envelope) ?? emptyDockModel(),
+      legacy: false,
+    };
+  }
+
+  const rawCounter = value(FOLDER_COUNTER_KEY);
+  return {
+    snapshot: {
+      folders: parseFolders(value(FOLDERS_KEY)),
+      assign: parseStringRecord(value(ASSIGN_KEY)),
+      expanded: parseExpanded(value(EXPANDED_KEY)),
+      names: parseStringRecord(value(WORKSPACE_NAMES_KEY), false),
+      folderCounter: typeof rawCounter === "number" && rawCounter >= 0
+        ? Math.floor(rawCounter)
+        : 0,
+    },
+    legacy: [FOLDERS_KEY, ASSIGN_KEY, EXPANDED_KEY, FOLDER_COUNTER_KEY, WORKSPACE_NAMES_KEY]
+      .some((key) => value(key) !== undefined),
+  };
+}
+
+function refreshDockModelCache(migrateLegacy = false): DockModelSnapshot {
+  const read = readDockModelSnapshot();
+  dockModelCache = read.snapshot;
+  if (migrateLegacy && read.legacy) scheduleDockModelMigration();
+  return read.snapshot;
+}
+
+function cachedDockModel(): DockModelSnapshot {
+  return dockModelCache ?? refreshDockModelCache(true);
+}
+
+function loadFolders(): DockFolder[] {
+  return cachedDockModel().folders;
 }
 
 function loadAssign(): Record<string, string> {
-  if (dockAssign) return dockAssign;
-  const raw = editor.getGlobalState(ASSIGN_KEY);
-  const out: Record<string, string> = {};
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (typeof v === "string") out[k] = v;
-    }
-  }
-  dockAssign = out;
-  return out;
-}
-
-function saveAssign(): void {
-  editor.setGlobalState(ASSIGN_KEY, (dockAssign ?? {}) as unknown as object);
+  return cachedDockModel().assign;
 }
 
 function loadExpanded(): Set<string> {
-  if (dockExpanded) return dockExpanded;
-  const raw = editor.getGlobalState(EXPANDED_KEY);
-  const out = new Set<string>();
-  if (Array.isArray(raw)) {
-    for (const v of raw) if (typeof v === "string") out.add(v);
+  return cachedDockModel().expanded;
+}
+
+function dockModelEnvelope(model: DockModelSnapshot): Record<string, unknown> {
+  return {
+    version: DOCK_MODEL_VERSION,
+    folders: model.folders,
+    assignments: model.assign,
+    expanded: Array.from(model.expanded),
+    names: model.names,
+    folderCounter: model.folderCounter,
+  };
+}
+
+async function writeDockModelSnapshot(
+  model: DockModelSnapshot,
+  heartbeat: LeaseHeartbeat,
+): Promise<void> {
+  heartbeat.assertOwned();
+  if (!(await setDurableState(DOCK_MODEL_KEY, dockModelEnvelope(model)))) {
+    throw new Error(`could not persist ${DOCK_MODEL_KEY}`);
   }
-  dockExpanded = out;
-  return out;
+  heartbeat.assertOwned();
 }
 
-function saveExpanded(): void {
-  editor.setGlobalState(
-    EXPANDED_KEY,
-    Array.from(dockExpanded ?? new Set<string>()) as unknown as object,
+function scheduleDockModelMigration(): void {
+  if (dockModelMigrationInFlight) return;
+  dockModelMigrationInFlight = true;
+  void withDockModelLease(async () => undefined)
+    .catch(() => {})
+    .finally(() => {
+      dockModelMigrationInFlight = false;
+    });
+}
+
+async function withDockModelLease<T>(
+  mutate: (model: DockModelSnapshot, heartbeat: LeaseHeartbeat) => Promise<T>,
+): Promise<T> {
+  const lease = await acquireLease("dock-model", 5000);
+  if (!lease) throw new Error("the dock model is busy");
+  const heartbeat = startLeaseHeartbeat(
+    () => renewLease(lease),
+    (milliseconds) => editor.delay(milliseconds),
+    LEASE_TTL_MS,
+    "dock model transaction",
   );
-}
-
-function allocFolderId(): string {
-  const raw = editor.getGlobalState(FOLDER_COUNTER_KEY);
-  const n = (typeof raw === "number" && raw >= 0 ? Math.floor(raw) : 0) + 1;
-  editor.setGlobalState(FOLDER_COUNTER_KEY, n as unknown as object);
-  return `df${n}`;
+  try {
+    heartbeat.assertOwned();
+    const model = readDockModelSnapshot().snapshot;
+    const result = await mutate(model, heartbeat);
+    await writeDockModelSnapshot(model, heartbeat);
+    refreshDockModelCache();
+    return result;
+  } catch (error) {
+    // The one-key envelope either committed in full or left the prior durable
+    // model intact. Re-read it so no failed optimistic value remains cached.
+    refreshDockModelCache();
+    throw error;
+  } finally {
+    heartbeat.stop();
+    releaseLease(lease);
+  }
 }
 
 function folderNodeKey(id: string): string {
@@ -1088,8 +1362,26 @@ function stableIdKey(stableId: string): string {
 function hasLiveCoTenant(s: AgentSession): boolean {
   const rootKey = normRoot(s.root);
   return [...orchestratorSessions.values()].some(
-    (o) => o.id !== s.id && !o.discovered && o.id > 0 && normRoot(o.root) === rootKey,
+    (o) =>
+      o.id !== s.id && !o.discovered && o.id > 0 &&
+      normRoot(o.root) === rootKey,
   );
+}
+
+function rootFallbackUnambiguous(root: string): boolean {
+  const rootKey = normRoot(root);
+  let tenants = 0;
+  for (const session of orchestratorSessions.values()) {
+    if (
+      session.discovered || session.id <= 0 ||
+      normRoot(session.root) !== rootKey
+    ) {
+      continue;
+    }
+    tenants += 1;
+    if (tenants > 1) return false;
+  }
+  return true;
 }
 
 function folderById(id: string): DockFolder | undefined {
@@ -1115,32 +1407,71 @@ function childFoldersOf(parent: string | null): DockFolder[] {
 // explicit "top level" (recorded when unfiling next to a co-tenant, so
 // the legacy per-root entry can't pull the row back into a folder).
 // Only a session with no entry of its own falls back to the legacy /
-// windowless per-root entry.
+// windowless per-root entry, and only while at most one live tenant can own it.
 function folderOfSession(id: number): string | null {
   const s = orchestratorSessions.get(id);
   if (!s) return null;
   const assign = loadAssign();
   const own = s.stableId ? assign[stableIdKey(s.stableId)] : undefined;
-  const a = own !== undefined ? own : assign[normRoot(s.root)];
+  const a = own !== undefined
+    ? own
+    : rootFallbackUnambiguous(s.root)
+    ? assign[normRoot(s.root)]
+    : undefined;
   return a && folderById(a) ? a : null;
 }
 
-function createFolder(name: string, parent: string | null): string {
-  const id = allocFolderId();
-  loadFolders().push({ id, name, parent });
-  saveFolders();
-  // New folders open expanded so their contents are immediately visible.
-  loadExpanded().add(folderNodeKey(id));
-  saveExpanded();
-  return id;
+function applySessionAssignment(
+  assign: Record<string, string>,
+  session: AgentSession,
+  folderId: string | null,
+): void {
+  const rootKey = normRoot(session.root);
+  if (session.stableId) {
+    const idKey = stableIdKey(session.stableId);
+    const coTenant = hasLiveCoTenant(session);
+    if (folderId) assign[idKey] = folderId;
+    else if (coTenant) assign[idKey] = "";
+    else delete assign[idKey];
+    if (!coTenant) {
+      if (folderId) assign[rootKey] = folderId;
+      else delete assign[rootKey];
+    }
+    return;
+  }
+  if (folderId) assign[rootKey] = folderId;
+  else delete assign[rootKey];
 }
 
-function renameFolder(id: string, name: string): void {
-  const f = folderById(id);
-  if (f) {
-    f.name = name;
-    saveFolders();
-  }
+async function createFolder(
+  name: string,
+  parent: string | null,
+  assignSessionId: number | null,
+): Promise<string> {
+  return await withDockModelLease(async (model) => {
+    const ids = new Set(model.folders.map((folder) => folder.id));
+    let counter = model.folderCounter;
+    let id: string;
+    do id = `df${++counter}`; while (ids.has(id));
+    const resolvedParent = parent && ids.has(parent) ? parent : null;
+    model.folders.push({ id, name, parent: resolvedParent });
+    model.folderCounter = counter;
+    model.expanded.add(folderNodeKey(id));
+    if (assignSessionId !== null) {
+      const session = orchestratorSessions.get(assignSessionId);
+      if (session) applySessionAssignment(model.assign, session, id);
+    }
+    return id;
+  });
+}
+
+async function renameFolder(id: string, name: string): Promise<boolean> {
+  return await withDockModelLease(async (model) => {
+    const folder = model.folders.find((candidate) => candidate.id === id);
+    if (!folder) return false;
+    folder.name = name;
+    return true;
+  });
 }
 
 // ── Per-workspace "last active" day — the dock's within-folder sort key ──
@@ -1173,7 +1504,10 @@ function loadLastActive(): Record<string, number> {
 }
 
 function saveLastActive(): void {
-  editor.setGlobalState(LAST_ACTIVE_KEY, (dockLastActive ?? {}) as unknown as object);
+  editor.setGlobalState(
+    LAST_ACTIVE_KEY,
+    (dockLastActive ?? {}) as unknown as object,
+  );
 }
 
 function todayDayNumber(): number {
@@ -1208,7 +1542,11 @@ function markSessionActiveToday(s: AgentSession): void {
 function sessionLastActiveDay(s: AgentSession): number {
   const stored = loadLastActive()[normRoot(s.root)];
   if (stored !== undefined) return stored;
-  const liveMs = Math.max(s.lastOutputAt ?? 0, s.activatedAt ?? 0, s.createdAt ?? 0);
+  const liveMs = Math.max(
+    s.lastOutputAt ?? 0,
+    s.activatedAt ?? 0,
+    s.createdAt ?? 0,
+  );
   return liveMs > 0 ? Math.floor(liveMs / MS_PER_DAY) : todayDayNumber();
 }
 
@@ -1219,43 +1557,71 @@ function sessionLastActiveDay(s: AgentSession): number {
 //   2. else, when it has a terminal that reports a title, an auto-name that
 //      tracks that terminal: a constant prefix (the workspace's own name, so
 //      you can still tell which workspace it is) + the changing terminal/
-//      process title (the same string the terminal tab shows),
+//      process title, excluding any transient OMP loader frame,
 //   3. else the host's own label (root basename).
 // Manual rename always wins, so naming a workspace pins it against the
 // auto-name (which would otherwise keep overwriting it as the tab title
 // shifts).
-const WORKSPACE_NAMES_KEY = "orchestrator.dock.names";
 // Separator between the constant workspace prefix and the changing terminal
 // title in an auto-name (e.g. `proj · bash — root@host: ~/proj`).
 const WORKSPACE_AUTONAME_SEP = " \u{b7} ";
-let dockNames: Record<string, string> | null = null;
+const OMP_LOADER_FRAMES = new Set([
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+]);
 
-function loadNames(): Record<string, string> {
-  if (dockNames) return dockNames;
-  const raw = editor.getGlobalState(WORKSPACE_NAMES_KEY);
-  const out: Record<string, string> = {};
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (typeof v === "string" && v.length > 0) out[k] = v;
-    }
-  }
-  dockNames = out;
-  return out;
+function splitOmpLoaderTitle(rawTitle: string): {
+  title: string;
+  spinner?: string;
+} {
+  let title = rawTitle.trim();
+  if (!title) return { title };
+
+  // OMP may prefix its native title with a foreground process label
+  // (`omp — π ⠧ task`). Only the suffix beginning with π is protocol state.
+  const protocolAt = title.lastIndexOf("π ");
+  if (protocolAt >= 0) title = title.slice(protocolAt);
+  if (!title.startsWith("π ")) return { title };
+
+  const stateAndTitle = title.slice(2).trimStart();
+  const separator = stateAndTitle.indexOf(" ");
+  const state = separator < 0
+    ? stateAndTitle
+    : stateAndTitle.slice(0, separator);
+  const stableTitle = separator < 0
+    ? ""
+    : stateAndTitle.slice(separator + 1).trimStart();
+  return {
+    title: stableTitle,
+    ...(OMP_LOADER_FRAMES.has(state) ? { spinner: state } : {}),
+  };
 }
 
-function saveNames(): void {
-  editor.setGlobalState(WORKSPACE_NAMES_KEY, (dockNames ?? {}) as unknown as object);
+function loadNames(): Record<string, string> {
+  return cachedDockModel().names;
 }
 
 // The manual name pinned to a workspace, if any: its own stable-id entry
-// first, else the legacy / windowless per-root entry.
-function customNameFor(stableId: string | undefined, root: string): string | undefined {
+// first, else the legacy / windowless per-root entry when that root names at
+// most one live tenant.
+function customNameFor(
+  stableId: string | undefined,
+  root: string,
+): string | undefined {
   const store = loadNames();
   if (stableId) {
     const own = store[stableIdKey(stableId)];
     if (own) return own;
   }
-  return store[normRoot(root)];
+  return rootFallbackUnambiguous(root) ? store[normRoot(root)] : undefined;
 }
 
 // The manual name pinned to this session, if any.
@@ -1269,7 +1635,8 @@ function workspaceDisplayName(s: AgentSession): string {
   if (manual) return manual;
   const title = (s.terminalTitle ?? "").trim();
   if (title && !s.discovered) {
-    const prefix = (s.hostLabel || editor.pathBasename(s.root) || "workspace").trim();
+    const prefix = (s.hostLabel || editor.pathBasename(s.root) || "workspace")
+      .trim();
     return prefix + WORKSPACE_AUTONAME_SEP + title;
   }
   return s.hostLabel;
@@ -1285,83 +1652,60 @@ function applyResolvedLabel(s: AgentSession): void {
 // Set (or, with an empty name, clear) the manual name for a session and
 // refresh its resolved label. Clearing lets the auto-name / host label take
 // over again.
-function renameWorkspace(s: AgentSession, name: string): void {
-  const rootKey = normRoot(s.root);
-  const store = loadNames();
+async function renameWorkspace(s: AgentSession, name: string): Promise<void> {
   const trimmed = name.trim();
-  if (s.stableId) {
-    const idKey = stableIdKey(s.stableId);
-    if (trimmed) store[idKey] = trimmed;
-    else delete store[idKey];
-    // Keep the per-root entry in step when it can only mean this
-    // workspace, so root-keyed lookups (a later discovered row at this
-    // root, a legacy workspace file) agree with the rename / clear.
-    // With a co-tenant present the entry may still name *that*
-    // workspace, so it is left alone — touching it is exactly the
-    // "renaming the extracted workspace renamed the original too" bug.
-    if (!hasLiveCoTenant(s)) {
-      if (trimmed) store[rootKey] = trimmed;
-      else delete store[rootKey];
+  await withDockModelLease(async (model) => {
+    const rootKey = normRoot(s.root);
+    if (s.stableId) {
+      const idKey = stableIdKey(s.stableId);
+      if (trimmed) model.names[idKey] = trimmed;
+      else delete model.names[idKey];
+      if (!hasLiveCoTenant(s)) {
+        if (trimmed) model.names[rootKey] = trimmed;
+        else delete model.names[rootKey];
+      }
+    } else {
+      if (trimmed) model.names[rootKey] = trimmed;
+      else delete model.names[rootKey];
     }
-  } else {
-    if (trimmed) store[rootKey] = trimmed;
-    else delete store[rootKey];
-  }
-  saveNames();
+  });
   applyResolvedLabel(s);
 }
 
 // Delete a folder. Its child folders and member sessions reparent to the
-// deleted folder's own parent so nothing is orphaned — the subtree
-// bubbles up one level rather than disappearing.
-function deleteFolder(id: string): void {
-  const f = folderById(id);
-  if (!f) return;
-  const parent = f.parent ?? null;
-  const folders = loadFolders();
-  for (const c of folders) {
-    if ((c.parent ?? null) === id) c.parent = parent;
-  }
-  dockFolders = folders.filter((x) => x.id !== id);
-  saveFolders();
-  const assign = loadAssign();
-  for (const [k, v] of Object.entries(assign)) {
-    if (v === id) {
-      if (parent) assign[k] = parent;
-      else delete assign[k];
+// deleted folder's own parent so nothing is orphaned — the subtree bubbles up
+// one level rather than disappearing.
+async function deleteFolder(id: string): Promise<boolean> {
+  return await withDockModelLease(async (model) => {
+    const folder = model.folders.find((candidate) => candidate.id === id);
+    if (!folder) return false;
+    const parent = folder.parent ?? null;
+    for (const child of model.folders) {
+      if ((child.parent ?? null) === id) child.parent = parent;
     }
-  }
-  saveAssign();
-  loadExpanded().delete(folderNodeKey(id));
-  saveExpanded();
+    model.folders = model.folders.filter((candidate) => candidate.id !== id);
+    for (const [key, value] of Object.entries(model.assign)) {
+      if (value !== id) continue;
+      if (parent) model.assign[key] = parent;
+      else delete model.assign[key];
+    }
+    model.expanded.delete(folderNodeKey(id));
+    return true;
+  });
 }
 
-function assignSessionToFolder(id: number, folderId: string | null): void {
-  const s = orchestratorSessions.get(id);
-  if (!s) return;
-  const assign = loadAssign();
-  const rootKey = normRoot(s.root);
-  if (s.stableId) {
-    const idKey = stableIdKey(s.stableId);
-    const coTenant = hasLiveCoTenant(s);
-    if (folderId) assign[idKey] = folderId;
-    // Unfiling next to a co-tenant records an explicit "top level" ("")
-    // rather than deleting the entry — a bare delete would fall back to
-    // the co-tenant's legacy per-root entry and the move wouldn't stick.
-    else if (coTenant) assign[idKey] = "";
-    else delete assign[idKey];
-    // Keep the per-root entry in step when it can only mean this
-    // workspace, so root-keyed lookups (a later discovered row at this
-    // root, a legacy workspace file) agree with the move.
-    if (!coTenant) {
-      if (folderId) assign[rootKey] = folderId;
-      else delete assign[rootKey];
+async function assignSessionToFolder(
+  id: number,
+  folderId: string | null,
+): Promise<void> {
+  const session = orchestratorSessions.get(id);
+  if (!session) return;
+  await withDockModelLease(async (model) => {
+    if (folderId && !model.folders.some((folder) => folder.id === folderId)) {
+      throw new Error("the destination folder no longer exists");
     }
-  } else {
-    if (folderId) assign[rootKey] = folderId;
-    else delete assign[rootKey];
-  }
-  saveAssign();
+    applySessionAssignment(model.assign, session, folderId);
+  });
 }
 
 // A flat, depth-first traversal of the dock hierarchy: each entry is
@@ -1403,7 +1747,10 @@ function buildDockTree(filtered: number[], activeId: number): DockTree {
 
   const emitFolder = (f: DockFolder, depth: number): void => {
     nodes.push(
-      treeNode(folderNodeEntry(f, countRec(f.id)), { depth, hasChildren: true }),
+      treeNode(folderNodeEntry(f, countRec(f.id)), {
+        depth,
+        hasChildren: true,
+      }),
     );
     keys.push(folderNodeKey(f.id));
     model.push({ kind: "folder", folderId: f.id });
@@ -1414,7 +1761,9 @@ function buildDockTree(filtered: number[], activeId: number): DockTree {
   // single-row line either way.
   const card = dockMode && dockView === "card";
   const emitSession = (id: number, depth: number): void => {
-    const primary = card ? sessionCardPrimary(id, activeId) : sessionNodeEntry(id, activeId);
+    const primary = card
+      ? sessionCardPrimary(id, activeId)
+      : sessionNodeEntry(id, activeId);
     nodes.push(
       treeNode(primary, {
         depth,
@@ -1430,7 +1779,9 @@ function buildDockTree(filtered: number[], activeId: number): DockTree {
       if (searching && countRec(f.id) === 0) continue;
       emitFolder(f, depth);
       walk(f.id, depth + 1);
-      for (const sid of membersByFolder.get(f.id) ?? []) emitSession(sid, depth + 1);
+      for (const sid of membersByFolder.get(f.id) ?? []) {
+        emitSession(sid, depth + 1);
+      }
     }
   };
   walk(null, 0);
@@ -1465,13 +1816,28 @@ function folderNodeEntry(f: DockFolder, count: number): TextPropertyEntry {
 // Message colour: red once the create has failed, amber while it is still
 // creating or is paused (interrupted, awaiting resume).
 function pendingMsgFg(p: PendingCreate): string {
-  return p.phase === "error" ? "ui.status_error_indicator_fg" : "diagnostic.warning_fg";
+  return p.phase === "error"
+    ? "ui.status_error_indicator_fg"
+    : "diagnostic.warning_fg";
 }
 
 // `error` and `paused` are actionable — Enter retries / resumes them — while
 // `creating` is passive (the create is running; the only action is Dismiss).
 function pendingActionable(p: PendingCreate): boolean {
   return p.phase !== "creating";
+}
+
+function previewPrimaryKey(s: AgentSession | undefined): string {
+  if (!s?.pending) return "visit";
+  return pendingActionable(s.pending) ? "pending-retry" : "pending-dismiss";
+}
+
+function selectedPreviewPrimaryKey(): string {
+  if (!openDialog) return "visit";
+  const id = openDialog.filteredIds[openDialog.selectedIndex];
+  return previewPrimaryKey(
+    typeof id === "number" ? orchestratorSessions.get(id) : undefined,
+  );
 }
 
 // The one-line action hint for a pending row's phase: retry/resume when
@@ -1519,15 +1885,20 @@ function sessionNodeEntry(id: number, activeId: number): TextPropertyEntry {
       style: { fg: "ui.menu_disabled_fg", italic: true },
     });
   }
-  // A being-created placeholder trails its status on the single compact line
-  // (there's no second row to put it on).
+  // A being-created placeholder and a live OMP facet own the compact row's
+  // authoritative right edge. The host knows the real dock width and elides
+  // the decorative left group before it ever clips this status.
+  const right: Entry[] = [];
   if (s.pending) {
-    segs.push({
-      text: "  " + s.pending.message,
+    right.push({
+      text: s.pending.message,
       style: { fg: pendingMsgFg(s.pending), italic: true },
     });
+  } else {
+    const ompStatus = ompCompanion.statusTextEntry(s);
+    if (ompStatus) right.push({ text: ompStatus.text, style: ompStatus.style });
   }
-  return styledRow(segs as Parameters<typeof styledRow>[0]);
+  return betweenRow(segs, right);
 }
 
 // The dock's "card" density renders each session leaf as a fixed
@@ -1558,35 +1929,22 @@ const DOCK_CARD_HEIGHT = 2;
 // — which knows the card's *actual* inner width, responsive or dragged
 // — inserts the gap. Plugin-side padding could only estimate that width
 // and drifted at every other one.
-function cardSplitRow(left: Entry[], right: Entry[]): TextPropertyEntry {
+function betweenRow(
+  left: Entry[],
+  right: Entry[],
+  rightPriorityByte?: number,
+): TextPropertyEntry {
   const row = styledRow([...left, ...right] as Parameters<typeof styledRow>[0]);
   if (right.length === 0) return row;
+  const splitByte = left.reduce((n, e) => n + utf8Len(e.text), 0);
   row.properties = {
     align: "between",
-    splitByte: left.reduce((n, e) => n + utf8Len(e.text), 0),
+    splitByte,
+    ...(rightPriorityByte === undefined
+      ? {}
+      : { rightPriorityByte: splitByte + rightPriorityByte }),
   };
   return row;
-}
-
-// Truncate to `cols` display columns, ellipsising when it doesn't fit.
-// Code-point aware (`Array.from`), so a multi-byte name can't be cut
-// mid-character.
-function capText(s: string, cols: number): string {
-  const chars = Array.from(s);
-  if (chars.length <= cols) return s;
-  return chars.slice(0, Math.max(1, cols - 1)).join("") + "…";
-}
-
-// Columns a group of entries occupies, for the left-group cap below.
-function entriesWidth(entries: Entry[]): number {
-  return entries.reduce((n, e) => n + Array.from(e.text).length, 0);
-}
-
-// Inner width of a card at the dock's default width — an estimate (the
-// dock can be dragged), used only to cap the branch so it doesn't shove
-// the right-hand group off the row. The host does the exact alignment.
-function cardInnerColsEstimate(): number {
-  return Math.max(12, dockContentCols(dockDefaultWidth()) - 2);
 }
 
 // Card line 1 (the tree node's primary text): state glyph, optional
@@ -1598,7 +1956,12 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
   const s = orchestratorSessions.get(id);
   if (!s) return styledRow([{ text: editor.t("pill.unknown") }]);
   const isActive = id === activeId;
-  const segs: Entry[] = [stateGlyphEntry(s)];
+  const companionState = s.ompCompanion?.snapshot.state;
+  const hideActivityGlyph = ompCompanion.statusTextEntry(s) !== undefined &&
+    companionState !== "error" && companionState !== "awaiting_approval";
+  const segs: Entry[] = hideActivityGlyph
+    ? [{ text: "  " }]
+    : [stateGlyphEntry(s)];
   if (s.remote) {
     segs.push({
       text: REMOTE_GLYPH[s.remote.kind] + " ",
@@ -1609,6 +1972,7 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
     text: s.label,
     style: { fg: isActive ? "ui.help_key_fg" : undefined, bold: true },
   });
+
   // A remote session surfaces its backend target (host / ns·pod) coloured
   // by the connection state — pill parity (the pill shows it at the right
   // end of line 1).
@@ -1622,7 +1986,7 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
   // the one-key affordance instead ("↵ Retry"), so the row below is free
   // for the whole status message.
   if (s.pending) {
-    return cardSplitRow(
+    return betweenRow(
       segs,
       pendingActionable(s.pending)
         ? [{
@@ -1632,13 +1996,111 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
         : [],
     );
   }
-  return cardSplitRow(segs, gitLineParts(s).right);
+  return betweenRow(segs, gitLineParts(s).right);
+}
+type StatusShimmerTier = "low" | "mid" | "high";
+
+const STATUS_SHIMMER_STYLES: Record<
+  StatusShimmerTier,
+  Record<string, unknown>
+> = {
+  low: { fg: "ui.menu_disabled_fg" },
+  mid: { fg: "diagnostic.warning_fg" },
+  high: { fg: "diagnostic.warning_fg", bold: true },
+};
+
+// OMP's classic shimmer: a cosine band moving left-to-right at 30 cells/s
+// through ten cells of padding on each side. Styling boundaries follow
+// grapheme clusters and positions use terminal cells, so combining marks,
+// emoji sequences, and wide CJK glyphs never split or speed up the band.
+function graphemeClusters(
+  text: string,
+): Array<{ text: string; width: number }> {
+  const clusters: Array<{ text: string; width: number }> = [];
+  let current = "";
+  let regionalCount = 0;
+  for (const codePoint of text) {
+    const code = codePoint.codePointAt(0) ?? 0;
+    const regional = code >= 0x1f1e6 && code <= 0x1f1ff;
+    const emojiModifier = code >= 0x1f3fb && code <= 0x1f3ff;
+    const zeroWidth = editor.stringWidth(codePoint) === 0;
+    const currentWidth = editor.stringWidth(current);
+    const combinedWidth = editor.stringWidth(current + codePoint);
+    const joinsCurrent = current !== "" &&
+      (zeroWidth || emojiModifier || codePoint === "\u200d" ||
+        current.endsWith("\u200d") || combinedWidth <= currentWidth ||
+        (regional && regionalCount % 2 === 1));
+    if (!joinsCurrent && current !== "") {
+      clusters.push({ text: current, width: editor.stringWidth(current) });
+      current = "";
+      regionalCount = 0;
+    }
+    current += codePoint;
+    regionalCount = regional ? regionalCount + 1 : 0;
+  }
+  if (current !== "") {
+    clusters.push({ text: current, width: editor.stringWidth(current) });
+  }
+  return clusters;
+}
+
+function truncateDisplayCells(text: string, maxCells: number): string {
+  if (editor.stringWidth(text) <= maxCells) return text;
+  const ellipsis = "…";
+  const contentCells = Math.max(0, maxCells - editor.stringWidth(ellipsis));
+  let out = "";
+  let width = 0;
+  for (const cluster of graphemeClusters(text)) {
+    if (width + cluster.width > contentCells) break;
+    out += cluster.text;
+    width += cluster.width;
+  }
+  return out + ellipsis;
+}
+
+function shimmerStatusEntries(text: string, now = Date.now()): Entry[] {
+  const clusters = graphemeClusters(text);
+  const width = clusters.reduce((sum, cluster) => sum + cluster.width, 0);
+  if (width === 0) return [];
+
+  const position = ((now / 1000) * 30) % (width + 20);
+  const entries: Entry[] = [];
+  let cell = 0;
+  let run = "";
+  let runTier: StatusShimmerTier | undefined;
+
+  for (const cluster of clusters) {
+    const midpoint = cell + Math.max(cluster.width, 1) / 2;
+    const distance = Math.abs(midpoint + 10 - position);
+    const intensity = distance >= 6
+      ? 0
+      : 0.5 * (1 + Math.cos((Math.PI * distance) / 6));
+    const tier: StatusShimmerTier = intensity >= 0.65
+      ? "high"
+      : intensity >= 0.22
+      ? "mid"
+      : "low";
+    if (tier !== runTier) {
+      if (runTier !== undefined) {
+        entries.push({ text: run, style: STATUS_SHIMMER_STYLES[runTier] });
+      }
+      run = cluster.text;
+      runTier = tier;
+    } else {
+      run += cluster.text;
+    }
+    cell += cluster.width;
+  }
+  if (runTier !== undefined) {
+    entries.push({ text: run, style: STATUS_SHIMMER_STYLES[runTier] });
+  }
+  return entries;
 }
 
 // Card line 2 (the continuation row): what this workspace *is* on the
 // left — its branch when that says something the name doesn't, else the
-// project it belongs to — and its PR badge (or the on-disk tag) flush
-// right.
+// project it belongs to — with live OMP status and its PR badge (or the
+// on-disk tag) flush right.
 function sessionCardExtraLines(id: number): TextPropertyEntry[] {
   const s = orchestratorSessions.get(id);
   if (!s) return [];
@@ -1654,7 +2116,23 @@ function sessionCardExtraLines(id: number): TextPropertyEntry[] {
     ];
   }
   const dim = "ui.menu_disabled_fg";
-  const right = prLineEntries(s);
+  const status = ompCompanion.statusTextEntry(s);
+  // Live agent status is the actionable signal. A PR badge must never evict it
+  // when the dock narrows, so PR metadata is shown only while no live status
+  // owns the row's right edge.
+  const pr = status ? [] : prLineEntries(s);
+  const right: Entry[] = status?.shimmer && s.terminalSpinner
+    ? [{
+      text: s.terminalSpinner + " ",
+      style: { fg: "diagnostic.warning_fg", bold: true },
+    }]
+    : [];
+  if (status) {
+    if (status.shimmer) right.push(...shimmerStatusEntries(status.text));
+    else right.push({ text: status.text, style: status.style });
+  } else {
+    right.push(...pr);
+  }
   // The branch earns the row only when it differs from the workspace
   // name — a worktree's branch is usually named after it, and printing
   // it twice was pure noise. Otherwise the project takes the slot: it's
@@ -1674,19 +2152,20 @@ function sessionCardExtraLines(id: number): TextPropertyEntry[] {
   // opened as its own project, whose label *is* the folder). The row
   // stays empty rather than echoing the line above it.
   if (text === s.label) {
-    return [cardSplitRow(right.length > 0 ? [] : [{ text: " " }], right)];
+    return [
+      betweenRow(
+        right.length > 0 ? [] : [{ text: " " }],
+        right,
+      ),
+    ];
   }
-  // Cap the branch/project so the badge keeps its columns: the host
-  // truncates the row's *end*, which is the badge. Budget = the card's
-  // inner width less this row's icon (2 cols), the badge, and the one
-  // column that always separates the two groups.
-  const cap = cardInnerColsEstimate() - 2 - entriesWidth(right) -
-    (right.length > 0 ? 1 : 0);
+  // The host knows the card's actual responsive width and preserves the right
+  // group, eliding this decorative left prefix only when both cannot fit.
   return [
-    cardSplitRow(
+    betweenRow(
       [
         { text: icon + " ", style: { fg: dim } },
-        { text: capText(text, Math.max(8, cap)), style: { fg: dim, italic: !showBranch } },
+        { text, style: { fg: dim, italic: !showBranch } },
       ],
       right,
     ),
@@ -1773,11 +2252,8 @@ const OPEN_MODE = "orchestrator-open";
 // =============================================================================
 
 // Remote facet derived from the host's `WindowInfo.remote` backend identity.
-// Present for SSH/Kubernetes sessions — including *dormant* ones restored
-// from disk that have never connected this run — so their dock rows carry
-// the backend glyph + detail and a disconnected ("stopped") state instead of
-// masquerading as local sessions. Plugin-managed backends (devcontainer)
-// carry no host facet; theirs still arrives via `pendingRemoteFacet`.
+// Present for SSH/Kubernetes sessions — including dormant ones restored from
+// disk — so their dock rows carry the backend identity and connection state.
 function backendFacet(info: WindowInfo): AgentSession["remote"] | undefined {
   if (!info.remote) return undefined;
   return {
@@ -1811,18 +2287,14 @@ function reconcileSessions(): void {
       orchestratorSessions.delete(s.id);
       continue;
     }
+    // An attach window exists before its activation intent may promote the
+    // discovered row. Keep that row authoritative until the winner is active.
+    if (worktreeAttachFlights.has(normRoot(s.root))) continue;
     const existing = orchestratorSessions.get(s.id);
     if (!existing) {
-      // A born-attached remote window (created by core after
-      // `attachRemoteAgent({ window: true })`) surfaces here for the first
-      // time. Core makes it the *active* window, so claim the pending facet
-      // only for the active id — otherwise a pre-existing untracked window
-      // processed first would wrongly grab it. Cleared once claimed.
-      const remote =
-        pendingRemoteFacet && s.id === editor.activeWindow()
-          ? pendingRemoteFacet
-          : undefined;
-      if (remote) pendingRemoteFacet = null;
+      // The host is authoritative for backend identity. Born-attached remote
+      // sessions are correlated explicitly by the attach result, never by
+      // whichever window happens to be active when reconciliation runs.
       orchestratorSessions.set(s.id, {
         id: s.id,
         stableId: s.stable_id || undefined,
@@ -1831,14 +2303,11 @@ function reconcileSessions(): void {
         root: s.root,
         projectPath: s.project_path,
         sharedWorktree: s.shared_worktree ?? false,
-        terminalId: null,
-        // Idle until the terminal actually prints something — we have
-        // no evidence of work yet. `lastOutputAt` is the real signal;
-        // `state` is recomputed from it at render time.
-        state: "idle",
+        terminalId: s.selectedAgentTerminalId ?? null,
+        // Idle until one of this window's terminals actually prints.
         lastOutputAt: null,
         createdAt: Date.now(),
-        remote: remote ?? backendFacet(s),
+        remote: backendFacet(s),
       });
     } else {
       // Track the host's raw label, then re-resolve the display name (a
@@ -1847,9 +2316,13 @@ function reconcileSessions(): void {
       existing.stableId = s.stable_id || undefined;
       existing.hostLabel = s.label;
       applyResolvedLabel(existing);
+      ompCompanion.rebindTerminal(existing, s.selectedAgentTerminalId ?? null);
+
       existing.root = s.root;
       existing.projectPath = s.project_path;
-      if (s.shared_worktree != null) existing.sharedWorktree = s.shared_worktree;
+      if (s.shared_worktree != null) {
+        existing.sharedWorktree = s.shared_worktree;
+      }
       // Keep the backend facet in step with the host's view: adopt it when
       // missing (a dormant session that predates the facet, or one whose
       // plugin-side record was created before the snapshot carried it), and
@@ -1909,12 +2382,6 @@ function reconcileSessions(): void {
 
 let discoveryInFlight = false;
 
-function isInternalWorktreePath(path: string): boolean {
-  // The sync-workspace and the `.archived/` graveyard are
-  // orchestrator bookkeeping, not user sessions.
-  return path.includes(".sync-workspace") || path.includes("/.archived/");
-}
-
 async function refreshDiscoveredWorktrees(): Promise<void> {
   if (discoveryInFlight) return;
   discoveryInFlight = true;
@@ -1940,6 +2407,13 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
     for (const s of orchestratorSessions.values()) {
       if (!s.discovered) liveRoots.add(s.root);
     }
+    // Archive worktrees stay registered with Git after `worktree move`, but
+    // are private orchestrator state rather than attachable workspaces.
+    const archiveRoot = editor.pathJoin(
+      editor.getDataDir(),
+      "orchestrator",
+      "archives",
+    ).replace(/\\/g, "/").replace(/\/+$/, "");
 
     // (3) Scan each repo and collect the linked worktrees worth
     //     surfacing.
@@ -1948,8 +2422,11 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
       const listed = await listLinkedWorktrees(repoRoot);
       if (!listed) continue;
       for (const wt of listed.worktrees) {
+        if (wt.locked || wt.prunable) continue;
+        if (
+          wt.path.replace(/\\/g, "/").startsWith(`${archiveRoot}/`)
+        ) continue;
         if (liveRoots.has(wt.path)) continue;
-        if (isInternalWorktreePath(wt.path)) continue;
         foundPaths.add(wt.path);
         const id = discoveredIdFor(wt.path);
         const label = wt.branch || editor.pathBasename(wt.path);
@@ -1969,9 +2446,8 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
             projectPath: listed.mainRoot,
             sharedWorktree: false,
             terminalId: null,
-            // Discovered on-disk rows have no live terminal; they render
-            // a `· on-disk` tag, not a pill, so state is moot — idle.
-            state: "idle",
+            // Discovered on-disk rows have no live terminal; they render a
+            // `· on-disk` tag rather than an activity pill.
             lastOutputAt: null,
             createdAt: Date.now(),
             discovered: true,
@@ -2006,21 +2482,6 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
 // 5s is a reasonable middle.
 const IDLE_AFTER_MS = 5000;
 
-// Coarse activity for a session, derived purely from how recently its
-// terminal produced output. This is the single source of truth — the
-// stored `state` field is just a cache of this for persistence/sorting.
-// No output ever (or no terminal) ⇒ idle: we have no evidence of work.
-function sessionState(s: AgentSession): AgentState {
-  // An explicit OSC activity signal (shell integration / progress) is
-  // authoritative over the output-timing heuristic: a command running keeps
-  // the workspace "working" even while it prints nothing, and a finished
-  // command flips it idle at once rather than riding out IDLE_AFTER_MS.
-  if (s.oscRunning === true) return "working";
-  if (s.oscRunning === false) return "idle";
-  if (s.lastOutputAt === null) return "idle";
-  return Date.now() - s.lastOutputAt < IDLE_AFTER_MS ? "working" : "idle";
-}
-
 // Age is shown at DAY granularity on purpose. A finer (s/m/h) counter ticks
 // every second/minute, and because the dock re-renders on the probe-poll
 // cadence, each tick changed the serialized card → a real frame → a full
@@ -2039,35 +2500,17 @@ function ageString(createdAt: number): string {
 // Status symbol
 //
 // Each live session shows a single status symbol in the row's left margin —
-// before the checkbox and name — so every name lines up in the same column
-// regardless of state. Activity is derived from how recently the session's
-// terminal printed (see `sessionState`):
+// before the checkbox and name — so every name lines up in the same column.
+// `ompCompanion.statusEntry` projects a live structured error/activity state,
+// then falls back to the existing OSC/output activity heuristic:
 //
-//   working : `*` in the warning/progress colour — terminal actively printing
-//   idle    : `✓` in the added/green colour       — quiet / waiting / done
+//   working : `*` in the warning/progress colour
+//   idle    : `·` in the muted resting colour
+//   error   : `!` in the status-error colour (live OMP facet only)
 //
-// `*` is ASCII; `✓` (U+2713) is a single-cell glyph present in essentially
-// every terminal font — both avoid the box-drawing / half-block / emoji
-// glyphs that render unevenly. Colours are theme keys so they track the
-// active theme. On-disk (discovered) rows have no agent process, so they get
-// no symbol (a blank margin) and keep their `· on-disk` tag instead.
+// All are single-cell glyphs with theme-key colours. On-disk (discovered) rows
+// have no agent process, so they keep their separate hollow-ring marker.
 // =============================================================================
-
-interface StatusSymbol {
-  // The single glyph painted in the left margin.
-  glyph: string;
-  // Theme key for the glyph colour, resolved by the host.
-  fg: string;
-}
-
-const STATE_SYMBOL: Record<AgentState, StatusSymbol> = {
-  // In progress — amber/warning, an asterisk reads as "busy/spinner".
-  working: { glyph: "*", fg: "diagnostic.warning_fg" },
-  // Quiet / waiting — a small dim dot. Deliberately understated: idle is
-  // the resting state, so it shouldn't draw the eye the way a green
-  // check (which reads as "done/success") did.
-  idle: { glyph: "·", fg: "ui.menu_disabled_fg" },
-};
 
 // Width of the left status margin: glyph + trailing space.
 const STATUS_MARGIN_W = 2;
@@ -2083,7 +2526,9 @@ const REMOTE_GLYPH: Record<SessionBackend, string> = {
 };
 
 // Theme colour for a remote facet's state.
-function remoteStateFg(state: "starting" | "running" | "stopped" | "error"): string {
+function remoteStateFg(
+  state: "starting" | "running" | "stopped" | "error",
+): string {
   switch (state) {
     case "running":
       return "diagnostic.info_fg";
@@ -2155,8 +2600,8 @@ function projectLabel(key: string): string {
 // the worse surprise. `scope === "all"` always shows everything,
 // sorted by project (current project first) so rows are grouped
 // rather than interleaved.
-function filterSessions(needle: string): number[] {
-  reconcileSessions();
+function filterSessions(needle: string, reconcile = true): number[] {
+  if (reconcile) reconcileSessions();
   const scope = openDialog?.scope ?? "current";
   const showWorktrees = openDialog?.showWorktrees ?? false;
   const hideTrivial = openDialog?.hideTrivial ?? false;
@@ -2265,19 +2710,19 @@ function filterSessions(needle: string): number[] {
     // each time) keeps the grouped, current-project-first browse order.
     const comparator = dockMode
       ? (a: number, b: number) => {
-          const sa = orchestratorSessions.get(a)!;
-          const sb = orchestratorSessions.get(b)!;
-          const da = sessionLastActiveDay(sa);
-          const db = sessionLastActiveDay(sb);
-          if (da !== db) return db - da; // more recent active-day first
-          // Same day (the common case): fall back to the permanent first-seen
-          // slot — the dock's long-standing stable order. Keeping this
-          // *ascending* means within-day order is unchanged from before the
-          // recency feature, so a discovered worktree keeps its position when
-          // it opens and the persistent dock never reshuffles intra-day; only
-          // a genuine cross-day change floats a workspace up.
-          return stableOrderKey(sa) - stableOrderKey(sb);
-        }
+        const sa = orchestratorSessions.get(a)!;
+        const sb = orchestratorSessions.get(b)!;
+        const da = sessionLastActiveDay(sa);
+        const db = sessionLastActiveDay(sb);
+        if (da !== db) return db - da; // more recent active-day first
+        // Same day (the common case): fall back to the permanent first-seen
+        // slot — the dock's long-standing stable order. Keeping this
+        // *ascending* means within-day order is unchanged from before the
+        // recency feature, so a discovered worktree keeps its position when
+        // it opens and the persistent dock never reshuffles intra-day; only
+        // a genuine cross-day change floats a workspace up.
+        return stableOrderKey(sa) - stableOrderKey(sb);
+      }
       : byProjectThenStable;
     const ids = allIds.slice().sort(comparator);
     if (scope === "current") {
@@ -2391,12 +2836,14 @@ const BRANCH_ICON = "▸";
 // the pill's alone.
 function gitLineParts(s: AgentSession): { left: Entry[]; right: Entry[] } {
   const dim = "ui.menu_disabled_fg";
-  let branch = s.branch || (s.discovered ? editor.t("pill.branch_worktree") : editor.t("pill.branch_detached"));
-  // Cap the branch so it doesn't push the right-aligned git summary off
-  // the tail (the host truncates the row's *end*, which is the summary)
-  // on a normal-width card. Very narrow docks may still clip it.
-  const BRANCH_CAP = 28;
-  if (branch.length > BRANCH_CAP) branch = branch.slice(0, BRANCH_CAP - 1) + "…";
+  let branch = s.branch ||
+    (s.discovered
+      ? editor.t("pill.branch_worktree")
+      : editor.t("pill.branch_detached"));
+  // Cap by terminal cells while preserving grapheme clusters. UTF-16 slicing
+  // could split an emoji/combining sequence, and character counts let wide CJK
+  // branches crowd the right-aligned git summary off the row.
+  branch = truncateDisplayCells(branch, 28);
   const left: Entry[] = [
     { text: BRANCH_ICON + " ", style: { fg: dim } },
     { text: branch, style: { fg: dim } },
@@ -2421,19 +2868,34 @@ function gitLineParts(s: AgentSession): { left: Entry[]; right: Entry[] } {
     return { left, right };
   }
   if (g.ahead && g.ahead > 0) {
-    right.push({ text: `${sep()}↑${g.ahead}`, style: { fg: "ui.file_status_added_fg" } });
+    right.push({
+      text: `${sep()}↑${g.ahead}`,
+      style: { fg: "ui.file_status_added_fg" },
+    });
   }
   if (g.behind && g.behind > 0) {
-    right.push({ text: `${sep()}↓${g.behind}`, style: { fg: "diagnostic.warning_fg" } });
+    right.push({
+      text: `${sep()}↓${g.behind}`,
+      style: { fg: "diagnostic.warning_fg" },
+    });
   }
   if (g.added) {
-    right.push({ text: `${sep()}+${g.added}`, style: { fg: "ui.file_status_added_fg" } });
+    right.push({
+      text: `${sep()}+${g.added}`,
+      style: { fg: "ui.file_status_added_fg" },
+    });
   }
   if (g.deleted) {
-    right.push({ text: `${sep()}−${g.deleted}`, style: { fg: "ui.file_status_deleted_fg" } });
+    right.push({
+      text: `${sep()}−${g.deleted}`,
+      style: { fg: "ui.file_status_deleted_fg" },
+    });
   }
   if (right.length === 0) {
-    right.push({ text: editor.t("pill.clean"), style: { fg: dim, italic: true } });
+    right.push({
+      text: editor.t("pill.clean"),
+      style: { fg: dim, italic: true },
+    });
   }
   return { left, right };
 }
@@ -2453,24 +2915,44 @@ function prLineEntries(s: AgentSession): Entry[] {
       { text: editor.t("pill.pr_prefix"), style: { fg: dim } },
       { text: `#${p.number}`, style: { fg: "ui.help_key_fg", bold: true } },
     ];
-    if (p.isDraft) out.push({ text: editor.t("pill.pr_draft"), style: { fg: dim } });
+    if (p.isDraft) {
+      out.push({ text: editor.t("pill.pr_draft"), style: { fg: dim } });
+    }
     if (p.checksFail && p.checksFail > 0) {
-      out.push({ text: ` ✗${p.checksFail}`, style: { fg: "diagnostic.error_fg" } });
+      out.push({
+        text: ` ✗${p.checksFail}`,
+        style: { fg: "diagnostic.error_fg" },
+      });
     } else if (p.checksPending && p.checksPending > 0) {
-      out.push({ text: ` •${p.checksPending}`, style: { fg: "diagnostic.warning_fg" } });
+      out.push({
+        text: ` •${p.checksPending}`,
+        style: { fg: "diagnostic.warning_fg" },
+      });
     } else if (p.checksPass && p.checksPass > 0) {
-      out.push({ text: ` ✓${p.checksPass}`, style: { fg: "ui.file_status_added_fg" } });
+      out.push({
+        text: ` ✓${p.checksPass}`,
+        style: { fg: "ui.file_status_added_fg" },
+      });
     }
     if (p.comments && p.comments > 0) {
       out.push({ text: ` ●${p.comments}`, style: { fg: dim } });
     }
     if (p.reviewDecision === "APPROVED") {
-      out.push({ text: editor.t("pill.pr_approved"), style: { fg: "ui.file_status_added_fg" } });
+      out.push({
+        text: editor.t("pill.pr_approved"),
+        style: { fg: "ui.file_status_added_fg" },
+      });
     } else if (p.reviewDecision === "CHANGES_REQUESTED") {
-      out.push({ text: editor.t("pill.pr_chg_req"), style: { fg: "diagnostic.warning_fg" } });
+      out.push({
+        text: editor.t("pill.pr_chg_req"),
+        style: { fg: "diagnostic.warning_fg" },
+      });
     }
     if (p.mergeable === "CONFLICTING") {
-      out.push({ text: editor.t("pill.pr_conflicts"), style: { fg: "diagnostic.error_fg" } });
+      out.push({
+        text: editor.t("pill.pr_conflicts"),
+        style: { fg: "diagnostic.error_fg" },
+      });
     }
     return out;
   }
@@ -2480,13 +2962,16 @@ function prLineEntries(s: AgentSession): Entry[] {
   // caller renders a blank spacer line in its place (keeping the card a
   // uniform three lines) rather than a "no PR yet" placeholder.
   if (s.discovered) {
-    return [{ text: editor.t("pill.on_disk_worktree"), style: { fg: dim, italic: true } }];
+    return [{
+      text: editor.t("pill.on_disk_worktree"),
+      style: { fg: dim, italic: true },
+    }];
   }
   return [];
 }
 
 // On-disk (discovered, unopened) worktrees get a dim hollow ring in the
-// status column — distinct from the live `*` working / `✓` idle glyphs.
+// status column — distinct from the live `*` working / `·` idle glyphs.
 const ON_DISK_GLYPH = "○";
 
 // A flex row: left group, host-filled spacer, right group. The host
@@ -2514,8 +2999,7 @@ function stateGlyphEntry(s: AgentSession): Entry {
   if (s.discovered) {
     return { text: ON_DISK_GLYPH + " ", style: { fg: "ui.menu_disabled_fg" } };
   }
-  const sym = STATE_SYMBOL[sessionState(s)];
-  return { text: sym.glyph + " ", style: { fg: sym.fg, bold: true } };
+  return ompCompanion.statusEntry(s, IDLE_AFTER_MS);
 }
 
 // Build one session row for the modal picker's list. (The dock's own
@@ -2526,10 +3010,10 @@ function stateGlyphEntry(s: AgentSession): Entry {
 //   card (default): a rounded `labeledSection` pill —
 //     line 1: <state> NAME (bold)              ▣ project
 //     line 2: ▸ branch        <git: ↑ahead ↓behind +add −del / clean>
-//     line 3: PR #1287 ✓7/8 ●2 approved        (blank spacer when no PR)
+//     line 3: live OMP status (left) + PR badge (right), otherwise PR/blank
 //
 //   compact: a single un-boxed line —
-//     <state> NAME                    <git summary>
+//     <state> NAME                    <OMP status or git summary>
 //
 // The bulk-select checkbox only appears in the modal picker (the dock
 // delegates bulk actions to it via the "manage" button), so dock rows
@@ -2540,7 +3024,12 @@ function renderPillSpec(
   activeId: number,
 ): WidgetSpec {
   const s = orchestratorSessions.get(id);
-  if (!s) return labeledSection({ label: "", child: styledRow([{ text: editor.t("pill.unknown") }]) });
+  if (!s) {
+    return labeledSection({
+      label: "",
+      child: raw([styledRow([{ text: editor.t("pill.unknown") }])]),
+    });
+  }
   // A being-created placeholder renders its status in place of the live
   // pill body: name on line 1, the creating/connecting/error message on
   // line 2 (amber while creating, red on failure), and a retry hint on the
@@ -2556,9 +3045,9 @@ function renderPillSpec(
   // so their rows render exactly as before (the facet is backend-opaque).
   const remoteGlyph: Entry[] = s.remote
     ? [{
-        text: REMOTE_GLYPH[s.remote.kind] + " ",
-        style: { fg: remoteStateFg(s.remote.state), bold: true },
-      }]
+      text: REMOTE_GLYPH[s.remote.kind] + " ",
+      style: { fg: remoteStateFg(s.remote.state), bold: true },
+    }]
     : [];
   const proj = editor.pathBasename(projectKeyOf(s));
   const projEntries: Entry[] = [
@@ -2573,12 +3062,18 @@ function renderPillSpec(
     });
   }
   const git = gitLineParts(s);
+  const ompStatus = ompCompanion.statusTextEntry(s);
 
   // Compact: one un-boxed line — glyph + (facet) + name on the left, the
-  // compact git summary right-aligned. Branch, project tag, and PR badge are
-  // dropped (that's the "compact" trade).
+  // live OMP status (or ordinary git summary) right-aligned. Branch, project
+  // tag, and PR badge are dropped (that's the "compact" trade).
   if (dockMode && dockView === "compact") {
-    return flexLine([stateGlyphEntry(s), ...remoteGlyph, nameEntry], git.right);
+    return flexLine(
+      [stateGlyphEntry(s), ...remoteGlyph, nameEntry],
+      ompStatus
+        ? [{ text: ompStatus.text, style: ompStatus.style }]
+        : git.right,
+    );
   }
 
   // Card line 1, left: state glyph · [facet] · NAME. In the modal picker keep
@@ -2601,13 +3096,13 @@ function renderPillSpec(
     flexLine(left, projEntries),
     flexLine(git.left, git.right),
   ];
-  // Line 3 is the PR badge when there's an actual PR; when `prLineEntries`
-  // returns `[]` we still emit a blank spacer line so every card is a
-  // uniform three lines tall — a 2-line card next to 3-line ones looks
-  // ragged in the dock.
   const prEntries = prLineEntries(s);
-  const prLine: Entry[] = prEntries.length > 0 ? prEntries : [{ text: " " }];
-  children.push(raw([styledRow(prLine as Parameters<typeof styledRow>[0])]));
+  if (ompStatus) {
+    children.push(flexLine([ompStatus], prEntries));
+  } else {
+    const prLine: Entry[] = prEntries.length > 0 ? prEntries : [{ text: " " }];
+    children.push(raw([styledRow(prLine as Parameters<typeof styledRow>[0])]));
+  }
   return labeledSection({ label: "", child: col(...children) });
 }
 
@@ -2622,7 +3117,10 @@ function renderPendingPillSpec(s: AgentSession): WidgetSpec {
   const actionable = pendingActionable(p);
   const msgFg = pendingMsgFg(p);
   const remoteGlyph: Entry[] = s.remote
-    ? [{ text: REMOTE_GLYPH[s.remote.kind] + " ", style: { fg: msgFg, bold: true } }]
+    ? [{
+      text: REMOTE_GLYPH[s.remote.kind] + " ",
+      style: { fg: msgFg, bold: true },
+    }]
     : [];
   const nameEntry: Entry = { text: s.label, style: { bold: true } };
   const proj = editor.pathBasename(projectKeyOf(s));
@@ -2641,50 +3139,51 @@ function renderPendingPillSpec(s: AgentSession): WidgetSpec {
 
   const children: WidgetSpec[] = [
     flexLine([stateGlyphEntry(s), ...remoteGlyph, nameEntry], projEntries),
-    raw([styledRow([{ text: p.message, style: { fg: msgFg, italic: actionable } }])]),
+    raw([
+      styledRow([{
+        text: p.message,
+        style: { fg: msgFg, italic: actionable },
+      }]),
+    ]),
   ];
   const hint: Entry[] = actionable
-    ? [{ text: pendingHintText(p), style: { fg: "ui.menu_disabled_fg", italic: true } }]
+    ? [{
+      text: pendingHintText(p),
+      style: { fg: "ui.menu_disabled_fg", italic: true },
+    }]
     : [{ text: " " }];
   children.push(raw([styledRow(hint as Parameters<typeof styledRow>[0])]));
   return labeledSection({ label: "", child: col(...children) });
 }
 
-// Preview-pane content for the currently selected session.
-// Plain info for Phase 1; later phases append pgid/pids + the
-// last terminal lines.
-function buildPreviewEntries(
-  s: AgentSession | undefined,
-): TextPropertyEntry[] {
+// Preview metadata for the currently selected session. OMP contributes only
+// Fresh-validated, allowlisted fields; its native terminal remains the UI for
+// conversation, tool output, and approvals.
+function buildPreviewEntries(s: AgentSession | undefined): TextPropertyEntry[] {
   if (!s) {
-    return [
-      styledRow([
-        {
-          text: editor.t("preview.no_workspace_selected"),
-          style: { fg: "editor.whitespace_indicator_fg", italic: true },
-        },
-      ]),
-    ];
+    return [styledRow([{
+      text: editor.t("preview.no_workspace_selected"),
+      style: { fg: "editor.whitespace_indicator_fg", italic: true },
+    }])];
   }
-  // A being-created placeholder: show its status (creating/connecting or
-  // the failure reason) rather than live-session detail it doesn't have.
   if (s.pending) {
     const p = s.pending;
     return [
       styledRow([{ text: s.label, style: { bold: true } }]),
-      styledRow([{ text: p.message, style: { fg: pendingMsgFg(p), italic: true } }]),
-      styledRow([
-        { text: pendingHintText(p), style: { fg: "ui.menu_disabled_fg", italic: true } },
-      ]),
+      styledRow([{
+        text: p.message,
+        style: { fg: pendingMsgFg(p), italic: true },
+      }]),
+      styledRow([{
+        text: pendingHintText(p),
+        style: { fg: "ui.menu_disabled_fg", italic: true },
+      }]),
     ];
   }
-  const activeId = editor.activeWindow();
-  const isActive = s.id === activeId;
-  // The focused window is labelled "active"; everything else shows its
-  // live working/idle activity (recomputed from the output timestamp).
+  const isActive = s.id === editor.activeWindow();
   const stateText = isActive
     ? editor.t("preview.state_active")
-    : sessionState(s) === "working"
+    : ompCompanion.activityState(s, IDLE_AFTER_MS) === "working"
     ? editor.t("preview.state_working")
     : editor.t("preview.state_idle");
   const headerEntries: { text: string; style?: Record<string, unknown> }[] = [
@@ -2698,20 +3197,20 @@ function buildPreviewEntries(
     { text: ageString(s.createdAt), style: { fg: "ui.menu_disabled_fg" } },
   ];
   if (!s.discovered && !ownsWorktree(s)) {
-    // In-place / launch session: runs inside a real checkout, owns no
-    // dedicated worktree. Surfaced so the user knows Archive doesn't
-    // apply (Delete just forgets it, leaving the directory untouched).
     headerEntries.push(
       { text: "  " },
-      { text: editor.t("preview.in_place"), style: { fg: "ui.menu_disabled_fg", italic: true } },
+      {
+        text: editor.t("preview.in_place"),
+        style: { fg: "ui.menu_disabled_fg", italic: true },
+      },
     );
   }
-  return [
+  const entries: TextPropertyEntry[] = [
     styledRow(headerEntries as Parameters<typeof styledRow>[0]),
-    styledRow([
-      { text: s.root, style: { fg: "ui.menu_disabled_fg" } },
-    ]),
+    styledRow([{ text: s.root, style: { fg: "ui.menu_disabled_fg" } }]),
   ];
+  entries.push(...ompCompanion.previewEntries(s));
+  return entries;
 }
 
 // A session "owns" a removable git worktree when it was created as a
@@ -2770,22 +3269,25 @@ function selectedSessions(): number[] {
 }
 
 // Is `id` a legal target for `action`? Base session is never
-// touched. Stop only applies to live windows. Archive/Delete apply
-// to discovered worktrees (removable on disk) and to live sessions
-// that own their worktree outright (not shared with siblings or the
-// project root).
+// touched. Stop only applies to live windows. Archive applies only
+// to linked worktrees; Delete also forgets in-place workspaces without
+// removing their directory.
 function bulkEligible(action: BulkAction, id: number): boolean {
   const s = orchestratorSessions.get(id);
   if (!s) return false;
   // Stop kills the agent process group — only meaningful for a live
   // session that actually spawned one (never the launch session, which
   // has no agent terminal, so signalling it can't touch the editor).
-  if (action === "stop") return !s.discovered && id > 0 && !!s.terminalId;
-  // Delete forgets any session. When it owns a worktree the worktree is
-  // removed too; otherwise (launch/in-place) it's just dropped.
-  if (action === "delete") return id > 0 || !!s.discovered;
-  // Archive applies to any session: a worktree session moves to the
-  // graveyard; a launch/in-place session is recorded at its own root.
+  if (action === "stop") {
+    return !s.discovered && id > 0 && s.terminalId !== null;
+  }
+  // Archive is a move plus persistence deletion, so an in-place session must
+  // never enter its transaction.
+  if (action === "archive" && !ownsWorktree(s)) return false;
+  // A removable worktree is shared infrastructure: archive/delete must refuse
+  // while another workspace at the same root is live. The transaction rechecks
+  // persisted co-tenants immediately before the destructive effect.
+  if (ownsWorktree(s) && hasLiveCoTenant(s)) return false;
   return id > 0 || !!s.discovered;
 }
 
@@ -2869,7 +3371,11 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
           entries: [
             styledRow([
               {
-                text: editor.t("preview.inflight_row", { label, id: String(s.id), name: s.label }),
+                text: editor.t("preview.inflight_row", {
+                  label,
+                  id: String(s.id),
+                  name: s.label,
+                }),
                 style: { bold: true, fg: "ui.menu_disabled_fg" },
               },
             ]),
@@ -2908,10 +3414,10 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   // accounts for that.
   const totalEmbedBase = (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 5;
   const detailsOn = openDialog?.showDetails ?? false;
-  const _DETAILS_CHROME_ROWS = 3; // 2 info rows + 1 spacer
+  const detailsEntries = detailsOn ? buildPreviewEntries(s) : [];
   const embedRows = Math.max(
     3,
-    totalEmbedBase - (detailsOn ? _DETAILS_CHROME_ROWS : 0),
+    totalEmbedBase - (detailsOn ? detailsEntries.length + 1 : 0),
   );
   // Gate the action buttons on having a session to act on. When
   // the filter matches nothing (or no session is highlighted) the
@@ -2938,7 +3444,44 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   // labels with the *target* state — pressing `[ Details ]`
   // turns details on, pressing `[ Preview ]` turns them off
   // (back to compact).
-  const detailsToggleLabel = detailsOn ? editor.t("preview.toggle_preview") : editor.t("preview.toggle_details");
+  const detailsToggleLabel = detailsOn
+    ? editor.t("preview.toggle_preview")
+    : editor.t("preview.toggle_details");
+  // A pending row is not a live workspace. Expose only actions valid for its
+  // phase: failed/paused rows can Retry, and every pending row can Dismiss.
+  if (s.pending) {
+    const pendingActions: WidgetSpec[] = [];
+    if (pendingActionable(s.pending)) {
+      pendingActions.push(
+        button(editor.t("dock.ctx_retry"), {
+          intent: "primary",
+          key: "pending-retry",
+        }),
+        spacer(2),
+      );
+    }
+    pendingActions.push(
+      button(editor.t("dock.ctx_dismiss"), {
+        intent: "danger",
+        key: "pending-dismiss",
+      }),
+    );
+    const pendingEntries = buildPreviewEntries(s);
+    return labeledSection({
+      label: editor.t("preview.title"),
+      child: col(
+        wrappingRow(...pendingActions),
+        spacer(0),
+        { kind: "raw", entries: pendingEntries },
+        windowEmbed({
+          windowId: 0,
+          rows: Math.max(3, totalEmbedBase - pendingEntries.length - 2),
+          key: "live-preview",
+        }),
+      ),
+    });
+  }
+
   // Discovered worktree: no live window to embed, so there's
   // nothing to Stop / Archive / Delete yet. Offer only "Open"
   // (Visit attaches a fresh session to the worktree) and describe
@@ -2948,20 +3491,23 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   if (s.discovered) {
     const openButtonRow = row(
       button(editor.t("preview.btn_open"), { intent: "primary", key: "visit" }),
-      flexSpacer(),
-      button(editor.t("preview.btn_stop"), { key: "stop", disabled: true }),
-      spacer(2),
-      button(editor.t("preview.btn_archive"), { key: "archive", disabled: true }),
-      spacer(2),
-      button(editor.t("preview.btn_delete"), { intent: "danger", key: "delete", disabled: true }),
     );
     const info: TextPropertyEntry[] = [
       styledRow([
-        { text: editor.t("preview.on_disk_not_open"), style: { fg: "ui.menu_disabled_fg", bold: true } },
+        {
+          text: editor.t("preview.on_disk_not_open"),
+          style: { fg: "ui.menu_disabled_fg", bold: true },
+        },
       ]),
       styledRow([{ text: "" }]),
-      styledRow([{ text: editor.t("preview.field_branch"), style: { fg: "ui.menu_disabled_fg" } }, { text: s.branch || editor.t("pill.branch_detached") }]),
-      styledRow([{ text: editor.t("preview.field_path"), style: { fg: "ui.menu_disabled_fg" } }, { text: s.root }]),
+      styledRow([{
+        text: editor.t("preview.field_branch"),
+        style: { fg: "ui.menu_disabled_fg" },
+      }, { text: s.branch || editor.t("pill.branch_detached") }]),
+      styledRow([{
+        text: editor.t("preview.field_path"),
+        style: { fg: "ui.menu_disabled_fg" },
+      }, { text: s.root }]),
       styledRow([{ text: "" }]),
       styledRow([
         {
@@ -2977,7 +3523,11 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
         spacer(0),
         { kind: "raw", entries: info },
         spacer(0),
-        windowEmbed({ windowId: 0, rows: Math.max(3, embedRows - 6), key: "live-preview" }),
+        windowEmbed({
+          windowId: 0,
+          rows: Math.max(3, embedRows - 6),
+          key: "live-preview",
+        }),
       ),
     });
   }
@@ -2991,15 +3541,14 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   //
   //  * Stop: only a live session with an agent terminal can be
   //    stopped (the launch session has none).
-  //  * Archive: every session can be archived — a worktree session moves
-  //    to the graveyard; a launch/in-place session is recorded at its own
-  //    root. Closing the last live window opens a replacement first.
+  //  * Archive: only an owned worktree can be moved to the archive.
   //  * Delete: forgets the session, removing the worktree only when one
   //    is owned (otherwise the directory is left untouched); the last
   //    live window likewise gets a replacement before it closes.
-  const stopDisabled = s.discovered || !s.terminalId;
-  const archiveDisabled = false;
-  const deleteDisabled = false;
+  const stopDisabled = s.discovered || s.terminalId === null;
+  const destructiveDisabled = ownsWorktree(s) && hasLiveCoTenant(s);
+  const archiveDisabled = !ownsWorktree(s) || destructiveDisabled;
+  const deleteDisabled = destructiveDisabled;
   // wrappingRow so the preview-pane actions reflow onto extra lines on a
   // narrow pane instead of the right-most ones (Stop / Archive / Delete)
   // being clipped off-screen. The wrap path ignores flex spacers, so a
@@ -3009,10 +3558,17 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
     button(editor.t("preview.btn_visit"), { intent: "primary", key: "visit" }),
     spacer(4),
     button(detailsToggleLabel, { key: "toggle-details" }),
+    ...ompCompanion.previewActions(s),
     spacer(2),
-    button(editor.t("preview.btn_stop"), { key: "stop", disabled: stopDisabled }),
+    button(editor.t("preview.btn_stop"), {
+      key: "stop",
+      disabled: stopDisabled,
+    }),
     spacer(2),
-    button(editor.t("preview.btn_archive"), { key: "archive", disabled: archiveDisabled }),
+    button(editor.t("preview.btn_archive"), {
+      key: "archive",
+      disabled: archiveDisabled,
+    }),
     spacer(2),
     button(editor.t("preview.btn_delete"), {
       intent: "danger",
@@ -3027,12 +3583,12 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
   });
   const body = detailsOn
     ? col(
-        buttonRow,
-        spacer(0),
-        { kind: "raw", entries: buildPreviewEntries(s) },
-        spacer(0),
-        embedWidget,
-      )
+      buttonRow,
+      spacer(0),
+      { kind: "raw", entries: detailsEntries },
+      spacer(0),
+      embedWidget,
+    )
     : col(buttonRow, spacer(0), embedWidget);
   // Surface the launch session in the preview label so it's always
   // visible (the list-row badge gets truncated at 25% column width).
@@ -3064,8 +3620,6 @@ function confirmActionLines(action: BulkAction): string[] {
         editor.t("confirm.archive_line1"),
         editor.t("confirm.archive_line2"),
         editor.t("confirm.archive_line3"),
-        "",
-        editor.t("confirm.archive_note"),
       ];
     case "delete":
       return [
@@ -3116,12 +3670,20 @@ function buildConfirmPane(
   const existing = ids.filter((id) => orchestratorSessions.has(id));
   const bulk = existing.length > 1;
   const diskNote = (id: number): string =>
-    orchestratorSessions.get(id)?.discovered ? editor.t("confirm.disk_note") : "";
+    orchestratorSessions.get(id)?.discovered
+      ? editor.t("confirm.disk_note")
+      : "";
   const entries: TextPropertyEntry[] = [];
   if (bulk) {
     entries.push(
       styledRow([
-        { text: editor.t("confirm.bulk_header", { cap, count: String(existing.length) }), style: { bold: true } },
+        {
+          text: editor.t("confirm.bulk_header", {
+            cap,
+            count: String(existing.length),
+          }),
+          style: { bold: true },
+        },
       ]),
       styledRow([{ text: "" }]),
     );
@@ -3130,7 +3692,10 @@ function buildConfirmPane(
       entries.push(
         styledRow([
           { text: `  ${ss.label}` },
-          { text: diskNote(id), style: { fg: "ui.menu_disabled_fg", italic: true } },
+          {
+            text: diskNote(id),
+            style: { fg: "ui.menu_disabled_fg", italic: true },
+          },
         ]),
       );
     }
@@ -3138,7 +3703,9 @@ function buildConfirmPane(
       entries.push(
         styledRow([
           {
-            text: editor.t("confirm.and_more", { count: String(existing.length - 8) }),
+            text: editor.t("confirm.and_more", {
+              count: String(existing.length - 8),
+            }),
             style: { fg: "ui.menu_disabled_fg", italic: true },
           },
         ]),
@@ -3149,13 +3716,21 @@ function buildConfirmPane(
     const ss = id !== undefined ? orchestratorSessions.get(id) : undefined;
     entries.push(
       styledRow([
-        { text: editor.t("confirm.single_header", { cap, name: ss?.label ?? "" }), style: { bold: true } },
+        {
+          text: editor.t("confirm.single_header", {
+            cap,
+            name: ss?.label ?? "",
+          }),
+          style: { bold: true },
+        },
       ]),
     );
   }
   entries.push(
     styledRow([{ text: "" }]),
-    styledRow([{ text: bulk ? editor.t("confirm.for_each") : editor.t("confirm.this_will") }]),
+    styledRow([{
+      text: bulk ? editor.t("confirm.for_each") : editor.t("confirm.this_will"),
+    }]),
   );
   for (const line of confirmActionLines(action)) {
     entries.push(styledRow([{ text: line }]));
@@ -3185,7 +3760,10 @@ function buildConfirmPane(
       wrappingRow(
         button(editor.t("confirm.btn_cancel"), { key: "confirm-cancel" }),
         spacer(2),
-        button(editor.t("confirm.btn_confirm", { cap }), { intent: "danger", key: `confirm-${action}` }),
+        button(editor.t("confirm.btn_confirm", { cap }), {
+          intent: "danger",
+          key: `confirm-${action}`,
+        }),
       ),
     ),
   });
@@ -3208,45 +3786,51 @@ function buildBulkPane(): WidgetSpec {
   const inflight = openDialog?.bulkInFlight ?? null;
   const actionRow = inflight
     ? row(
+      {
+        kind: "raw",
+        entries: [
+          styledRow([
+            {
+              text: editor.t("confirm.bulk_progress", {
+                verb: gerundAction(inflight.action),
+                done: String(inflight.done),
+                total: String(inflight.total),
+              }),
+              style: { fg: "ui.menu_disabled_fg", italic: true },
+            },
+          ]),
+        ],
+      },
+      flexSpacer(),
+    )
+    // wrappingRow (not row): on a narrow pane the action buttons
+    // reflow onto extra lines instead of the right-most ones being
+    // clipped off-screen. The wrap path ignores flex spacers, so a
+    // fixed `spacer(4)` (rather than `flexSpacer()`) keeps a visible
+    // gap between the destructive actions and the non-destructive
+    // "Clear" while still wrapping cleanly.
+    : wrappingRow(
+      button(editor.t("confirm.bulk_btn_stop", { count: String(stopN) }), {
+        key: "bulk-stop",
+        disabled: stopN === 0,
+      }),
+      spacer(2),
+      button(
+        editor.t("confirm.bulk_btn_archive", { count: String(archiveN) }),
         {
-          kind: "raw",
-          entries: [
-            styledRow([
-              {
-                text: editor.t("confirm.bulk_progress", {
-                  verb: gerundAction(inflight.action),
-                  done: String(inflight.done),
-                  total: String(inflight.total),
-                }),
-                style: { fg: "ui.menu_disabled_fg", italic: true },
-              },
-            ]),
-          ],
-        },
-        flexSpacer(),
-      )
-    : // wrappingRow (not row): on a narrow pane the action buttons
-      // reflow onto extra lines instead of the right-most ones being
-      // clipped off-screen. The wrap path ignores flex spacers, so a
-      // fixed `spacer(4)` (rather than `flexSpacer()`) keeps a visible
-      // gap between the destructive actions and the non-destructive
-      // "Clear" while still wrapping cleanly.
-      wrappingRow(
-        button(editor.t("confirm.bulk_btn_stop", { count: String(stopN) }), { key: "bulk-stop", disabled: stopN === 0 }),
-        spacer(2),
-        button(editor.t("confirm.bulk_btn_archive", { count: String(archiveN) }), {
           key: "bulk-archive",
           disabled: archiveN === 0,
-        }),
-        spacer(2),
-        button(editor.t("confirm.bulk_btn_delete", { count: String(deleteN) }), {
-          intent: "danger",
-          key: "bulk-delete",
-          disabled: deleteN === 0,
-        }),
-        spacer(4),
-        button(editor.t("confirm.bulk_btn_clear"), { key: "bulk-clear" }),
-      );
+        },
+      ),
+      spacer(2),
+      button(editor.t("confirm.bulk_btn_delete", { count: String(deleteN) }), {
+        intent: "danger",
+        key: "bulk-delete",
+        disabled: deleteN === 0,
+      }),
+      spacer(4),
+      button(editor.t("confirm.bulk_btn_clear"), { key: "bulk-clear" }),
+    );
 
   // Affected-sessions list. Flag the rows a destructive action will
   // skip so the count discrepancy explains itself.
@@ -3271,7 +3855,10 @@ function buildBulkPane(): WidgetSpec {
   // spacer (1) + list, and the embed pane reserves `listVisibleRows
   // + 4` for its body — so the list takes that height and the two
   // panes' bottom borders line up.
-  const listRows = Math.max(3, (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 4);
+  const listRows = Math.max(
+    3,
+    (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 4,
+  );
 
   return labeledSection({
     label: editor.t("confirm.bulk_label", { count: String(sel.length) }),
@@ -3332,7 +3919,9 @@ function buildOpenSpec(): WidgetSpec {
     "orchestrator_open_new_from_picker",
     OPEN_MODE,
   );
-  const newLabel = newKey ? editor.t("list.new_btn_key", { key: newKey }) : editor.t("list.new_btn");
+  const newLabel = newKey
+    ? editor.t("list.new_btn_key", { key: newKey })
+    : editor.t("list.new_btn");
   const inConfirm = openDialog.pendingConfirm !== null;
   // While a confirmation prompt is up the filter is rendered
   // without a `key`. The host's `collect_tabbable` only adds
@@ -3352,20 +3941,20 @@ function buildOpenSpec(): WidgetSpec {
   });
   const errorBanner: WidgetSpec | null = openDialog.lastError
     ? {
-        kind: "raw",
-        entries: [
-          styledRow([
-            {
-              text: editor.t("list.warn_prefix"),
-              style: { fg: "ui.status_error_indicator_fg", bold: true },
-            },
-            {
-              text: openDialog.lastError,
-              style: { fg: "ui.status_error_indicator_fg" },
-            },
-          ]),
-        ],
-      }
+      kind: "raw",
+      entries: [
+        styledRow([
+          {
+            text: editor.t("list.warn_prefix"),
+            style: { fg: "ui.status_error_indicator_fg", bold: true },
+          },
+          {
+            text: openDialog.lastError,
+            style: { fg: "ui.status_error_indicator_fg" },
+          },
+        ]),
+      ],
+    }
     : null;
 
   // Scope chrome. The `Project:` control below is the clickable scope
@@ -3373,13 +3962,18 @@ function buildOpenSpec(): WidgetSpec {
   // title suffix (the dialog title is native modal-frame chrome).
   const scope = openDialog.scope;
   const curKey = currentProjectKey();
-  const scopeKey = editor.getKeybindingLabel("orchestrator_toggle_scope", OPEN_MODE);
+  const scopeKey = editor.getKeybindingLabel(
+    "orchestrator_toggle_scope",
+    OPEN_MODE,
+  );
   const sectionLabel = editor.t("list.section_label");
   // `Project:` control — a visible, clickable scope switch with the
   // Alt+P hint baked into the button label. Shows the current
   // project's name when scoped, "All" when showing every project.
   // Inert while a confirm prompt is up so it can't steal focus.
-  const scopeWord = scope === "current" ? editor.pathBasename(curKey) : editor.t("list.scope_all");
+  const scopeWord = scope === "current"
+    ? editor.pathBasename(curKey)
+    : editor.t("list.scope_all");
   const scopeButtonLabel = scopeKey
     ? editor.t("list.scope_btn_key", { word: scopeWord, key: scopeKey })
     : editor.t("list.scope_btn", { word: scopeWord });
@@ -3390,7 +3984,10 @@ function buildOpenSpec(): WidgetSpec {
     {
       kind: "raw",
       entries: [
-        styledRow([{ text: editor.t("list.project_prefix"), style: { fg: "ui.menu_disabled_fg" } }]),
+        styledRow([{
+          text: editor.t("list.project_prefix"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
       ],
     },
     scopeButton,
@@ -3518,47 +4115,25 @@ function buildOpenSpec(): WidgetSpec {
         { keys: "↑↓", label: editor.t("hint.nav") },
         { keys: "Enter", label: editor.t("hint.dive") },
         {
-          keys: editor.getKeybindingLabel("orchestrator_toggle_select", OPEN_MODE) ||
+          keys: editor.getKeybindingLabel(
+            "orchestrator_toggle_select",
+            OPEN_MODE,
+          ) ||
             "Space",
           label: editor.t("hint.select"),
         },
         {
           keys: scopeKey || "⌥P",
-          label: scope === "current" ? editor.t("hint.all_projects") : editor.t("hint.current_only"),
+          label: scope === "current"
+            ? editor.t("hint.all_projects")
+            : editor.t("hint.current_only"),
         },
         { keys: "Tab", label: editor.t("hint.focus") },
         { keys: "Esc", label: editor.t("hint.close") },
       ]),
       flexSpacer(),
-      syncIndicator(),
     ),
   );
-}
-
-// Tiny status glyph rendered at the trailing edge of the
-// footer. `↻` while a push is in flight, `⤒` when the last
-// push failed (with the error in the tooltip — for now, just a
-// status-bar setStatus on focus), and an empty entry otherwise
-// so the layout stays put.
-function syncIndicator(): WidgetSpec {
-  let glyph = "";
-  let style: { fg?: string; italic?: boolean } | undefined;
-  switch (syncStatus) {
-    case "syncing":
-      glyph = " ↻ ";
-      style = { fg: "editor.whitespace_indicator_fg" };
-      break;
-    case "error":
-      glyph = " ⤒ ";
-      style = { fg: "ui.status_error_indicator_fg" };
-      break;
-    default:
-      glyph = "   ";
-  }
-  return {
-    kind: "raw",
-    entries: [styledRow([{ text: glyph, style }])],
-  };
 }
 
 // Surface a lifecycle-action refusal in two places: the dialog
@@ -3580,25 +4155,50 @@ function clearDialogError(): void {
   }
 }
 
-function refreshOpenDialog(): void {
+function refreshOpenDialog(reconcile = true): void {
   if (!openPanel || !openDialog) return;
   pruneSelection();
-  openDialog.filteredIds = filterSessions(openDialog.filter.value);
+  const previousIds = openDialog.filteredIds;
+  const previousIndex = openDialog.selectedIndex;
+  const selectedId = previousIds[previousIndex];
+  const interruptWasFocused = !dockMode && pickerFocusKey === "omp-interrupt";
+  openDialog.filteredIds = filterSessions(openDialog.filter.value, reconcile);
+  // Keep the modal bound to the rendered workspace, not to the row number it
+  // happened to occupy before a label/activity refresh reordered the list.
+  // Only fall back to the nearest surviving row when that exact session left.
+  const selectedIndex = typeof selectedId === "number"
+    ? openDialog.filteredIds.indexOf(selectedId)
+    : -1;
+  if (selectedIndex >= 0) {
+    openDialog.selectedIndex = selectedIndex;
+  } else if (openDialog.filteredIds.length === 0) {
+    openDialog.selectedIndex = 0;
+  } else {
+    openDialog.selectedIndex = Math.max(
+      0,
+      Math.min(previousIndex, openDialog.filteredIds.length - 1),
+    );
+  }
   // Ensure the background probe poll is running (idempotent; it stops
   // itself when the panel closes). PR/git info is gathered on that
   // loop's own cadence, never synchronously from this refresh.
   startProbePolling();
-  // Clamp the selection into range so a fresh filter or a
-  // session vanishing under us doesn't leave us pointing past
-  // the end of the list.
-  if (openDialog.filteredIds.length === 0) {
-    openDialog.selectedIndex = 0;
-  } else if (openDialog.selectedIndex >= openDialog.filteredIds.length) {
-    openDialog.selectedIndex = openDialog.filteredIds.length - 1;
-  } else if (openDialog.selectedIndex < 0) {
-    openDialog.selectedIndex = 0;
-  }
+  const selected = orchestratorSessions.get(
+    openDialog.filteredIds[openDialog.selectedIndex],
+  );
+  const interruptStillPresent = !!selected &&
+    ompCompanion.previewActions(selected).some((widget) =>
+      "key" in widget && widget.key === "omp-interrupt"
+    );
   openPanel.update(dockMode ? buildDockSpec() : buildOpenSpec());
+  // A transient Interrupt button may disappear on refusal, idle, or expiry.
+  // Move focus to the stable Visit action before the next Enter can fall
+  // through to the modal's first tabbable control (+ New Session).
+  if (interruptWasFocused && !interruptStillPresent && selected) {
+    const focusKey = previewPrimaryKey(selected);
+    openPanel.setFocusKey(focusKey);
+    pickerFocusKey = focusKey;
+  }
   // The list/tree widget's `selectedIndex` in the spec is initial-only;
   // pin it via mutation so re-renders don't snap back to 0. In the dock
   // (a tree) the pin follows the highlighted node key, which
@@ -3635,6 +4235,7 @@ function syncDockSelectionToActive(): void {
   const activeKey = sessionNodeKey(editor.activeWindow());
   const idx = openDialog.dockKeys.indexOf(activeKey);
   if (idx < 0) return;
+  if (openDialog.dockSelKey !== activeKey) invalidateWorktreeActivation();
   openDialog.dockSelKey = activeKey;
   openPanel.setSelectedIndex("sessions", idx);
 }
@@ -3716,13 +4317,19 @@ function rollupCounts(
 async function probePr(s: AgentSession): Promise<void> {
   if (prProbesInFlight.has(s.id)) return;
   const now = Date.now();
-  if (s.pr && s.pr.status !== "loading" && now - s.pr.fetchedAt < PR_PROBE_TTL_MS) {
+  if (
+    s.pr && s.pr.status !== "loading" && now - s.pr.fetchedAt < PR_PROBE_TTL_MS
+  ) {
     return;
   }
   prProbesInFlight.add(s.id);
   // Keep any prior info visible while re-checking (avoids a flicker
   // back to the branch fallback on refresh).
-  s.pr = { status: "loading", fetchedAt: s.pr?.fetchedAt ?? 0, info: s.pr?.info };
+  s.pr = {
+    status: "loading",
+    fetchedAt: s.pr?.fetchedAt ?? 0,
+    info: s.pr?.info,
+  };
   try {
     const branch = await sessionBranch(s);
     if (!branch) {
@@ -3817,7 +4424,9 @@ function drainGitProbes(): void {
 async function probeGit(s: AgentSession): Promise<void> {
   if (gitProbesInFlight.has(s.id)) return;
   const now = Date.now();
-  if (s.git && s.git.status === "ok" && now - s.git.fetchedAt < GIT_PROBE_TTL_MS) {
+  if (
+    s.git && s.git.status === "ok" && now - s.git.fetchedAt < GIT_PROBE_TTL_MS
+  ) {
     return;
   }
   // Bound concurrent git spawns (see MAX_CONCURRENT_GIT_PROBES). Check this
@@ -3826,7 +4435,11 @@ async function probeGit(s: AgentSession): Promise<void> {
   // refills the slot this holds as soon as the probe finishes.
   if (gitProbesInFlight.size >= MAX_CONCURRENT_GIT_PROBES) return;
   gitProbesInFlight.add(s.id);
-  s.git = { status: "loading", fetchedAt: s.git?.fetchedAt ?? 0, info: s.git?.info };
+  s.git = {
+    status: "loading",
+    fetchedAt: s.git?.fetchedAt ?? 0,
+    info: s.git?.info,
+  };
   try {
     const st = await spawnCollect(
       "git",
@@ -3845,7 +4458,11 @@ async function probeGit(s: AgentSession): Promise<void> {
     const info = parsePorcelainV2(st.stdout || "");
     if (info.branch && !s.branch) s.branch = info.branch;
     // Uncommitted line churn vs HEAD (staged + unstaged).
-    const diff = await spawnCollect("git", ["diff", "--shortstat", "HEAD"], s.root);
+    const diff = await spawnCollect(
+      "git",
+      ["diff", "--shortstat", "HEAD"],
+      s.root,
+    );
     if (diff.exit_code === 0) {
       const ins = (diff.stdout || "").match(/(\d+) insertion/);
       const del = (diff.stdout || "").match(/(\d+) deletion/);
@@ -3964,6 +4581,7 @@ function openControlRoom(
       return;
     }
   }
+  refreshDockModelCache(true);
   reconcileSessions();
   // Summarise on-disk session content up front so the trivial filter
   // has data on the first render.
@@ -4045,7 +4663,11 @@ function openControlRoom(
     // undo a blurred mount for one tick until the follow-up blur lands
     // (command dispatch is budgeted, so the pair can split across frames).
     // The mount alone decides focus; this only sets the default width.
-    editor.floatingPanelControl(openPanel.id(), "dock_width", dockDefaultWidth());
+    editor.floatingPanelControl(
+      openPanel.id(),
+      "dock_width",
+      dockDefaultWidth(),
+    );
     openPanel.update(buildDockSpec());
   } else {
     // 90% × 90% of the terminal — the open dialog wants room for
@@ -4077,13 +4699,11 @@ function openControlRoom(
   // selection. The host clamps to the first tabbable when "visit"
   // isn't in the spec (empty filter result, no session), which is
   // safe — there's nothing to act on then anyway.
-  // In the dock the focusable session list is the default focus
-  // (↑↓ switch, Enter blurs to editor). The modal lands on Visit.
-  const initialFocus = asDock ? "sessions" : "visit";
+  // In the dock the session tree is primary. The modal lands on the selected
+  // row's phase-valid primary action (Visit/Open, Retry, or Dismiss).
+  const initialFocus = asDock ? "sessions" : selectedPreviewPrimaryKey();
   openPanel.setFocusKey(initialFocus);
-  // Seed the `pickerFocusKey` mirror — `setFocusKey` only fires the
-  // `focus` widget_event when the inner key actually *changes*, so on
-  // a fresh mount it may not fire (no previous focus to differ from).
+  // Seed the mirror because a fresh mount need not emit a focus event.
   pickerFocusKey = initialFocus;
   if (asDock) {
     // The dock has no editor mode — its keys are handled at the host
@@ -4131,6 +4751,7 @@ function restoreDockBehindPicker(): boolean {
 }
 
 function closeOpenDialog(): void {
+  invalidateWorktreeActivation();
   if (openPanel) {
     openPanel.unmount();
     openPanel = null;
@@ -4265,7 +4886,9 @@ function dockProjectMenu(): WidgetSpec {
   const cursor = clampMenuIndex(openDialog?.projectMenuIndex ?? 0, keys.length);
   const rows: WidgetSpec[] = keys.map((key, i) => {
     const applied = key === "" ? cur === null : key === cur;
-    const label = key === "" ? editor.t("dock.all_projects") : projectLabel(key);
+    const label = key === ""
+      ? editor.t("dock.all_projects")
+      : projectLabel(key);
     return row(
       button((applied ? "● " : "  ") + label, {
         key: projectPickKey(key),
@@ -4274,7 +4897,9 @@ function dockProjectMenu(): WidgetSpec {
       flexSpacer(),
     );
   });
-  return overlay(labeledSection({ label: editor.t("dock.menu_label"), child: col(...rows) }));
+  return overlay(
+    labeledSection({ label: editor.t("dock.menu_label"), child: col(...rows) }),
+  );
 }
 
 // Clamp a menu cursor into `[0, len)`, tolerating an empty list.
@@ -4327,7 +4952,8 @@ function moveProjectMenu(delta: number): void {
 function acceptProjectMenu(): void {
   if (!openDialog || !openDialog.projectMenuOpen) return;
   const keys = projectMenuKeys();
-  const key = keys[clampMenuIndex(openDialog.projectMenuIndex, keys.length)] ?? "";
+  const key = keys[clampMenuIndex(openDialog.projectMenuIndex, keys.length)] ??
+    "";
   pickProject(key);
 }
 
@@ -4374,7 +5000,9 @@ function buildDockSpec(): WidgetSpec {
   openDialog.dockKeys = dockTree.keys;
   // Keep the highlighted node key pointing at something real: default to
   // the active session's node, else the first node.
-  if (!openDialog.dockSelKey || !dockTree.keys.includes(openDialog.dockSelKey)) {
+  if (
+    !openDialog.dockSelKey || !dockTree.keys.includes(openDialog.dockSelKey)
+  ) {
     const activeKey = sessionNodeKey(activeId);
     openDialog.dockSelKey = dockTree.keys.includes(activeKey)
       ? activeKey
@@ -4392,7 +5020,7 @@ function buildDockSpec(): WidgetSpec {
   // usable — and so the two overflow (and wrap) on a narrow/dragged dock.
   // The host wraps against the *actual* rendered width, so this estimate
   // only needs to be close for the default-dock case.
-  const newBtnCols = newLabel.length + 4;
+  const newBtnCols = editor.stringWidth(newLabel) + 4;
   const dockCols = dockContentCols(dockDefaultWidth());
   const SEARCH_MIN_FIELD = 10;
   const searchField = Math.max(SEARCH_MIN_FIELD, dockCols - newBtnCols - 4);
@@ -4416,24 +5044,22 @@ function buildDockSpec(): WidgetSpec {
   // instead of a mouse-only secret.
   const centered = (entries: Parameters<typeof hintBar>[0]): WidgetSpec =>
     row(flexSpacer(), hintBar(entries), flexSpacer());
-  const bottom: WidgetSpec[] = !showHints
-    ? []
-    : menuOpen
-      ? [centered([
-          { keys: "↑↓", label: editor.t("dock.hint_choose") },
-          { keys: "Enter", label: editor.t("dock.hint_select") },
-          { keys: "Esc", label: editor.t("dock.hint_cancel") },
-        ])]
-      : [
-        centered([
-          { keys: "↑↓", label: editor.t("dock.hint_switch") },
-          { keys: "→←", label: editor.t("dock.hint_fold") },
-        ]),
-        centered([
-          { keys: "Enter", label: editor.t("dock.hint_edit") },
-          { keys: "F2", label: editor.t("dock.hint_menu") },
-        ]),
-      ];
+  const bottom: WidgetSpec[] = !showHints ? [] : menuOpen
+    ? [centered([
+      { keys: "↑↓", label: editor.t("dock.hint_choose") },
+      { keys: "Enter", label: editor.t("dock.hint_select") },
+      { keys: "Esc", label: editor.t("dock.hint_cancel") },
+    ])]
+    : [
+      centered([
+        { keys: "↑↓", label: editor.t("dock.hint_switch") },
+        { keys: "→←", label: editor.t("dock.hint_fold") },
+      ]),
+      centered([
+        { keys: "Enter", label: editor.t("dock.hint_edit") },
+        { keys: "F2", label: editor.t("dock.hint_menu") },
+      ]),
+    ];
   const bottomRows = bottom.length;
 
   // The collapsible Filters section: a header toggle plus, when open,
@@ -4446,14 +5072,20 @@ function buildDockSpec(): WidgetSpec {
   const filterBody: WidgetSpec[] = openDialog.filtersExpanded
     ? [
       row(
-        button(editor.t("dock.view_btn", { view: dockView }), { key: "view-toggle" }),
+        button(editor.t("dock.view_btn", { view: dockView }), {
+          key: "view-toggle",
+        }),
         flexSpacer(),
-        button(editor.t("dock.project_btn", { word: projWord }), { key: "project-menu" }),
+        button(editor.t("dock.project_btn", { word: projWord }), {
+          key: "project-menu",
+        }),
       ),
       // The project dropdown floats just under its toolbar button.
       ...(openDialog.projectMenuOpen ? [dockProjectMenu()] : []),
       row(
-        toggle(openDialog.showWorktrees, worktreeLabel, { key: "worktree-show" }),
+        toggle(openDialog.showWorktrees, worktreeLabel, {
+          key: "worktree-show",
+        }),
         flexSpacer(),
       ),
       row(
@@ -4491,7 +5123,10 @@ function buildDockSpec(): WidgetSpec {
   // the visible tree content occupies and fill the gap with blank,
   // non-interactive rows so `bottom` always lands on the dock's last
   // rows. Zero when the tree fills or overflows its budget.
-  const treeRows = Math.min(listRows, dockTreeContentRows(dockTree, expandedSeed));
+  const treeRows = Math.min(
+    listRows,
+    dockTreeContentRows(dockTree, expandedSeed),
+  );
   const padRows = bottomRows > 0 ? Math.max(0, listRows - treeRows) : 0;
   const bottomPad: WidgetSpec[] = padRows > 0
     ? [raw(Array.from({ length: padRows }, () => ({ text: "" })))]
@@ -4529,16 +5164,11 @@ function buildDockSpec(): WidgetSpec {
       selectedIndex: selIdx,
       visibleRows: listRows,
       expandedKeys: expandedSeed,
-      // "card" density renders each session as a 3-content-row card
-      // inside a rounded border (the pill look the pre-tree dock had);
-      // "compact" keeps single-line rows. The host keeps
-      // scroll/selection in node units either way.
+      // "card" density renders each session as a 2-content-row card
+      // inside a rounded border; "compact" keeps single-line rows. The
+      // host keeps scroll/selection in node units either way.
       itemHeight: dockView === "card" ? DOCK_CARD_HEIGHT : 1,
       cardBorders: dockView === "card",
-      // Focusable in the dock (unlike the modal, where Up/Down forward
-      // from the filter): the tree itself is the default focus so ↑↓
-      // drive live-switch, →← fold, and Enter dives / toggles a folder.
-      focusable: true,
       key: "sessions",
     }),
     ...bottomPad,
@@ -4614,7 +5244,11 @@ function dockNewOptions(): MenuOption[] {
 function dockMoveOptions(sessionId: number): MenuOption[] {
   const cur = folderOfSession(sessionId);
   const opts: MenuOption[] = [
-    { key: "move:root", label: editor.t("dock.move_root"), marked: cur === null },
+    {
+      key: "move:root",
+      label: editor.t("dock.move_root"),
+      marked: cur === null,
+    },
   ];
   const walk = (parent: string | null, depth: number): void => {
     for (const f of childFoldersOf(parent)) {
@@ -4637,7 +5271,11 @@ function dockMenuOptions(): MenuOption[] {
   return m.kind === "new" ? dockNewOptions() : dockMoveOptions(m.sessionId);
 }
 
-function dockDropdownOverlay(label: string, opts: MenuOption[], cursor: number): WidgetSpec {
+function dockDropdownOverlay(
+  label: string,
+  opts: MenuOption[],
+  cursor: number,
+): WidgetSpec {
   const rows: WidgetSpec[] = opts.map((o, i) =>
     row(
       button((o.marked ? "● " : "  ") + o.label, {
@@ -4655,7 +5293,11 @@ function dockNewMenu(): WidgetSpec {
     openDialog?.dockMenu?.kind === "new" ? openDialog.dockMenu.index : 0,
     dockNewOptions().length,
   );
-  return dockDropdownOverlay(editor.t("dock.menu_new_label"), dockNewOptions(), cursor);
+  return dockDropdownOverlay(
+    editor.t("dock.menu_new_label"),
+    dockNewOptions(),
+    cursor,
+  );
 }
 
 function dockMoveMenu(): WidgetSpec {
@@ -4694,6 +5336,11 @@ function moveDockMenu(delta: number): void {
   if (opts[next]) openPanel.setFocusKey(menuPickKey(opts[next].key));
 }
 
+function reportDockModelFailure(error: unknown): void {
+  setDialogError(error instanceof Error ? error.message : String(error));
+  refreshOpenDialog();
+}
+
 function acceptDockMenu(): void {
   if (!openDialog || !openDialog.dockMenu) return;
   const opts = dockMenuOptions();
@@ -4725,9 +5372,11 @@ function runDockMenuOption(optKey: string): void {
       openCreateFolderDialog(null, sessionId);
       return;
     }
-    assignSessionToFolder(sessionId, target === "root" ? null : target);
     closeDockMenu();
-    refreshOpenDialog();
+    void assignSessionToFolder(
+      sessionId,
+      target === "root" ? null : target,
+    ).then(() => refreshOpenDialog()).catch(reportDockModelFailure);
     return;
   }
   closeDockMenu();
@@ -4839,6 +5488,7 @@ function openRenameWorkspaceDialog(id: number): void {
 
 // Shared mount path for the create / rename folder dialog.
 function mountFolderDialog(): void {
+  createFolderSubmitting = false;
   // Yield the dock's keyboard while the dialog owns it (mirrors the
   // new-session form and the context-menu confirm).
   if (openPanel && dockMode) {
@@ -4849,8 +5499,8 @@ function mountFolderDialog(): void {
   const title = d0.renameSessionId !== null
     ? editor.t("dock.rename_workspace_dialog_title")
     : d0.renameId !== null
-      ? editor.t("dock.rename_folder_dialog_title")
-      : editor.t("dock.new_folder_dialog_title");
+    ? editor.t("dock.rename_folder_dialog_title")
+    : editor.t("dock.new_folder_dialog_title");
   createFolderPanel = new FloatingWidgetPanel();
   createFolderPanel.mount(buildCreateFolderSpec(), {
     widthPct: 50,
@@ -4877,13 +5527,13 @@ function buildCreateFolderSpec(): WidgetSpec {
   const d = createFolderDialog!;
   const renamingSession = d.renameSessionId !== null;
   const renaming = d.renameId !== null || renamingSession;
-  const sess = d.sessionId != null ? orchestratorSessions.get(d.sessionId) : undefined;
+  const sess = d.sessionId != null
+    ? orchestratorSessions.get(d.sessionId)
+    : undefined;
   const promptLabel = renamingSession
     ? editor.t("dock.rename_workspace_prompt")
     : editor.t("dock.new_folder_prompt");
   const children: WidgetSpec[] = [
-    // Render the label inline ("Folder name: " / "Workspace name: ") so the
-    // ": " separator appears the same way in the TUI and the web UI.
     row(
       raw([
         styledRow([
@@ -4901,14 +5551,19 @@ function buildCreateFolderSpec(): WidgetSpec {
   ];
   if (sess) {
     children.push(
-      toggle(d.organizeCurrent, editor.t("dock.new_folder_organize", { name: sess.label }), {
-        key: "folder-organize",
-      }),
+      toggle(
+        d.organizeCurrent,
+        editor.t("dock.new_folder_organize", { name: sess.label }),
+        { key: "folder-organize" },
+      ),
     );
   }
   children.push(
     wrappingRow(
-      button(editor.t("dock.new_folder_btn_cancel"), { intent: "danger", key: "folder-cancel" }),
+      button(editor.t("dock.new_folder_btn_cancel"), {
+        intent: "danger",
+        key: "folder-cancel",
+      }),
       spacer(2),
       button(
         renaming
@@ -4918,45 +5573,41 @@ function buildCreateFolderSpec(): WidgetSpec {
       ),
     ),
   );
-  // The dialog's title + border come from the native modal-frame chrome
-  // (see `mountFolderDialog`), so the spec is just the content column.
   return col(...children);
 }
 
-// Commit the dialog: create the folder and (when the checkbox is on)
-// file the target session under it. No-op on an empty name, so the
-// dialog stays open for the user to type one.
-function submitCreateFolder(): void {
+async function submitCreateFolder(): Promise<void> {
   const d = createFolderDialog;
-  if (!d) return;
-  if (d.renameSessionId !== null) {
-    // Workspace rename: an empty name clears the manual name and lets the
-    // auto-name / host label take back over.
-    const s = orchestratorSessions.get(d.renameSessionId);
-    if (s) renameWorkspace(s, d.name.value);
+  if (!d || createFolderSubmitting) return;
+  createFolderSubmitting = true;
+  try {
+    if (d.renameSessionId !== null) {
+      const session = orchestratorSessions.get(d.renameSessionId);
+      if (session) await renameWorkspace(session, d.name.value);
+      closeCreateFolderDialog();
+      return;
+    }
+    if (d.renameId !== null) {
+      const trimmed = d.name.value.trim();
+      if (trimmed) await renameFolder(d.renameId, trimmed);
+      closeCreateFolderDialog();
+      return;
+    }
+    const name = d.name.value.trim() || editor.t("dock.new_folder_default");
+    await createFolder(
+      name,
+      d.parent,
+      d.organizeCurrent ? d.sessionId : null,
+    );
     closeCreateFolderDialog();
-    if (openPanel && dockMode) refreshOpenDialog();
-    return;
-  }
-  if (d.renameId !== null) {
-    // Rename mode: an emptied-out name keeps the current one (renaming
-    // to nothing is never what the user meant).
-    const trimmed = d.name.value.trim();
-    if (trimmed) renameFolder(d.renameId, trimmed);
-    closeCreateFolderDialog();
-    if (openPanel && dockMode) refreshOpenDialog();
-    return;
-  }
-  // Empty name ⇒ the default ("New Folder"), matching the placeholder.
-  const name = d.name.value.trim() || editor.t("dock.new_folder_default");
-  const id = createFolder(name, d.parent);
-  if (d.organizeCurrent && d.sessionId != null) {
-    assignSessionToFolder(d.sessionId, id);
-  }
-  closeCreateFolderDialog();
-  if (openPanel && dockMode) {
-    openPanel.setExpandedKeys("sessions", Array.from(loadExpanded()));
-    refreshOpenDialog();
+    if (openPanel && dockMode) {
+      openPanel.setExpandedKeys("sessions", Array.from(loadExpanded()));
+      refreshOpenDialog();
+    }
+  } catch (error) {
+    reportDockModelFailure(error);
+  } finally {
+    createFolderSubmitting = false;
   }
 }
 
@@ -4967,6 +5618,7 @@ function closeCreateFolderDialog(): void {
     createFolderPanel = null;
   }
   createFolderDialog = null;
+  createFolderSubmitting = false;
   editor.setEditorMode(null);
   if (openPanel && dockMode) {
     dockBlurred = false;
@@ -4976,18 +5628,23 @@ function closeCreateFolderDialog(): void {
   }
 }
 
-// Flip one folder's expansion in the persisted set and push it to the
-// host-owned tree state.
-function toggleDockFolderExpansion(folderKey: string): void {
+async function setDockFolderExpansion(
+  folderKey: string,
+  expanded?: boolean,
+): Promise<void> {
+  const set = await withDockModelLease(async (model) => {
+    const shouldExpand = expanded ?? !model.expanded.has(folderKey);
+    if (shouldExpand) model.expanded.add(folderKey);
+    else model.expanded.delete(folderKey);
+    return model.expanded;
+  });
   if (!openPanel) return;
-  const set = loadExpanded();
-  if (set.has(folderKey)) set.delete(folderKey);
-  else set.add(folderKey);
-  saveExpanded();
   openPanel.setExpandedKeys("sessions", Array.from(set));
-  // Re-render so the hint-bar padding tracks the tree's new height
-  // (see the `expand` widget_event mirror for the host-owned fold path).
   if (dockMode && openDialog) openPanel.update(buildDockSpec());
+}
+
+function toggleDockFolderExpansion(folderKey: string): void {
+  void setDockFolderExpansion(folderKey).catch(reportDockModelFailure);
 }
 
 // Reconcile the tree's host-owned expansion with the plugin's intent:
@@ -5021,16 +5678,18 @@ function dockMenuVisit(id: number): void {
   const s = orchestratorSessions.get(id);
   if (!s) return;
   if (s.discovered) {
-    // Visit "dives in" (like the live path below, which blurs to the
-    // editor), so attach with dive: true.
+    const activation = beginWorktreeActivation(
+      true,
+      openDialog?.dockSelKey ?? undefined,
+    );
     void attachToWorktree({
       root: s.root,
       projectPath: s.projectPath ?? s.root,
       label: s.label,
       branch: s.branch,
       discoveredId: s.id,
-      dive: true,
-    });
+      activation,
+    }).catch(() => {});
     return;
   }
   if (id > 0 && id !== editor.activeWindow()) editor.setActiveWindow(id);
@@ -5054,15 +5713,33 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
     const f = folderById(state.target.id);
     const label = f?.name ?? `[${state.target.id}]`;
     return col(
-      { kind: "raw", entries: [
-        styledRow([{ text: FOLDER_GLYPH + " " + label, style: { bold: true } }]),
-      ] },
-      button(editor.t("dock.ctx_rename"), { intent: "primary", key: "ctx-rename" }),
+      {
+        kind: "raw",
+        entries: [
+          styledRow([{
+            text: FOLDER_GLYPH + " " + label,
+            style: { bold: true },
+          }]),
+        ],
+      },
+      button(editor.t("dock.ctx_rename"), {
+        intent: "primary",
+        key: "ctx-rename",
+      }),
       button(editor.t("dock.ctx_new_subfolder"), { key: "ctx-new-subfolder" }),
-      button(editor.t("dock.ctx_delete_folder"), { intent: "danger", key: "ctx-delete-folder" }),
-      { kind: "raw", entries: [
-        styledRow([{ text: editor.t("dock.ctx_esc_close"), style: { fg: "ui.menu_disabled_fg" } }]),
-      ] },
+      button(editor.t("dock.ctx_delete_folder"), {
+        intent: "danger",
+        key: "ctx-delete-folder",
+      }),
+      {
+        kind: "raw",
+        entries: [
+          styledRow([{
+            text: editor.t("dock.ctx_esc_close"),
+            style: { fg: "ui.menu_disabled_fg" },
+          }]),
+        ],
+      },
     );
   }
   const sid = state.target.id;
@@ -5072,15 +5749,33 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
   // Archive. It offers Retry (when failed or paused) and Dismiss.
   if (s?.pending) {
     const items: WidgetSpec[] = [
-      { kind: "raw", entries: [styledRow([{ text: `${label}`, style: { bold: true } }])] },
+      {
+        kind: "raw",
+        entries: [styledRow([{ text: `${label}`, style: { bold: true } }])],
+      },
     ];
     if (pendingActionable(s.pending)) {
-      items.push(button(editor.t("dock.ctx_retry"), { intent: "primary", key: "ctx-retry" }));
+      items.push(
+        button(editor.t("dock.ctx_retry"), {
+          intent: "primary",
+          key: "ctx-retry",
+        }),
+      );
     }
-    items.push(button(editor.t("dock.ctx_dismiss"), { intent: "danger", key: "ctx-dismiss" }));
+    items.push(
+      button(editor.t("dock.ctx_dismiss"), {
+        intent: "danger",
+        key: "ctx-dismiss",
+      }),
+    );
     items.push({
       kind: "raw",
-      entries: [styledRow([{ text: editor.t("dock.ctx_esc_close"), style: { fg: "ui.menu_disabled_fg" } }])],
+      entries: [
+        styledRow([{
+          text: editor.t("dock.ctx_esc_close"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
+      ],
     });
     return col(...items);
   }
@@ -5092,17 +5787,33 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
   // host frames the box (its border) and sizes it to the widest of these
   // rows, so the popup hugs its items like a real context menu.
   return col(
-    { kind: "raw", entries: [
-      styledRow([{ text: `${label}`, style: { bold: true } }]),
-    ] },
+    {
+      kind: "raw",
+      entries: [
+        styledRow([{ text: `${label}`, style: { bold: true } }]),
+      ],
+    },
     button(editor.t("dock.ctx_visit"), { intent: "primary", key: "ctx-visit" }),
     button(editor.t("dock.ctx_rename"), { key: "ctx-rename-session" }),
     button(editor.t("dock.ctx_move"), { key: "ctx-move" }),
-    button(editor.t("dock.ctx_archive"), { key: "ctx-archive", disabled: !canArchive }),
-    button(editor.t("dock.ctx_delete"), { intent: "danger", key: "ctx-delete", disabled: !canDelete }),
-    { kind: "raw", entries: [
-      styledRow([{ text: editor.t("dock.ctx_esc_close"), style: { fg: "ui.menu_disabled_fg" } }]),
-    ] },
+    button(editor.t("dock.ctx_archive"), {
+      key: "ctx-archive",
+      disabled: !canArchive,
+    }),
+    button(editor.t("dock.ctx_delete"), {
+      intent: "danger",
+      key: "ctx-delete",
+      disabled: !canDelete,
+    }),
+    {
+      kind: "raw",
+      entries: [
+        styledRow([{
+          text: editor.t("dock.ctx_esc_close"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
+      ],
+    },
   );
 }
 
@@ -5142,7 +5853,9 @@ function openDockContextMenu(index: number, col: number, row: number): void {
     : { kind: "session", id: node.sessionId };
   // Align the dock's highlighted row with the right-clicked one so the
   // menu and the tree agree on the target.
-  openDialog.dockSelKey = openDialog.dockKeys[index] ?? openDialog.dockSelKey;
+  const nextKey = openDialog.dockKeys[index] ?? openDialog.dockSelKey;
+  if (nextKey !== openDialog.dockSelKey) invalidateWorktreeActivation();
+  openDialog.dockSelKey = nextKey;
   if (openPanel) openPanel.setSelectedIndex("sessions", index);
   dockMenuState = { target, anchorCol: col, anchorRow: row, stage: "menu" };
   if (!dockMenuPanel) dockMenuPanel = new FloatingWidgetPanel();
@@ -5283,14 +5996,15 @@ function scheduleDockSwitch(fromEdge: "top" | "bottom" | null): void {
     // 30 ms debounce above means scrolling *past* it without pausing
     // never spawns a session.
     if (sess?.discovered) {
+      const activation = captureDockWorktreeActivation(false);
       void attachToWorktree({
         root: sess.root,
         projectPath: sess.projectPath ?? sess.root,
         label: sess.label,
         branch: sess.branch,
         discoveredId: sess.id,
-        dive: false,
-      });
+        activation,
+      }).catch(() => {});
       return;
     }
     if (id <= 0) return;
@@ -5333,14 +6047,18 @@ function diveDockSelectionFromClick(fromEdge: "top" | "bottom" | null): void {
   // A discovered (on-disk) worktree has no live window — attach a fresh
   // session and dive in (attachToWorktree hands focus to the editor).
   if (sess?.discovered) {
+    const activation = beginWorktreeActivation(
+      true,
+      openDialog.dockSelKey ?? undefined,
+    );
     void attachToWorktree({
       root: sess.root,
       projectPath: sess.projectPath ?? sess.root,
       label: sess.label,
       branch: sess.branch,
       discoveredId: sess.id,
-      dive: true,
-    });
+      activation,
+    }).catch(() => {});
     return;
   }
   if (id > 0 && id !== editor.activeWindow()) {
@@ -5374,96 +6092,674 @@ function toggleDock(): void {
 
 registerHandler("orchestrator_dock_toggle", toggleDock);
 
-// Stop every process one session owns. Sends SIGTERM first via the
-// host's `signalWindow` (which fans out through the window's
-// process-group tracker), then follows up with SIGKILL after a short
-// grace period so ill-behaved agents that ignore SIGTERM still get
-// reaped. The session record stays put — Stop only kills processes,
-// it doesn't touch the worktree or the editor session. Returns false
-// for ids it can't stop (base session, discovered worktrees with no
-// live window).
+// Stop is one host transaction: it snapshots this window's exact terminal and
+// process incarnations, sends SIGTERM, closes those terminals, then escalates
+// only the captured process incarnations after the grace period.
 function stopOne(id: number): boolean {
-  const s = orchestratorSessions.get(id);
-  if (!s || id <= 0 || s.discovered || !s.terminalId) return false;
-  editor.signalWindow(id, "SIGTERM");
-  // SIGKILL fallback for agents that ignore SIGTERM. The host's
-  // signalWindow is idempotent on already-exited process groups, so
-  // the second call is safe whether or not the first one took.
-  // QuickJS has no `setTimeout`; `editor.delay(ms)` is the async
-  // sleep primitive, which we kick off but don't await.
-  void editor.delay(2000).then(() => {
-    editor.signalWindow(id, "SIGKILL");
-  });
-  return true;
+  const session = orchestratorSessions.get(id);
+  if (
+    !session || id <= 0 || session.discovered || session.terminalId === null
+  ) return false;
+  return (editor as typeof editor & {
+    stopWindow(id: number, graceMs: number): boolean;
+  }).stopWindow(id, 2000);
 }
 
 // ---------------------------------------------------------------------
-// Archive manifest — `<XDG>/orchestrator/<repo-slug>/archived.json`.
-// Records sessions that have been archived (stopped + worktree moved
-// to `.archived/`). Used today by the Archive action; Unarchive and
-// "Show archived" surface in a follow-up phase.
+// Durable archive/delete transactions.
+//
+// Archive metadata lives in the merge-on-key plugin state rather than a
+// label-derived file. The manifest is keyed by the canonical repository and
+// every mutation is protected by the same inter-process lease. A per-attempt
+// intent is durable before workspace persistence or git bookkeeping changes,
+// so startup can either recognize the published archive entry or roll the
+// unfinished operation back.
 // ---------------------------------------------------------------------
 
-interface ArchivedSession {
-  label: string;
-  /** Current path of the moved worktree, under `.archived/`. */
-  root: string;
-  /** Path the worktree lived at before archiving. */
-  original_root: string;
-  /** Branch the worktree was on. */
+interface WorkspacePersistenceSnapshot {
+  path: string;
+  content: string;
+  stableId: string | null;
+  quarantinePath?: string;
+  quiescedContent?: string;
+}
+
+interface WorktreeIdentity {
+  gitDir: string;
+  head: string;
   branch: string;
-  /** ISO 8601 timestamp of when the session was archived. */
+}
+
+interface ArchivedSession {
+  id: string;
+  identity: string;
+  repo_root: string;
+  label: string;
+  /** Current path of the moved worktree, under the private archive root. */
+  root: string;
+  /** Canonical path the worktree lived at before archiving. */
+  original_root: string;
+  stable_id?: string;
+  branch: string;
   archived_at: string;
+  /** Complete, quiesced workspace records needed to restore this session. */
+  workspace_bundle: WorkspacePersistenceSnapshot[];
 }
 
 interface ArchiveManifest {
-  version: number;
+  version: 2;
+  repo_root: string;
   sessions: ArchivedSession[];
 }
 
-function archiveManifestPath(repoRoot: string): string {
+type LifecycleIntentPhase =
+  | "prepared"
+  | "quarantined"
+  | "window_closed"
+  | "persistence_deleted"
+  | "moved"
+  | "committed";
+
+interface LifecycleIntent {
+  version: 1;
+  attemptId: string;
+  action: "archive" | "delete";
+  phase: LifecycleIntentPhase;
+  repoRoot: string;
+  originalRoot: string;
+  archivedRoot?: string;
+  removable: boolean;
+  stableId?: string;
+  forgetWholeRoot: boolean;
+  snapshots: WorkspacePersistenceSnapshot[];
+  worktreeIdentity?: WorktreeIdentity;
+  entry?: ArchivedSession;
+  /** Label and focus state needed to recreate the exact closed workspace. */
+  label?: string;
+  reopenOnRollback?: boolean;
+  activateOnRollback?: boolean;
+  remote?: boolean;
+}
+
+const ARCHIVE_MANIFEST_PREFIX = "orchestrator.archive_manifest:";
+const LIFECYCLE_INTENT_PREFIX = "orchestrator.lifecycle_intent:";
+
+function archiveManifestKey(repoRoot: string): string {
+  return ARCHIVE_MANIFEST_PREFIX + encodeURIComponent(normRoot(repoRoot));
+}
+
+function lifecycleIntentKey(attemptId: string): string {
+  return LIFECYCLE_INTENT_PREFIX + attemptId;
+}
+
+function inspectArchiveManifest(repoRoot: string): ArchiveManifest | null {
+  const canonical = normRoot(repoRoot);
+  const state = inspectPersistedPluginState();
+  if (state === null) return null;
+  const key = archiveManifestKey(canonical);
+  if (!Object.prototype.hasOwnProperty.call(state, key)) {
+    return { version: 2, repo_root: canonical, sessions: [] };
+  }
+  const value = state[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 2 || typeof record.repo_root !== "string" ||
+    normRoot(record.repo_root) !== canonical || !Array.isArray(record.sessions)
+  ) return null;
+  const sessions: ArchivedSession[] = [];
+  for (const value of record.sessions) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const candidate = value as Record<string, unknown>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.identity !== "string" ||
+      typeof candidate.repo_root !== "string" ||
+      normRoot(candidate.repo_root) !== canonical ||
+      typeof candidate.label !== "string" ||
+      typeof candidate.root !== "string" ||
+      typeof candidate.original_root !== "string" ||
+      typeof candidate.branch !== "string" ||
+      typeof candidate.archived_at !== "string" ||
+      !Array.isArray(candidate.workspace_bundle) ||
+      !candidate.workspace_bundle.every((snapshot) => {
+        if (
+          !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)
+        ) {
+          return false;
+        }
+        const item = snapshot as Record<string, unknown>;
+        return typeof item.path === "string" &&
+          typeof item.content === "string" &&
+          (item.stableId === null || typeof item.stableId === "string");
+      })
+    ) return null;
+    sessions.push(candidate as unknown as ArchivedSession);
+  }
+  return { version: 2, repo_root: canonical, sessions };
+}
+
+async function saveArchiveManifest(
+  manifest: ArchiveManifest,
+): Promise<boolean> {
+  return await setDurableState(
+    archiveManifestKey(manifest.repo_root),
+    manifest,
+  );
+}
+function legacyArchiveSlug(repoRoot: string): string {
+  return normRoot(repoRoot).replace(/^[\\/]+/, "").replace(/[\\/]+/g, "_");
+}
+
+function legacyArchiveManifestPaths(repoRoot: string): string[] {
+  const slug = legacyArchiveSlug(repoRoot);
+  const dataDir = editor.getDataDir();
+  return [
+    editor.pathJoin(dataDir, "orchestrator", slug, "archived.json"),
+    editor.pathJoin(dataDir, "conductor", slug, "archived.json"),
+  ];
+}
+
+function parseLegacyArchiveManifest(
+  content: string,
+  repoRoot: string,
+): ArchivedSession[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const manifest = parsed as Record<string, unknown>;
+  if (manifest.version !== 1 || !Array.isArray(manifest.sessions)) return null;
+  const canonicalRepo = normRoot(repoRoot);
+  const imported: ArchivedSession[] = [];
+  for (const value of manifest.sessions) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const entry = value as Record<string, unknown>;
+    if (
+      typeof entry.label !== "string" ||
+      typeof entry.root !== "string" || entry.root.length === 0 ||
+      typeof entry.original_root !== "string" ||
+      entry.original_root.length === 0 ||
+      typeof entry.branch !== "string" ||
+      typeof entry.archived_at !== "string" || entry.archived_at.length === 0
+    ) return null;
+    const originalRoot = normRoot(entry.original_root);
+    imported.push({
+      id: `legacy:${encodeURIComponent(originalRoot)}:${
+        encodeURIComponent(entry.archived_at)
+      }`,
+      identity: `root:${originalRoot}`,
+      repo_root: canonicalRepo,
+      label: entry.label,
+      root: normRoot(entry.root),
+      original_root: originalRoot,
+      branch: entry.branch,
+      archived_at: entry.archived_at,
+      workspace_bundle: [],
+    });
+  }
+  return imported;
+}
+
+function retireLegacyArchiveManifest(path: string): boolean {
+  if (!editor.fileExists(editor.localPath(path))) return true;
+  for (let suffix = 0; suffix < 10_000; suffix++) {
+    const retired = suffix === 0
+      ? `${path}.migrated.bak`
+      : `${path}.migrated-${suffix}.bak`;
+    if (editor.fileExists(editor.localPath(retired))) continue;
+    return editor.renamePath(editor.localPath(path), editor.localPath(retired));
+  }
+  return false;
+}
+
+async function importLegacyArchiveManifests(
+  repoRoot: string,
+  fence: LifecycleFence,
+): Promise<ArchiveManifest | null> {
+  const current = inspectArchiveManifest(repoRoot);
+  if (!current) return null;
+  const sessions = [...current.sessions];
+  const validSources: string[] = [];
+  let changed = false;
+  for (const path of legacyArchiveManifestPaths(repoRoot)) {
+    const content = editor.readFile(editor.localPath(path));
+    if (content === null) continue;
+    const imported = parseLegacyArchiveManifest(content, repoRoot);
+    if (!imported) continue;
+    validSources.push(path);
+    for (const entry of imported) {
+      if (
+        sessions.some((existing) =>
+          existing.id === entry.id || existing.identity === entry.identity
+        )
+      ) continue;
+      sessions.push(entry);
+      changed = true;
+    }
+  }
+  const next = changed
+    ? { version: 2 as const, repo_root: normRoot(repoRoot), sessions }
+    : current;
+  if (changed && !(await fence.wait(() => saveArchiveManifest(next)))) {
+    return null;
+  }
+  for (const path of validSources) {
+    // Retirement is best-effort. If it fails, the durable v2 entries dedupe a
+    // retry and the legacy source remains available for a later attempt.
+    fence.mutate(() => retireLegacyArchiveManifest(path));
+  }
+  return next;
+}
+
+async function saveLifecycleIntent(intent: LifecycleIntent): Promise<boolean> {
+  return await setDurableState(lifecycleIntentKey(intent.attemptId), intent);
+}
+
+async function clearLifecycleIntent(attemptId: string): Promise<boolean> {
+  return await setDurableState(lifecycleIntentKey(attemptId), null);
+}
+interface LifecyclePersistenceApi {
+  inspectWorkspacePersistence(
+    root: string,
+  ): Promise<WorkspacePersistenceSnapshot[]>;
+  inspectWorkspaceCreateAttempt(
+    attemptId: string,
+    rootHint: string | null,
+    workspaceIdHint: string | null,
+  ): Promise<
+    | { status: "found"; root: string; workspaceId: string }
+    | { status: "not_found" }
+    | { status: "error"; message: string }
+  >;
+  forgetWorkspacePersistence(
+    root: string,
+    stableId: string | null,
+  ): Promise<void>;
+  acquireWorkspaceRootOwnership(root: string, ownerId: string): Promise<void>;
+  releaseWorkspaceRootOwnership(ownerId: string): Promise<void>;
+  quarantineWorkspaceArtifacts(
+    root: string,
+    stableId: string | null,
+    ownerId: string,
+  ): Promise<void>;
+  restoreWorkspaceArtifacts(
+    targetRoot: string,
+    stableId: string | null,
+    ownerId: string,
+  ): Promise<void>;
+  purgeWorkspaceArtifactQuarantine(ownerId: string): Promise<void>;
+  restoreWorkspaceWindow(
+    root: string,
+    label: string,
+    stableId: string | null,
+    activate: boolean,
+  ): Promise<{ windowId: number; stableId: string }>;
+}
+
+const lifecyclePersistenceEditor = editor as
+  & typeof editor
+  & LifecyclePersistenceApi;
+
+class LifecycleFence {
+  private readonly heartbeats: LeaseHeartbeat[];
+
+  constructor(...heartbeats: (LeaseHeartbeat | null)[]) {
+    this.heartbeats = heartbeats.filter((
+      heartbeat,
+    ): heartbeat is LeaseHeartbeat => heartbeat !== null);
+  }
+
+  assertOwned(): void {
+    for (const heartbeat of this.heartbeats) heartbeat.assertOwned();
+  }
+
+  async wait<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertOwned();
+    const result = await operation();
+    this.assertOwned();
+    return result;
+  }
+
+  mutate<T>(operation: () => T): T {
+    this.assertOwned();
+    const result = operation();
+    this.assertOwned();
+    return result;
+  }
+}
+
+async function inspectWorkspacePersistence(
+  root: string,
+): Promise<WorkspacePersistenceSnapshot[]> {
+  const snapshots = await lifecyclePersistenceEditor
+    .inspectWorkspacePersistence(root);
+  return snapshots.map((snapshot) => ({
+    path: snapshot.path,
+    content: snapshot.content,
+    stableId: snapshot.stableId,
+  }));
+}
+
+function quiesceWorkspaceContent(content: string): string {
+  const workspace = JSON.parse(content) as Record<string, unknown>;
+  if (Array.isArray(workspace.terminals)) {
+    for (const value of workspace.terminals) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        (value as Record<string, unknown>).exited = { exit_code: null };
+      }
+    }
+  }
+  return JSON.stringify(workspace);
+}
+
+function lifecycleQuarantinePath(attemptId: string, index: number): string {
   return editor.pathJoin(
     editor.getDataDir(),
     "orchestrator",
-    slugify(repoRoot),
-    "archived.json",
+    "lifecycle-quarantine",
+    attemptId,
+    `${index}.json`,
   );
 }
 
-function loadArchiveManifest(repoRoot: string): ArchiveManifest {
-  const path = archiveManifestPath(repoRoot);
-  const raw = editor.readFile(editor.localPath(path));
-  if (!raw) return { version: 1, sessions: [] };
-  try {
-    const parsed = JSON.parse(raw);
-    if (
-      parsed && typeof parsed === "object" &&
-      Array.isArray(parsed.sessions)
-    ) {
-      return parsed as ArchiveManifest;
-    }
-  } catch (_) {
-    // Fall through to fresh manifest — bad data shouldn't
-    // brick the dialog.
+function prepareLifecycleSnapshots(
+  snapshots: WorkspacePersistenceSnapshot[],
+  attemptId: string,
+): WorkspacePersistenceSnapshot[] {
+  return snapshots.map((snapshot, index) => ({
+    ...snapshot,
+    quarantinePath: lifecycleQuarantinePath(attemptId, index),
+    quiescedContent: quiesceWorkspaceContent(snapshot.content),
+  }));
+}
+
+function archiveWorkspaceBundle(
+  snapshots: WorkspacePersistenceSnapshot[],
+): WorkspacePersistenceSnapshot[] {
+  return snapshots.map((snapshot) => ({
+    path: snapshot.path,
+    content: snapshot.quiescedContent ?? snapshot.content,
+    stableId: snapshot.stableId,
+  }));
+}
+
+
+function hasPersistedCoTenant(
+  session: AgentSession,
+  snapshots: WorkspacePersistenceSnapshot[],
+): boolean {
+  if (snapshots.length === 0) return false;
+  if (!session.stableId) {
+    // A live legacy workspace can identify its sole id-less snapshot. A
+    // discovered row has no identity to distinguish that file from a dormant
+    // co-tenant, so it must not move/remove the root.
+    return !!session.discovered || snapshots.length > 1 ||
+      snapshots.some((snapshot) => snapshot.stableId !== null);
   }
-  return { version: 1, sessions: [] };
+  return snapshots.some((snapshot) => snapshot.stableId !== session.stableId);
 }
 
-function saveArchiveManifest(repoRoot: string, m: ArchiveManifest): boolean {
-  const path = archiveManifestPath(repoRoot);
-  const dir = editor.pathDirname(path);
-  if (!editor.createDir(editor.localPath(dir))) return false;
-  return editor.writeFile(editor.localPath(path), JSON.stringify(m, null, 2));
+function persistencePlan(
+  session: AgentSession,
+  removable: boolean,
+  all: WorkspacePersistenceSnapshot[],
+): { wholeRoot: boolean; snapshots: WorkspacePersistenceSnapshot[] } | null {
+  // Prefer exact identity even when the root itself will be removed. A
+  // co-tenant created between the guard and this delete must survive so the
+  // final pre-git check can observe it and refuse the destructive mutation.
+  if (session.stableId) {
+    return {
+      wholeRoot: false,
+      snapshots: all.filter((snapshot) =>
+        snapshot.stableId === session.stableId
+      ),
+    };
+  }
+  if (removable) {
+    // A discovered worktree has no workspace identity of its own to forget.
+    // Deleting nothing lets the final tenant check catch any workspace that
+    // appears during the transaction instead of erasing it root-wide.
+    return session.discovered ? { wholeRoot: false, snapshots: [] } : null;
+  }
+  // Without a durable id, the only safe exact operation is a whole-root
+  // forget, and only when there is no evidence of a sibling identity.
+  if (
+    hasLiveCoTenant(session) || all.length > 1 ||
+    all.some((snapshot) => snapshot.stableId !== null)
+  ) return null;
+  return { wholeRoot: true, snapshots: all };
 }
 
-// Pick a session id to make active so that `excludeId` can be
-// closed. `close_window` refuses to close the active window, so
-// archive/delete of the currently-active session needs to switch
-// away first. Prefers a session already visible in the open
-// dialog's current filter (keeps the user in roughly the same
-// project context they were browsing), falls back to the base
-// session — which always exists and can't itself be archived /
-// deleted, so this is guaranteed to return a valid target.
+async function forgetWorkspacePersistenceByIdentity(
+  root: string,
+  stableId: string | null,
+  fence?: LifecycleFence,
+): Promise<boolean> {
+  const wait = <T>(operation: () => Promise<T>): Promise<T> =>
+    fence ? fence.wait(operation) : operation();
+  // Window closure is observable before the host finishes draining terminal
+  // ownership. Preserve the durable intent and retry only host rejection;
+  // once a delete resolves, strict inventory is the authoritative ack.
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      await wait(() =>
+        lifecyclePersistenceEditor.forgetWorkspacePersistence(root, stableId)
+      );
+      const remaining = await wait(() => inspectWorkspacePersistence(root));
+      return stableId === null
+        ? remaining.length === 0
+        : !remaining.some((snapshot) => snapshot.stableId === stableId);
+    } catch {
+      fence?.assertOwned();
+      if (Date.now() >= deadline) return false;
+      await wait(() => editor.delay(25));
+    }
+  }
+}
+
+async function forgetWorkspacePersistence(
+  intent: LifecycleIntent,
+  fence: LifecycleFence,
+): Promise<boolean> {
+  if (!intent.forgetWholeRoot && intent.stableId === undefined) {
+    return intent.snapshots.length === 0;
+  }
+  return await forgetWorkspacePersistenceByIdentity(
+    intent.originalRoot,
+    intent.forgetWholeRoot ? null : intent.stableId!,
+    fence,
+  );
+}
+
+function quarantineWorkspacePersistence(
+  intent: LifecycleIntent,
+): string | null {
+  for (const snapshot of intent.snapshots) {
+    const quarantinePath = snapshot.quarantinePath;
+    if (!quarantinePath) {
+      return `snapshot ${snapshot.path} has no quarantine path`;
+    }
+    if (
+      !editor.createDir(
+        editor.localPath(editor.pathDirname(quarantinePath)),
+      )
+    ) return `could not create quarantine directory for ${snapshot.path}`;
+    const original = editor.readFile(editor.localPath(snapshot.path));
+    const quarantined = editor.readFile(editor.localPath(quarantinePath));
+    if (original === null) {
+      if (quarantined !== snapshot.content) {
+        return `workspace snapshot disappeared before quarantine: ${snapshot.path}`;
+      }
+      continue;
+    }
+    if (original !== snapshot.content) {
+      return `workspace snapshot changed before quarantine: ${snapshot.path}`;
+    }
+    if (quarantined !== null) {
+      return `workspace quarantine path already exists: ${quarantinePath}`;
+    }
+    if (
+      !editor.renamePath(
+        editor.localPath(snapshot.path),
+        editor.localPath(quarantinePath),
+      )
+    ) {
+      return `could not move workspace snapshot to quarantine: ${snapshot.path}`;
+    }
+    if (
+      editor.readFile(editor.localPath(quarantinePath)) !== snapshot.content
+    ) {
+      return `quarantined workspace snapshot failed verification: ${snapshot.path}`;
+    }
+  }
+  return null;
+}
+
+function restoreWorkspacePersistence(intent: LifecycleIntent): boolean {
+  let ok = true;
+  for (const snapshot of intent.snapshots) {
+    // Rollback is exact: the original bytes win, never the archive's quiesced
+    // representation. This includes terminal liveness and every plugin field.
+    const desired = snapshot.content;
+    const current = editor.readFile(editor.localPath(snapshot.path));
+    if (current === desired) {
+      if (snapshot.quarantinePath) {
+        editor.removePath(editor.localPath(snapshot.quarantinePath));
+      }
+      continue;
+    }
+    if (current !== null) {
+      ok = false;
+      continue;
+    }
+    const quarantinePath = snapshot.quarantinePath;
+    const quarantined = quarantinePath
+      ? editor.readFile(editor.localPath(quarantinePath))
+      : null;
+    if (quarantined !== null && quarantined !== snapshot.content) {
+      ok = false;
+      continue;
+    }
+    if (
+      !editor.createDir(editor.localPath(editor.pathDirname(snapshot.path)))
+    ) {
+      ok = false;
+      continue;
+    }
+    if (quarantined === desired && quarantinePath) {
+      ok = editor.renamePath(
+        editor.localPath(quarantinePath),
+        editor.localPath(snapshot.path),
+      ) && ok;
+      continue;
+    }
+    const temporary = `${snapshot.path}.restore-${intent.attemptId}`;
+    editor.removePath(editor.localPath(temporary));
+    if (
+      !editor.writeFile(editor.localPath(temporary), desired) ||
+      !editor.renamePath(
+        editor.localPath(temporary),
+        editor.localPath(snapshot.path),
+      )
+    ) {
+      editor.removePath(editor.localPath(temporary));
+      ok = false;
+      continue;
+    }
+    if (quarantinePath) editor.removePath(editor.localPath(quarantinePath));
+  }
+  return ok;
+}
+function discardLifecycleQuarantine(intent: LifecycleIntent): void {
+  for (const snapshot of intent.snapshots) {
+    if (snapshot.quarantinePath) {
+      editor.removePath(editor.localPath(snapshot.quarantinePath));
+    }
+  }
+}
+
+function identityStorageHash(identity: string): string {
+  let forward = 0x811c9dc5;
+  let reverse = 0x9e3779b9;
+  for (let index = 0; index < identity.length; index++) {
+    forward = Math.imul(forward ^ identity.charCodeAt(index), 0x01000193) >>> 0;
+    reverse = Math.imul(
+      reverse ^ identity.charCodeAt(identity.length - index - 1),
+      0x01000193,
+    ) >>> 0;
+  }
+  return forward.toString(16).padStart(8, "0") +
+    reverse.toString(16).padStart(8, "0");
+}
+
+function identityStoragePath(base: string, identity: string): string {
+  const encoded = encodeURIComponent(identity);
+  const key = encoded.length <= 64
+    ? `v-${encoded}`
+    : `h-${identityStorageHash(encoded)}`;
+  return editor.pathJoin(base, `k-${key}`);
+}
+
+function archiveRepositoryDir(repoRoot: string): string | null {
+  const directory = identityStoragePath(
+    editor.pathJoin(editor.getDataDir(), "orchestrator", "archives"),
+    normRoot(repoRoot),
+  );
+  if (!editor.createDir(editor.localPath(directory))) return null;
+  const identityPath = editor.pathJoin(directory, "repo.json");
+  const canonical = normRoot(repoRoot);
+  const existing = editor.readFile(editor.localPath(identityPath));
+  if (existing !== null) {
+    try {
+      const identity = JSON.parse(existing) as Record<string, unknown>;
+      return typeof identity.repo_root === "string" &&
+          normRoot(identity.repo_root) === canonical
+        ? directory
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  return editor.writeFile(
+      editor.localPath(identityPath),
+      JSON.stringify({ version: 1, repo_root: canonical }),
+    )
+    ? directory
+    : null;
+}
+
+function archivedSessionIdentity(session: AgentSession): string {
+  return session.stableId
+    ? `workspace:${session.stableId}`
+    : `root:${normRoot(session.root)}`;
+}
+function removeLifecycleSession(
+  session: AgentSession,
+  removable: boolean,
+): void {
+  for (const [id, candidate] of [...orchestratorSessions.entries()]) {
+    if (
+      id === session.id ||
+      (removable && !!candidate.discovered &&
+        normRoot(candidate.root) === normRoot(session.root))
+    ) {
+      orchestratorSessions.delete(id);
+    }
+  }
+  if (removable || session.discovered) discoveredIdByPath.delete(session.root);
+}
+
 function pickNextActiveSession(excludeId: number): number {
   if (openDialog) {
     const inFilter = openDialog.filteredIds.find(
@@ -5471,87 +6767,291 @@ function pickNextActiveSession(excludeId: number): number {
     );
     if (typeof inFilter === "number") return inFilter;
   }
-  for (const sid of orchestratorSessions.keys()) {
-    if (sid !== excludeId && sid > 0) return sid;
+  for (const window of editor.listWindows()) {
+    if (window.id !== excludeId) return window.id;
   }
-  // No other live window. Callers guard against closing the last
-  // window before reaching here, so this is a safe no-op swap (id 1
-  // is no longer guaranteed to exist — it's deletable like any other).
   return excludeId;
 }
 
-// Number of real editor windows. Discovered on-disk rows have negative
-// ids and are not windows. The editor must always host at least one
-// window; archiving/deleting the last live window therefore opens a
-// replacement first (see `ensureReplacementWindow`).
 function liveWindowCount(): number {
-  let n = 0;
-  for (const s of orchestratorSessions.values()) {
-    if (s.id > 0) n += 1;
-  }
-  return n;
+  return editor.listWindows().length;
 }
 
-// Closing the last live window would leave the editor with nothing to
-// show, so before archiving/deleting the sole remaining session we open
-// a fresh terminal session in `projectRoot` — the project that session
-// belonged to, i.e. "the last project" — and dive into it. The new
-// window becomes active, so the caller can then close the old one
-// normally. No-op when another live window already exists (the caller
-// just switches to it instead). Returns true when a replacement opened.
-async function ensureReplacementWindow(projectRoot: string): Promise<boolean> {
-  if (liveWindowCount() > 1) return false;
+async function waitForActiveWindow(
+  windowId: number,
+  fence?: LifecycleFence,
+): Promise<boolean> {
+  const deadline = Date.now() + 5000;
+  while (editor.activeWindow() !== windowId) {
+    if (Date.now() >= deadline) return false;
+    if (fence) await fence.wait(() => editor.delay(10));
+    else await editor.delay(10);
+  }
+  return true;
+}
+
+// Return true only once the host has another active window. Callers may then
+// close their target without relying on a queued create/switch command.
+async function ensureReplacementWindow(
+  projectRoot: string,
+  fence: LifecycleFence,
+): Promise<boolean> {
+  if (liveWindowCount() > 1) return true;
   const label = editor.pathBasename(projectRoot) || "session";
   try {
-    const result = await editor.createWindowWithTerminal({
-      root: projectRoot,
-      label,
-      cwd: projectRoot,
-      // Always mint the workspace's capability token (see runLocalCreate).
-      allowScript: FRESH_CLI_ALLOW_SCRIPT,
-    });
-    // `createWindowWithTerminal` fires `window_created`, which reconciles
-    // the new window into the model; set it eagerly too so the immediate
-    // close-and-switch below sees a second live window.
-    orchestratorSessions.set(result.windowId, {
-      id: result.windowId,
-      stableId: result.stableId || undefined,
-      label,
-      hostLabel: label,
-      root: projectRoot,
-      projectPath: projectRoot,
-      sharedWorktree: false,
-      terminalId: result.terminalId,
-      state: "idle",
-      lastOutputAt: null,
-      createdAt: Date.now(),
-    });
-    return true;
-  } catch (e) {
+    const result = await fence.wait(() =>
+      editor.createWindowWithTerminal({
+        root: projectRoot,
+        label,
+        cwd: projectRoot,
+        allowScript: FRESH_CLI_ALLOW_SCRIPT,
+        selectedAgent: true,
+        activate: true,
+        initialState: {
+          project_path: projectRoot,
+          shared_worktree: true,
+        },
+      })
+    );
+    fence.mutate(() =>
+      publishLiveSession({
+        id: result.windowId,
+        stableId: result.stableId || undefined,
+        label,
+        hostLabel: label,
+        root: projectRoot,
+        projectPath: projectRoot,
+        sharedWorktree: true,
+        terminalId: result.terminalId,
+        lastOutputAt: null,
+        createdAt: Date.now(),
+      })
+    );
+    return await waitForActiveWindow(result.windowId, fence);
+  } catch (error) {
+    fence.assertOwned();
     editor.setStatus(
       editor.t("status.replacement_failed", {
-        error: e instanceof Error ? e.message : String(e),
+        error: error instanceof Error ? error.message : String(error),
       }),
     );
     return false;
   }
 }
 
-// Resolve the *main* repo root a session's worktree belongs to, so
-// `git worktree move/remove` runs from a stable directory (never from
-// inside the tree being moved/removed). Prefers the canonical
-// `projectPath` recorded at create/discovery time, falling back to
-// resolving from the worktree itself.
-async function worktreeRepoRoot(s: AgentSession): Promise<string | null> {
-  // `projectPath` is the canonical repo root when the session is a
-  // worktree of a separate project, and equals `root` otherwise (the
-  // host normalises absence → root). Resolve once; if the canonical
-  // path is unavailable (non-git, etc.), fall back to `root` so the
-  // caller still gets something to dedupe against.
-  const r = await resolveCanonicalRepoRoot(s.projectPath);
-  if (r) return r;
-  if (s.projectPath !== s.root) {
-    return await resolveCanonicalRepoRoot(s.root);
+async function prepareLifecycleWindow(
+  session: AgentSession,
+  fence: LifecycleFence,
+): Promise<string | null> {
+  if (session.discovered || session.id <= 0) return null;
+  let replacementRoot = session.projectPath || session.root;
+  if (session.remote) {
+    replacementRoot = editor.pathJoin(
+      editor.getDataDir(),
+      "orchestrator",
+      "replacement-workspace",
+    );
+    if (
+      !fence.mutate(() => editor.createDir(editor.localPath(replacementRoot)))
+    ) {
+      return "could not establish a safe local replacement workspace";
+    }
+  }
+  if (!(await ensureReplacementWindow(replacementRoot, fence))) {
+    return "could not open an acknowledged replacement workspace";
+  }
+  if (session.id === editor.activeWindow()) {
+    const next = pickNextActiveSession(session.id);
+    if (
+      next === session.id ||
+      !fence.mutate(() => editor.setActiveWindow(next)) ||
+      !(await waitForActiveWindow(next, fence))
+    ) return "could not switch away from the workspace";
+  }
+  return null;
+}
+
+async function closePreparedLifecycleWindow(
+  session: AgentSession,
+  fence: LifecycleFence,
+): Promise<string | null> {
+  if (session.discovered || session.id <= 0) return null;
+  const accepted = fence.mutate(() => {
+    closingWindowIds.add(session.id);
+    if (editor.closeWindow(session.id)) return true;
+    closingWindowIds.delete(session.id);
+    return false;
+  });
+  if (!accepted) return "the editor refused to close the workspace";
+  const deadline = Date.now() + 10_000;
+  while (
+    editor.listWindows().some((window) => window.id === session.id) ||
+    closingWindowIds.has(session.id)
+  ) {
+    if (Date.now() >= deadline) {
+      return "the editor did not acknowledge closing the workspace";
+    }
+    await fence.wait(() => editor.delay(10));
+  }
+  return null;
+}
+
+async function validateLifecycleWorktree(
+  repoRoot: string,
+  root: string,
+  fence: LifecycleFence,
+): Promise<string | null> {
+  const listed = await fence.wait(() => listLinkedWorktrees(repoRoot));
+  if (!listed) return editor.t("err.not_git_repo");
+  const worktree = listed.worktrees.find((entry) =>
+    normRoot(entry.path) === normRoot(root)
+  );
+  if (!worktree) return "the worktree is no longer registered";
+  if (worktree.locked) return "the worktree is locked";
+  if (worktree.prunable) {
+    return "the worktree is prunable and cannot be mutated safely";
+  }
+  return null;
+}
+
+async function captureWorktreeIdentity(
+  repoRoot: string,
+  root: string,
+  fence: LifecycleFence,
+): Promise<WorktreeIdentity | null> {
+  const listed = await fence.wait(() => listLinkedWorktrees(repoRoot));
+  const worktree = listed?.worktrees.find((entry) =>
+    normRoot(entry.path) === normRoot(root)
+  );
+  if (!worktree || worktree.locked || worktree.prunable) return null;
+  const [gitDir, head] = await fence.wait(() =>
+    Promise.all([
+      spawnCollect(
+        "git",
+        ["-C", root, "rev-parse", "--absolute-git-dir"],
+        root,
+      ),
+      spawnCollect("git", ["-C", root, "rev-parse", "HEAD"], root),
+    ])
+  );
+  if (gitDir.exit_code !== 0 || head.exit_code !== 0) return null;
+  return {
+    gitDir: normRoot((gitDir.stdout || "").trim()),
+    head: (head.stdout || "").trim(),
+    branch: worktree.branch || "",
+  };
+}
+
+async function worktreeIdentityMatches(
+  intent: LifecycleIntent,
+  fence: LifecycleFence,
+): Promise<boolean> {
+  if (!intent.removable || !intent.worktreeIdentity) return !intent.removable;
+  const current = await captureWorktreeIdentity(
+    intent.repoRoot,
+    intent.originalRoot,
+    fence,
+  );
+  return !!current && current.gitDir === intent.worktreeIdentity.gitDir &&
+    current.head === intent.worktreeIdentity.head &&
+    current.branch === intent.worktreeIdentity.branch;
+}
+
+async function rollbackUncommittedLifecycle(
+  intent: LifecycleIntent,
+  fence: LifecycleFence,
+): Promise<boolean> {
+  fence.assertOwned();
+  if (
+    intent.action === "archive" && intent.archivedRoot &&
+    editor.fileExists(editor.localPath(intent.archivedRoot))
+  ) {
+    if (editor.fileExists(editor.localPath(intent.originalRoot))) return false;
+    const movedBack = await fence.wait(() =>
+      spawnCollect(
+        "git",
+        [
+          "-C",
+          intent.repoRoot,
+          "worktree",
+          "move",
+          intent.archivedRoot!,
+          intent.originalRoot,
+        ],
+        intent.repoRoot,
+      )
+    );
+    if (movedBack.exit_code !== 0) return false;
+  }
+  if (
+    intent.removable
+      ? !(await worktreeIdentityMatches(intent, fence))
+      : !intent.remote &&
+        !editor.fileExists(editor.localPath(intent.originalRoot))
+  ) return false;
+  if (!fence.mutate(() => restoreWorkspacePersistence(intent))) return false;
+
+  if (intent.forgetWholeRoot || intent.stableId !== undefined) {
+    const stableId = intent.forgetWholeRoot ? null : intent.stableId!;
+    try {
+      // Quarantine is idempotent. Repeating it first makes rollback robust to
+      // a crash between the artifact move and the corresponding intent write.
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.quarantineWorkspaceArtifacts(
+          intent.originalRoot,
+          stableId,
+          intent.attemptId,
+        )
+      );
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.restoreWorkspaceArtifacts(
+          intent.originalRoot,
+          stableId,
+          intent.attemptId,
+        )
+      );
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.purgeWorkspaceArtifactQuarantine(
+          intent.attemptId,
+        )
+      );
+    } catch {
+      fence.assertOwned();
+      return false;
+    }
+  }
+  if (intent.reopenOnRollback) {
+    try {
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.restoreWorkspaceWindow(
+          intent.originalRoot,
+          intent.label || editor.pathBasename(intent.originalRoot) ||
+            "workspace",
+          intent.stableId ?? null,
+          !!intent.activateOnRollback,
+        )
+      );
+    } catch {
+      fence.assertOwned();
+      return false;
+    }
+  }
+  try {
+    await fence.wait(() =>
+      lifecyclePersistenceEditor.releaseWorkspaceRootOwnership(intent.attemptId)
+    );
+  } catch {
+    fence.assertOwned();
+    return false;
+  }
+  return await fence.wait(() => clearLifecycleIntent(intent.attemptId));
+}
+
+async function worktreeRepoRoot(session: AgentSession): Promise<string | null> {
+  const project = await resolveCanonicalRepoRoot(session.projectPath);
+  if (project) return project;
+  if (session.projectPath !== session.root) {
+    return await resolveCanonicalRepoRoot(session.root);
   }
   return null;
 }
@@ -5560,404 +7060,984 @@ interface LifecycleResult {
   ok: boolean;
   err?: string;
   repoRoot?: string;
+  attention?: string;
 }
 
-// Archive a single session: SIGKILL its processes (archive is a
-// "done with this for now" action — no graceful teardown needed since
-// the worktree stays on disk), close the editor session, move the
-// worktree to the `.archived/` graveyard, and append a manifest
-// entry so Unarchive can reverse it. Handles both live sessions and
-// discovered on-disk worktrees (the latter have no window to close).
-// Does NOT trigger sync — the caller batches one sync per repo after
-// the whole run.
 async function archiveOne(id: number): Promise<LifecycleResult> {
-  const s = orchestratorSessions.get(id);
-  if (!s) return { ok: false, err: editor.t("err.workspace_gone") };
-  const removable = ownsWorktree(s);
-
-  // Live session: the editor must always host a window. If this is the
-  // only one, open a replacement in its project first; then switch away
-  // (close_window refuses the active window), SIGKILL the process group
-  // so pty children release any worktree locks, and close the session.
-  if (!s.discovered && id > 0) {
-    await ensureReplacementWindow(s.projectPath ?? s.root);
-    if (id === editor.activeWindow()) {
-      editor.setActiveWindow(pickNextActiveSession(id));
-    }
-    if (s.terminalId) editor.signalWindow(id, "SIGKILL");
-    // Tombstone before the (async) close so a mid-archive
-    // `refreshOpenDialog` doesn't reconcile the workspace back in from the
-    // still-stale window snapshot.
-    closingWindowIds.add(id);
-    editor.closeWindow(id);
-    // Brief settle so the filesystem reflects the pty's exit before we
-    // move the worktree out from under it.
-    if (removable) await editor.delay(250);
+  const session = orchestratorSessions.get(id);
+  if (!session) return { ok: false, err: editor.t("err.workspace_gone") };
+  const removable = ownsWorktree(session);
+  if (!removable) {
+    return { ok: false, err: "this workspace does not own a linked worktree" };
   }
+  const repoRoot = await worktreeRepoRoot(session);
+  if (!repoRoot) return { ok: false, err: editor.t("err.not_git_repo") };
 
-  if (removable) {
-    // Owns a worktree: move it to the `.archived/` graveyard so git's
-    // bookkeeping stays consistent and Unarchive can move it back.
-    const repoRoot = await worktreeRepoRoot(s);
-    if (!repoRoot) return { ok: false, err: editor.t("err.not_git_repo") };
-    const archivedRoot = editor.pathJoin(
-      editor.getDataDir(),
-      "orchestrator",
-      slugify(repoRoot),
-      ".archived",
-      s.label,
+  const manifestLease = await acquireLease(
+    `archive-manifest:${normRoot(repoRoot)}`,
+    10_000,
+  );
+  if (!manifestLease) {
+    return { ok: false, err: "the archive manifest is busy", repoRoot };
+  }
+  const manifestHeartbeat = startLeaseHeartbeat(
+    () => renewLease(manifestLease),
+    (milliseconds) => editor.delay(milliseconds),
+    LEASE_TTL_MS,
+    "archive manifest transaction",
+  );
+  let targetLease: InterprocessLease | null = null;
+  let targetHeartbeat: LeaseHeartbeat | null = null;
+  let fence: LifecycleFence | null = null;
+  let intent: LifecycleIntent | null = null;
+  let rootOwned = false;
+  let manifestPublished = false;
+  try {
+    manifestHeartbeat.assertOwned();
+    targetLease = await acquireLease(
+      `workspace-target:${normRoot(session.root)}`,
+      10_000,
     );
-    const parent = editor.pathDirname(archivedRoot);
-    if (!editor.createDir(editor.localPath(parent))) {
-      return { ok: false, err: editor.t("err.could_not_create", { path: parent }), repoRoot };
+    manifestHeartbeat.assertOwned();
+    if (!targetLease) {
+      return { ok: false, err: "the workspace is busy", repoRoot };
     }
-    const moveRes = await spawnCollect(
-      "git",
-      ["-C", repoRoot, "worktree", "move", s.root, archivedRoot],
-      repoRoot,
+    targetHeartbeat = startLeaseHeartbeat(
+      () => renewLease(targetLease!),
+      (milliseconds) => editor.delay(milliseconds),
+      LEASE_TTL_MS,
+      "archive workspace transaction",
     );
-    if (moveRes.exit_code !== 0) {
+    fence = new LifecycleFence(manifestHeartbeat, targetHeartbeat);
+    fence.assertOwned();
+
+    const previous = await importLegacyArchiveManifests(repoRoot, fence);
+    if (!previous) {
+      return { ok: false, err: "the archive manifest is unreadable", repoRoot };
+    }
+    if (!session.stableId && !session.discovered && liveWindowCount() <= 1) {
       return {
         ok: false,
-        err: lastNonEmptyLine(moveRes.stderr) || editor.t("err.worktree_move_failed"),
+        err: "the last workspace has no exact durable identity",
         repoRoot,
       };
     }
-    const manifest = loadArchiveManifest(repoRoot);
-    manifest.sessions.push({
-      label: s.label,
-      root: archivedRoot,
-      original_root: s.root,
-      branch: s.branch || s.label,
+    const activateOnRollback = !session.discovered && session.id > 0 &&
+      session.id === editor.activeWindow();
+    const prepareError = await prepareLifecycleWindow(session, fence);
+    if (prepareError) return { ok: false, err: prepareError, repoRoot };
+
+    const beforeClose = await fence.wait(() =>
+      inspectWorkspacePersistence(session.root)
+    );
+    if (
+      removable && (hasLiveCoTenant(session) ||
+        hasPersistedCoTenant(session, beforeClose))
+    ) {
+      return {
+        ok: false,
+        err: "the worktree still has another workspace tenant",
+        repoRoot,
+      };
+    }
+    if (
+      !removable && !session.stableId &&
+      (hasLiveCoTenant(session) || hasPersistedCoTenant(session, beforeClose))
+    ) {
+      return {
+        ok: false,
+        err: "the workspace has no exact durable identity",
+        repoRoot,
+      };
+    }
+    const plan = persistencePlan(session, removable, beforeClose);
+    if (!plan) {
+      return {
+        ok: false,
+        err: "the workspace persistence identity is ambiguous",
+        repoRoot,
+      };
+    }
+
+    let worktreeIdentity: WorktreeIdentity | undefined;
+    if (removable) {
+      const invalid = await validateLifecycleWorktree(
+        repoRoot,
+        session.root,
+        fence,
+      );
+      if (invalid) return { ok: false, err: invalid, repoRoot };
+      worktreeIdentity = (await captureWorktreeIdentity(
+        repoRoot,
+        session.root,
+        fence,
+      )) ?? undefined;
+      if (!worktreeIdentity) {
+        return {
+          ok: false,
+          err: "could not capture the worktree identity",
+          repoRoot,
+        };
+      }
+    }
+
+    const repositoryDir = removable
+      ? fence.mutate(() => archiveRepositoryDir(repoRoot))
+      : null;
+    if (removable && !repositoryDir) {
+      return {
+        ok: false,
+        err: "could not establish the canonical archive directory",
+        repoRoot,
+      };
+    }
+    let attemptId = "";
+    let archivedRoot: string | undefined;
+    for (let candidate = 0; candidate < 32; candidate++) {
+      const nextId = uniqueAttemptId();
+      const nextRoot = repositoryDir
+        ? editor.pathJoin(repositoryDir, `archive-${nextId}`)
+        : undefined;
+      if (previous.sessions.some((entry) => entry.id === nextId)) continue;
+      if (nextRoot && editor.fileExists(editor.localPath(nextRoot))) continue;
+      attemptId = nextId;
+      archivedRoot = nextRoot;
+      break;
+    }
+    if (!attemptId) {
+      return {
+        ok: false,
+        err: "could not allocate an archive identity",
+        repoRoot,
+      };
+    }
+
+    const snapshots = prepareLifecycleSnapshots(plan.snapshots, attemptId);
+    const entry: ArchivedSession = {
+      id: attemptId,
+      identity: archivedSessionIdentity(session),
+      repo_root: normRoot(repoRoot),
+      label: session.label,
+      root: archivedRoot ?? normRoot(session.root),
+      original_root: normRoot(session.root),
+      stable_id: session.stableId,
+      branch: session.branch || session.git?.info?.branch || "",
       archived_at: new Date().toISOString(),
-    });
-    saveArchiveManifest(repoRoot, manifest);
-    // A discovered row has no window_closed hook to drop it — remove it
-    // from the model directly.
-    if (s.discovered) {
-      orchestratorSessions.delete(id);
-      discoveredIdByPath.delete(s.root);
-    }
-    // The worktree moved to the graveyard, so the original root is gone;
-    // forget its now-dangling persisted workspace explicitly rather than
-    // leaning on boot-time GC to notice the directory vanished.
-    editor.deleteWorkspace(s.root);
-    return { ok: true, repoRoot };
-  }
-
-  // In-place / launch session: there's no separate worktree to move, so
-  // archiving just records the session at its own root (original_root ===
-  // root, no graveyard move) — listing it as archived and letting a
-  // future Unarchive reopen a window there — then drops the live record.
-  // The window was already closed above.
-  const repoRoot = (await resolveCanonicalRepoRoot(s.root)) ?? s.root;
-  const manifest = loadArchiveManifest(repoRoot);
-  manifest.sessions.push({
-    label: s.label,
-    root: s.root,
-    original_root: s.root,
-    branch: s.branch || s.label,
-    archived_at: new Date().toISOString(),
-  });
-  saveArchiveManifest(repoRoot, manifest);
-  orchestratorSessions.delete(id);
-  // In-place archive leaves the directory on disk, so its persisted
-  // workspace must be forgotten too — otherwise discovery re-adds it as a
-  // live session on the next launch, double-listed with its archive entry.
-  // Unarchive reopens from the manifest, so the dropped layout is expendable.
-  editor.deleteWorkspace(s.root);
-  return { ok: true, repoRoot };
-}
-
-// ---------------------------------------------------------------------
-// Cross-machine recovery (Phase 6)
-//
-// Every lifecycle action that mutates the local archive manifest also
-// fires an asynchronous push to `refs/heads/<user>/fresh-sessions` on
-// origin so the same sessions can be recovered on another machine.
-// The push runs in the background and never blocks the user-visible
-// action; failures get surfaced through `syncStatus` (and a small ⤒
-// glyph in the dialog footer when the error is fresh).
-//
-// The branch is orphan-style: a single root file `sessions.json` and
-// commits with the sessions snapshot. We maintain it through a
-// dedicated worktree at `<XDG>/orchestrator/.sync-workspace` so we don't
-// disturb the user's normal `git worktree` set.
-// ---------------------------------------------------------------------
-
-type SyncStatus = "idle" | "syncing" | "error";
-let syncStatus: SyncStatus = "idle";
-let syncError: string | null = null;
-
-function deriveSyncUser(): string {
-  // Priority order documented in
-  // docs/internal/orchestrator-open-dialog-and-lifecycle.md.
-  const envOverride = editor.getEnv("FRESH_SESSIONS_USER");
-  if (envOverride && envOverride.trim()) return envOverride.trim();
-  const localPart = (envEmailLocalPart() || "").trim();
-  if (localPart) return localPart;
-  const u = editor.getEnv("USER");
-  if (u && u.trim()) return u.trim();
-  return "fresh";
-}
-
-function envEmailLocalPart(): string | null {
-  // Best-effort sync read of git config user.email's local-part.
-  // Reading from env first (since spawnProcess is async) keeps
-  // deriveSyncUser synchronous; users with no env override will
-  // probably have `$USER` available as fallback.
-  const email = editor.getEnv("GIT_AUTHOR_EMAIL") ||
-    editor.getEnv("EMAIL");
-  if (!email) return null;
-  const at = email.indexOf("@");
-  return at > 0 ? email.slice(0, at) : null;
-}
-
-function syncWorkspacePath(): string {
-  return editor.pathJoin(editor.getDataDir(), "orchestrator", ".sync-workspace");
-}
-
-// Fire-and-forget sync. Never blocks the caller; updates
-// `syncStatus`/`syncError` and refreshes the dialog (if open)
-// so the footer indicator can reflect the result.
-function triggerSyncAsync(repoRoot: string): void {
-  void (async () => {
-    syncStatus = "syncing";
-    if (openPanel) refreshOpenDialog();
-    const result = await syncSessions(repoRoot);
-    if (result.ok) {
-      syncStatus = "idle";
-      syncError = null;
-    } else {
-      syncStatus = "error";
-      syncError = result.err ?? "unknown error";
-    }
-    if (openPanel) refreshOpenDialog();
-  })();
-}
-
-interface SyncResult {
-  ok: boolean;
-  err?: string;
-}
-
-async function syncSessions(repoRoot: string): Promise<SyncResult> {
-  const user = deriveSyncUser();
-  const branch = `${user}/fresh-sessions`;
-  const wt = syncWorkspacePath();
-
-  // Ensure the sync worktree exists and is on the right branch.
-  // First-time setup creates the worktree as an orphan branch
-  // with no parent commit (cleanest history; no leftover files
-  // from the original tree).
-  if (!editor.createDir(editor.localPath(editor.pathDirname(wt)))) {
-    return { ok: false, err: "createDir failed for sync workspace parent" };
-  }
-  const branchExists = await spawnCollect(
-    "git",
-    ["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-    repoRoot,
-  );
-  const wtExists = await spawnCollect(
-    "git",
-    ["-C", repoRoot, "worktree", "list", "--porcelain"],
-    repoRoot,
-  );
-  const wtAlreadyTracked = wtExists.exit_code === 0 &&
-    wtExists.stdout.includes(wt);
-
-  if (!wtAlreadyTracked) {
-    if (branchExists.exit_code === 0) {
-      const addRes = await spawnCollect(
-        "git",
-        ["-C", repoRoot, "worktree", "add", wt, branch],
-        repoRoot,
-      );
-      if (addRes.exit_code !== 0) {
-        return { ok: false, err: lastNonEmptyLine(addRes.stderr) };
-      }
-    } else {
-      // Create an orphan worktree by adding detached then
-      // switching to a new orphan branch.
-      const addRes = await spawnCollect(
-        "git",
-        ["-C", repoRoot, "worktree", "add", "--detach", wt, "HEAD"],
-        repoRoot,
-      );
-      if (addRes.exit_code !== 0) {
-        return { ok: false, err: lastNonEmptyLine(addRes.stderr) };
-      }
-      const orphanRes = await spawnCollect(
-        "git",
-        ["-C", wt, "checkout", "--orphan", branch],
-        wt,
-      );
-      if (orphanRes.exit_code !== 0) {
-        return { ok: false, err: lastNonEmptyLine(orphanRes.stderr) };
-      }
-      // Strip everything inherited from HEAD's tree so the
-      // orphan branch starts clean.
-      await spawnCollect("git", ["-C", wt, "rm", "-rf", "."], wt);
-    }
-  }
-
-  // Snapshot active + archived sessions into the JSON that
-  // lives at the root of the sync branch.
-  const snapshot = await buildSyncSnapshot(repoRoot);
-  const sessionsPath = editor.pathJoin(wt, "sessions.json");
-  if (!editor.writeFile(editor.localPath(sessionsPath), JSON.stringify(snapshot, null, 2))) {
-    return { ok: false, err: "writeFile sessions.json failed" };
-  }
-
-  const addRes = await spawnCollect(
-    "git",
-    ["-C", wt, "add", "sessions.json"],
-    wt,
-  );
-  if (addRes.exit_code !== 0) {
-    return { ok: false, err: lastNonEmptyLine(addRes.stderr) };
-  }
-  // The commit may noop when nothing changed — git exits with
-  // 1 in that case, which we treat as success rather than an
-  // error.
-  const commitRes = await spawnCollect(
-    "git",
-    [
-      "-C",
-      wt,
-      "commit",
-      "--allow-empty-message",
-      "-m",
-      "Update sessions",
-    ],
-    wt,
-  );
-  if (commitRes.exit_code !== 0 && !commitRes.stdout.includes("nothing to commit")) {
-    // Permissive: stderr "nothing to commit" / "working tree clean"
-    // means there was nothing new to push. Skip the push and
-    // report success.
-    if (!commitRes.stderr.includes("nothing to commit")) {
-      // Other commit failures: report.
-      return { ok: false, err: lastNonEmptyLine(commitRes.stderr) };
-    }
-  }
-
-  const pushRes = await spawnCollect(
-    "git",
-    ["-C", wt, "push", "origin", branch],
-    wt,
-  );
-  if (pushRes.exit_code !== 0) {
-    return { ok: false, err: lastNonEmptyLine(pushRes.stderr) };
-  }
-  return { ok: true };
-}
-
-async function buildSyncSnapshot(repoRoot: string): Promise<unknown> {
-  const manifest = loadArchiveManifest(repoRoot);
-  return {
-    version: 1,
-    machine_id: editor.getEnv("HOSTNAME") || "unknown",
-    updated_at: new Date().toISOString(),
-    active: Array.from(orchestratorSessions.values()).map((s) => ({
-      label: s.label,
-      branch: s.label,
-      base_ref: "origin/master",
-      created_at: new Date(s.createdAt).toISOString(),
-    })),
-    archived: manifest.sessions,
-  };
-}
-
-// Delete a single session: close the editor session, then — only when
-// the session owns a worktree — `git worktree remove --force` to drop
-// it from disk (and prune any archive-manifest entry). A launch or
-// in-place session owns no worktree, so Delete just forgets it: the
-// window closes and the directory is left untouched (a fresh session
-// can always be opened there again). Handles discovered on-disk
-// worktrees (no window to close). Does NOT trigger sync — the caller
-// batches it.
-async function deleteOne(id: number): Promise<LifecycleResult> {
-  const s = orchestratorSessions.get(id);
-  if (!s) return { ok: false, err: editor.t("err.workspace_gone") };
-  const removable = ownsWorktree(s);
-
-  if (!s.discovered && id > 0) {
-    // The editor must keep at least one window. If this is the only live
-    // one, open a replacement in its project first (so a removable
-    // session can't `git worktree remove` the tree the editor is still
-    // sitting in, and the editor never goes empty). Then swap away
-    // (close_window refuses the active window), SIGKILL only when there's
-    // an agent terminal — a launch/in-place session has none — and close.
-    await ensureReplacementWindow(s.projectPath ?? s.root);
-    if (id === editor.activeWindow()) {
-      editor.setActiveWindow(pickNextActiveSession(id));
-    }
-    if (s.terminalId) editor.signalWindow(id, "SIGKILL");
-    // Tombstone before the (async) close so any `refreshOpenDialog` that
-    // runs before the host processes it doesn't reconcile the workspace
-    // straight back in from the still-stale window snapshot.
-    closingWindowIds.add(id);
-    editor.closeWindow(id);
-    if (removable) await editor.delay(250);
-  }
-
-  let repoRoot: string | undefined;
-  if (removable) {
-    const rr = await worktreeRepoRoot(s);
-    if (!rr) return { ok: false, err: editor.t("err.not_git_repo") };
-    repoRoot = rr;
-    // `--force` because the worktree may have unstaged changes the user
-    // explicitly chose to discard via the confirm step.
-    const removeRes = await spawnCollect(
-      "git",
-      ["-C", rr, "worktree", "remove", "--force", s.root],
-      rr,
-    );
-    if (removeRes.exit_code !== 0) {
+      workspace_bundle: archiveWorkspaceBundle(snapshots),
+    };
+    intent = {
+      version: 1,
+      attemptId,
+      action: "archive",
+      phase: "prepared",
+      repoRoot: normRoot(repoRoot),
+      originalRoot: normRoot(session.root),
+      archivedRoot,
+      removable,
+      stableId: session.stableId,
+      forgetWholeRoot: plan.wholeRoot,
+      snapshots,
+      worktreeIdentity,
+      entry,
+      label: session.label,
+      reopenOnRollback: !session.discovered && session.id > 0,
+      activateOnRollback,
+      remote: !!session.remote,
+    };
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
       return {
         ok: false,
-        err: lastNonEmptyLine(removeRes.stderr) || editor.t("err.worktree_remove_failed"),
+        err: "could not persist the archive intent",
+        repoRoot,
+      };
+    }
+    try {
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.acquireWorkspaceRootOwnership(
+          intent!.originalRoot,
+          intent!.attemptId,
+        )
+      );
+      rootOwned = true;
+    } catch (error) {
+      fence.assertOwned();
+      const cleared = await fence.wait(() =>
+        clearLifecycleIntent(intent!.attemptId)
+      );
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        err: cleared
+          ? `could not acquire workspace ownership: ${detail}`
+          : `could not acquire workspace ownership and the prepared intent needs recovery: ${detail}`,
         repoRoot,
       };
     }
 
-    // Drop the matching manifest entry too, in case the session was
-    // already archived (delete-from-archived drops dormant sessions).
-    const manifest = loadArchiveManifest(rr);
-    const before = manifest.sessions.length;
-    manifest.sessions = manifest.sessions.filter((e) => e.label !== s.label);
-    if (manifest.sessions.length !== before) {
-      saveArchiveManifest(rr, manifest);
+    const fail = async (message: string): Promise<LifecycleResult> => {
+      const rolledBack = await rollbackUncommittedLifecycle(intent!, fence!);
+      if (rolledBack) rootOwned = false;
+      return {
+        ok: false,
+        err: rolledBack ? message : `${message}; rollback needs attention`,
+        repoRoot,
+      };
+    };
+
+    const lockedInventory = await fence.wait(() =>
+      inspectWorkspacePersistence(session.root)
+    );
+    if (
+      removable && (hasLiveCoTenant(session) ||
+        hasPersistedCoTenant(session, lockedInventory))
+    ) return await fail("the worktree gained another workspace tenant");
+    if (
+      !removable && !session.stableId &&
+      (hasLiveCoTenant(session) ||
+        hasPersistedCoTenant(session, lockedInventory))
+    ) return await fail("the workspace gained another durable identity");
+
+    const closeError = await closePreparedLifecycleWindow(session, fence);
+    if (closeError) return await fail(closeError);
+    intent.phase = "window_closed";
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return await fail("could not checkpoint the closed workspace");
+    }
+
+    const hasArtifacts = intent.forgetWholeRoot ||
+      intent.stableId !== undefined;
+    const artifactStableId = intent.forgetWholeRoot ? null : intent.stableId!;
+    if (hasArtifacts) {
+      try {
+        await fence.wait(() =>
+          lifecyclePersistenceEditor.quarantineWorkspaceArtifacts(
+            intent!.originalRoot,
+            artifactStableId,
+            intent!.attemptId,
+          )
+        );
+      } catch (error) {
+        fence.assertOwned();
+        const detail = error instanceof Error ? error.message : String(error);
+        return await fail(`could not retain workspace artifacts: ${detail}`);
+      }
+    }
+    const quarantineError = fence.mutate(() =>
+      quarantineWorkspacePersistence(intent!)
+    );
+    if (quarantineError) {
+      return await fail(
+        `could not quarantine workspace persistence: ${quarantineError}`,
+      );
+    }
+    intent.phase = "quarantined";
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return await fail("could not checkpoint workspace quarantine");
+    }
+
+    if (!(await forgetWorkspacePersistence(intent, fence))) {
+      return await fail("the editor did not durably forget the workspace");
+    }
+    intent.phase = "persistence_deleted";
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return await fail("could not checkpoint the archive transaction");
+    }
+
+    if (removable && archivedRoot) {
+      const remaining = await fence.wait(() =>
+        inspectWorkspacePersistence(session.root)
+      );
+      if (hasLiveCoTenant(session) || remaining.length > 0) {
+        return await fail("the worktree gained another workspace tenant");
+      }
+      if (!(await worktreeIdentityMatches(intent, fence))) {
+        return await fail("the worktree identity changed");
+      }
+      const move = await fence.wait(() =>
+        spawnCollect(
+          "git",
+          ["-C", repoRoot, "worktree", "move", session.root, archivedRoot],
+          repoRoot,
+        )
+      );
+      if (move.exit_code !== 0) {
+        return await fail(
+          commandErrorSummary(move.stderr) ||
+            editor.t("err.worktree_move_failed"),
+        );
+      }
+      intent.phase = "moved";
+      if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+        return await fail("could not checkpoint the moved worktree");
+      }
+    }
+
+    const next: ArchiveManifest = {
+      version: 2,
+      repo_root: normRoot(repoRoot),
+      sessions: [
+        ...previous.sessions.filter((archived) =>
+          archived.id !== entry.id && archived.identity !== entry.identity
+        ),
+        entry,
+      ],
+    };
+    if (!(await fence.wait(() => saveArchiveManifest(next)))) {
+      return await fail("could not publish the archive manifest");
+    }
+    manifestPublished = true;
+    intent.phase = "committed";
+    await fence.wait(() => saveLifecycleIntent(intent!));
+
+    let cleanupComplete = true;
+    if (hasArtifacts) {
+      try {
+        await fence.wait(() =>
+          lifecyclePersistenceEditor.restoreWorkspaceArtifacts(
+            entry.root,
+            artifactStableId,
+            intent!.attemptId,
+          )
+        );
+      } catch {
+        fence.assertOwned();
+        cleanupComplete = false;
+      }
+    }
+    if (cleanupComplete) {
+      fence.mutate(() => discardLifecycleQuarantine(intent!));
+      try {
+        await fence.wait(() =>
+          lifecyclePersistenceEditor.releaseWorkspaceRootOwnership(
+            intent!.attemptId,
+          )
+        );
+        rootOwned = false;
+      } catch {
+        fence.assertOwned();
+        cleanupComplete = false;
+      }
+    }
+    if (
+      cleanupComplete &&
+      !(await fence.wait(() => clearLifecycleIntent(attemptId)))
+    ) {
+      cleanupComplete = false;
+    }
+    fence.mutate(() => removeLifecycleSession(session, removable));
+    return {
+      ok: true,
+      repoRoot,
+      attention: cleanupComplete
+        ? undefined
+        : `Archive completed; lifecycle cleanup needs attention for ${intent.originalRoot}`,
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (manifestPublished) {
+      removeLifecycleSession(session, removable);
+      return {
+        ok: true,
+        repoRoot,
+        attention: `Archive completed; lifecycle cleanup needs attention for ${
+          intent?.originalRoot ?? session.root
+        }: ${detail}`,
+      };
+    }
+    if (intent && rootOwned && fence) {
+      try {
+        if (await rollbackUncommittedLifecycle(intent, fence)) {
+          rootOwned = false;
+        } else {return {
+            ok: false,
+            err: `${detail}; rollback needs attention`,
+            repoRoot,
+          };}
+      } catch {
+        return {
+          ok: false,
+          err: `${detail}; rollback needs attention`,
+          repoRoot,
+        };
+      }
+    }
+    return { ok: false, err: detail, repoRoot };
+  } finally {
+    targetHeartbeat?.stop();
+    manifestHeartbeat.stop();
+    if (targetLease) releaseLease(targetLease);
+    releaseLease(manifestLease);
+  }
+}
+
+// Delete closes and forgets the exact workspace before touching a removable
+// worktree. The durable intent makes a failed `git worktree remove` reversible:
+// persistence is restored byte-for-byte, while a missing root after a crash is
+// itself an unambiguous commit marker for the user-confirmed deletion.
+async function deleteOne(id: number): Promise<LifecycleResult> {
+  const session = orchestratorSessions.get(id);
+  if (!session) return { ok: false, err: editor.t("err.workspace_gone") };
+  const removable = ownsWorktree(session);
+  const repoRoot = removable
+    ? await worktreeRepoRoot(session)
+    : (await resolveCanonicalRepoRoot(session.root)) ?? normRoot(session.root);
+  if (!repoRoot) return { ok: false, err: editor.t("err.not_git_repo") };
+
+  const targetLease = await acquireLease(
+    `workspace-target:${normRoot(session.root)}`,
+    10_000,
+  );
+  if (!targetLease) {
+    return { ok: false, err: "the workspace is busy", repoRoot };
+  }
+  const targetHeartbeat = startLeaseHeartbeat(
+    () => renewLease(targetLease),
+    (milliseconds) => editor.delay(milliseconds),
+    LEASE_TTL_MS,
+    "delete workspace transaction",
+  );
+  const fence = new LifecycleFence(targetHeartbeat);
+  let intent: LifecycleIntent | null = null;
+  let rootOwned = false;
+  let deleteCommitted = false;
+  try {
+    fence.assertOwned();
+    if (!session.stableId && !session.discovered && liveWindowCount() <= 1) {
+      return {
+        ok: false,
+        err: "the last workspace has no exact durable identity",
+        repoRoot,
+      };
+    }
+    const activateOnRollback = !session.discovered && session.id > 0 &&
+      session.id === editor.activeWindow();
+    const prepareError = await prepareLifecycleWindow(session, fence);
+    if (prepareError) return { ok: false, err: prepareError, repoRoot };
+
+    const beforeClose = await fence.wait(() =>
+      inspectWorkspacePersistence(session.root)
+    );
+    if (
+      removable && (hasLiveCoTenant(session) ||
+        hasPersistedCoTenant(session, beforeClose))
+    ) {
+      return {
+        ok: false,
+        err: "the worktree still has another workspace tenant",
+        repoRoot,
+      };
+    }
+    if (
+      !removable && !session.stableId &&
+      (hasLiveCoTenant(session) || hasPersistedCoTenant(session, beforeClose))
+    ) {
+      return {
+        ok: false,
+        err: "the workspace has no exact durable identity",
+        repoRoot,
+      };
+    }
+    const plan = persistencePlan(session, removable, beforeClose);
+    if (!plan) {
+      return {
+        ok: false,
+        err: "the workspace persistence identity is ambiguous",
+        repoRoot,
+      };
+    }
+
+    let worktreeIdentity: WorktreeIdentity | undefined;
+    if (removable) {
+      const invalid = await validateLifecycleWorktree(
+        repoRoot,
+        session.root,
+        fence,
+      );
+      if (invalid) return { ok: false, err: invalid, repoRoot };
+      worktreeIdentity = (await captureWorktreeIdentity(
+        repoRoot,
+        session.root,
+        fence,
+      )) ?? undefined;
+      if (!worktreeIdentity) {
+        return {
+          ok: false,
+          err: "could not capture the worktree identity",
+          repoRoot,
+        };
+      }
+    }
+
+    const attemptId = uniqueAttemptId();
+    intent = {
+      version: 1,
+      attemptId,
+      action: "delete",
+      phase: "prepared",
+      repoRoot: normRoot(repoRoot),
+      originalRoot: normRoot(session.root),
+      removable,
+      stableId: session.stableId,
+      forgetWholeRoot: plan.wholeRoot,
+      snapshots: prepareLifecycleSnapshots(plan.snapshots, attemptId),
+      worktreeIdentity,
+      label: session.label,
+      reopenOnRollback: !session.discovered && session.id > 0,
+      activateOnRollback,
+      remote: !!session.remote,
+    };
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return {
+        ok: false,
+        err: "could not persist the delete intent",
+        repoRoot,
+      };
+    }
+    try {
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.acquireWorkspaceRootOwnership(
+          intent!.originalRoot,
+          intent!.attemptId,
+        )
+      );
+      rootOwned = true;
+    } catch (error) {
+      fence.assertOwned();
+      const cleared = await fence.wait(() =>
+        clearLifecycleIntent(intent!.attemptId)
+      );
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        err: cleared
+          ? `could not acquire workspace ownership: ${detail}`
+          : `could not acquire workspace ownership and the prepared intent needs recovery: ${detail}`,
+        repoRoot,
+      };
+    }
+
+    const fail = async (message: string): Promise<LifecycleResult> => {
+      const rolledBack = await rollbackUncommittedLifecycle(intent!, fence);
+      if (rolledBack) rootOwned = false;
+      return {
+        ok: false,
+        err: rolledBack ? message : `${message}; rollback needs attention`,
+        repoRoot,
+      };
+    };
+
+    const lockedInventory = await fence.wait(() =>
+      inspectWorkspacePersistence(session.root)
+    );
+    if (
+      removable && (hasLiveCoTenant(session) ||
+        hasPersistedCoTenant(session, lockedInventory))
+    ) return await fail("the worktree gained another workspace tenant");
+    if (
+      !removable && !session.stableId &&
+      (hasLiveCoTenant(session) ||
+        hasPersistedCoTenant(session, lockedInventory))
+    ) return await fail("the workspace gained another durable identity");
+
+    const closeError = await closePreparedLifecycleWindow(session, fence);
+    if (closeError) return await fail(closeError);
+    intent.phase = "window_closed";
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return await fail("could not checkpoint the closed workspace");
+    }
+
+    const hasArtifacts = intent.forgetWholeRoot ||
+      intent.stableId !== undefined;
+    const artifactStableId = intent.forgetWholeRoot ? null : intent.stableId!;
+    if (hasArtifacts) {
+      try {
+        await fence.wait(() =>
+          lifecyclePersistenceEditor.quarantineWorkspaceArtifacts(
+            intent!.originalRoot,
+            artifactStableId,
+            intent!.attemptId,
+          )
+        );
+      } catch (error) {
+        fence.assertOwned();
+        const detail = error instanceof Error ? error.message : String(error);
+        return await fail(`could not retain workspace artifacts: ${detail}`);
+      }
+    }
+    const quarantineError = fence.mutate(() =>
+      quarantineWorkspacePersistence(intent!)
+    );
+    if (quarantineError) {
+      return await fail(
+        `could not quarantine workspace persistence: ${quarantineError}`,
+      );
+    }
+    intent.phase = "quarantined";
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return await fail("could not checkpoint workspace quarantine");
+    }
+
+    if (!(await forgetWorkspacePersistence(intent, fence))) {
+      return await fail("the editor did not durably forget the workspace");
+    }
+    intent.phase = "persistence_deleted";
+    if (!(await fence.wait(() => saveLifecycleIntent(intent!)))) {
+      return await fail("could not checkpoint the delete transaction");
+    }
+
+    if (removable) {
+      const remaining = await fence.wait(() =>
+        inspectWorkspacePersistence(session.root)
+      );
+      if (hasLiveCoTenant(session) || remaining.length > 0) {
+        return await fail("the worktree gained another workspace tenant");
+      }
+      if (!(await worktreeIdentityMatches(intent, fence))) {
+        return await fail("the worktree identity changed");
+      }
+      const removed = await fence.wait(() =>
+        spawnCollect(
+          "git",
+          ["-C", repoRoot, "worktree", "remove", "--force", session.root],
+          repoRoot,
+        )
+      );
+      if (removed.exit_code !== 0) {
+        return await fail(
+          commandErrorSummary(removed.stderr) ||
+            editor.t("err.worktree_remove_failed"),
+        );
+      }
+      deleteCommitted = true;
+    }
+
+    intent.phase = "committed";
+    const commitAcknowledged = await fence.wait(() =>
+      saveLifecycleIntent(intent!)
+    );
+    if (!commitAcknowledged && !deleteCommitted) {
+      return await fail("could not durably commit the workspace deletion");
+    }
+    deleteCommitted = true;
+
+    let cleanupComplete = true;
+    if (hasArtifacts) {
+      try {
+        await fence.wait(() =>
+          lifecyclePersistenceEditor.purgeWorkspaceArtifactQuarantine(
+            intent!.attemptId,
+          )
+        );
+      } catch {
+        fence.assertOwned();
+        cleanupComplete = false;
+      }
+    }
+    if (cleanupComplete) {
+      fence.mutate(() => discardLifecycleQuarantine(intent!));
+      try {
+        await fence.wait(() =>
+          lifecyclePersistenceEditor.releaseWorkspaceRootOwnership(
+            intent!.attemptId,
+          )
+        );
+        rootOwned = false;
+      } catch {
+        fence.assertOwned();
+        cleanupComplete = false;
+      }
+    }
+    if (
+      cleanupComplete &&
+      !(await fence.wait(() => clearLifecycleIntent(attemptId)))
+    ) {
+      cleanupComplete = false;
+    }
+    fence.mutate(() => removeLifecycleSession(session, removable));
+    return {
+      ok: true,
+      repoRoot,
+      attention: cleanupComplete
+        ? undefined
+        : `Delete completed; lifecycle cleanup needs attention for ${intent.originalRoot}`,
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (deleteCommitted) {
+      removeLifecycleSession(session, removable);
+      return {
+        ok: true,
+        repoRoot,
+        attention: `Delete completed; lifecycle cleanup needs attention for ${
+          intent?.originalRoot ?? session.root
+        }: ${detail}`,
+      };
+    }
+    if (intent && rootOwned) {
+      try {
+        if (await rollbackUncommittedLifecycle(intent, fence)) {
+          rootOwned = false;
+        } else {return {
+            ok: false,
+            err: `${detail}; rollback needs attention`,
+            repoRoot,
+          };}
+      } catch {
+        return {
+          ok: false,
+          err: `${detail}; rollback needs attention`,
+          repoRoot,
+        };
+      }
+    }
+    return { ok: false, err: detail, repoRoot };
+  } finally {
+    targetHeartbeat.stop();
+    releaseLease(targetLease);
+  }
+}
+
+function isLifecycleIntent(value: unknown): value is LifecycleIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const intent = value as Record<string, unknown>;
+  const phases: unknown[] = [
+    "prepared",
+    "quarantined",
+    "window_closed",
+    "persistence_deleted",
+    "moved",
+    "committed",
+  ];
+  const entry = intent.entry;
+  return intent.version === 1 && typeof intent.attemptId === "string" &&
+    (intent.action === "archive" || intent.action === "delete") &&
+    phases.includes(intent.phase) && typeof intent.repoRoot === "string" &&
+    typeof intent.originalRoot === "string" &&
+    typeof intent.removable === "boolean" &&
+    (intent.stableId === undefined || typeof intent.stableId === "string") &&
+    typeof intent.forgetWholeRoot === "boolean" &&
+    (intent.label === undefined || typeof intent.label === "string") &&
+    (intent.reopenOnRollback === undefined ||
+      typeof intent.reopenOnRollback === "boolean") &&
+    (intent.activateOnRollback === undefined ||
+      typeof intent.activateOnRollback === "boolean") &&
+    (intent.remote === undefined || typeof intent.remote === "boolean") &&
+    Array.isArray(intent.snapshots) &&
+    intent.snapshots.every((snapshot) => {
+      if (
+        !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)
+      ) {
+        return false;
+      }
+      const record = snapshot as Record<string, unknown>;
+      return typeof record.path === "string" &&
+        typeof record.content === "string" &&
+        (record.stableId === null || typeof record.stableId === "string") &&
+        (record.quarantinePath === undefined ||
+          typeof record.quarantinePath === "string") &&
+        (record.quiescedContent === undefined ||
+          typeof record.quiescedContent === "string");
+    }) &&
+    (intent.worktreeIdentity === undefined ||
+      (!!intent.worktreeIdentity &&
+        typeof intent.worktreeIdentity === "object" &&
+        !Array.isArray(intent.worktreeIdentity) &&
+        typeof (intent.worktreeIdentity as Record<string, unknown>).gitDir ===
+          "string" &&
+        typeof (intent.worktreeIdentity as Record<string, unknown>).head ===
+          "string" &&
+        typeof (intent.worktreeIdentity as Record<string, unknown>).branch ===
+          "string")) &&
+    (intent.archivedRoot === undefined ||
+      typeof intent.archivedRoot === "string") &&
+    (entry === undefined ||
+      (!!entry && typeof entry === "object" && !Array.isArray(entry) &&
+        typeof (entry as Record<string, unknown>).id === "string" &&
+        typeof (entry as Record<string, unknown>).identity === "string" &&
+        typeof (entry as Record<string, unknown>).root === "string" &&
+        typeof (entry as Record<string, unknown>).original_root === "string"));
+}
+
+async function recoverLifecycleIntents(): Promise<void> {
+  const state = inspectPersistedPluginState();
+  if (state === null) return;
+  for (const [key, value] of Object.entries(state)) {
+    if (!key.startsWith(LIFECYCLE_INTENT_PREFIX) || !isLifecycleIntent(value)) {
+      continue;
+    }
+    const intent = value;
+    const repoLease = intent.action === "archive"
+      ? await acquireLease(`archive-manifest:${normRoot(intent.repoRoot)}`, 0)
+      : null;
+    if (intent.action === "archive" && !repoLease) continue;
+    const targetLease = await acquireLease(
+      `workspace-target:${normRoot(intent.originalRoot)}`,
+      0,
+    );
+    if (!targetLease) {
+      if (repoLease) releaseLease(repoLease);
+      continue;
+    }
+    const repoHeartbeat = repoLease
+      ? startLeaseHeartbeat(
+        () => renewLease(repoLease),
+        (milliseconds) => editor.delay(milliseconds),
+        LEASE_TTL_MS,
+        "archive recovery",
+      )
+      : null;
+    const targetHeartbeat = startLeaseHeartbeat(
+      () => renewLease(targetLease),
+      (milliseconds) => editor.delay(milliseconds),
+      LEASE_TTL_MS,
+      "lifecycle recovery",
+    );
+    const fence = new LifecycleFence(repoHeartbeat, targetHeartbeat);
+    try {
+      await fence.wait(() =>
+        lifecyclePersistenceEditor.acquireWorkspaceRootOwnership(
+          intent.originalRoot,
+          intent.attemptId,
+        )
+      );
+      if (intent.action === "archive") {
+        const manifest = inspectArchiveManifest(intent.repoRoot);
+        if (!manifest) continue;
+        const published = !!intent.entry &&
+          manifest.sessions.some((entry) =>
+            entry.id === intent.attemptId &&
+            entry.identity === intent.entry!.identity &&
+            normRoot(entry.root) === normRoot(intent.entry!.root) &&
+            normRoot(entry.original_root) === normRoot(intent.originalRoot)
+          );
+        if (published) {
+          if (!(await forgetWorkspacePersistence(intent, fence))) {
+            editor.setStatus(
+              `Orchestrator: archive recovery could not confirm forgetting ${intent.originalRoot}`,
+            );
+            continue;
+          }
+          const hasArtifacts = intent.forgetWholeRoot ||
+            intent.stableId !== undefined;
+          if (hasArtifacts) {
+            const stableId = intent.forgetWholeRoot ? null : intent.stableId!;
+            try {
+              await fence.wait(() =>
+                lifecyclePersistenceEditor.restoreWorkspaceArtifacts(
+                  intent.entry!.root,
+                  stableId,
+                  intent.attemptId,
+                )
+              );
+            } catch {
+              fence.assertOwned();
+              editor.setStatus(
+                `Orchestrator: archive recovery could not retain artifacts for ${intent.originalRoot}`,
+              );
+              continue;
+            }
+          }
+          fence.mutate(() => discardLifecycleQuarantine(intent));
+          try {
+            await fence.wait(() =>
+              lifecyclePersistenceEditor.releaseWorkspaceRootOwnership(
+                intent.attemptId,
+              )
+            );
+          } catch {
+            fence.assertOwned();
+            editor.setStatus(
+              `Orchestrator: archive recovery could not release ${intent.originalRoot}`,
+            );
+            continue;
+          }
+          if (
+            !(await fence.wait(() => clearLifecycleIntent(intent.attemptId)))
+          ) {
+            editor.setStatus(
+              `Orchestrator: archive recovery could not acknowledge ${intent.originalRoot}`,
+            );
+          }
+          continue;
+        }
+        if (!(await rollbackUncommittedLifecycle(intent, fence))) {
+          editor.setStatus(
+            `Orchestrator: archive recovery needs attention for ${intent.originalRoot}`,
+          );
+        }
+        continue;
+      }
+
+      fence.assertOwned();
+      const rootStillExists = editor.fileExists(
+        editor.localPath(intent.originalRoot),
+      );
+      if (
+        intent.phase === "committed" || (intent.removable && !rootStillExists)
+      ) {
+        if (!(await forgetWorkspacePersistence(intent, fence))) {
+          editor.setStatus(
+            `Orchestrator: delete recovery could not confirm forgetting ${intent.originalRoot}`,
+          );
+          continue;
+        }
+        if (intent.forgetWholeRoot || intent.stableId !== undefined) {
+          try {
+            await fence.wait(() =>
+              lifecyclePersistenceEditor.purgeWorkspaceArtifactQuarantine(
+                intent.attemptId,
+              )
+            );
+          } catch {
+            fence.assertOwned();
+            editor.setStatus(
+              `Orchestrator: delete recovery could not purge artifacts for ${intent.originalRoot}`,
+            );
+            continue;
+          }
+        }
+        fence.mutate(() => discardLifecycleQuarantine(intent));
+        try {
+          await fence.wait(() =>
+            lifecyclePersistenceEditor.releaseWorkspaceRootOwnership(
+              intent.attemptId,
+            )
+          );
+        } catch {
+          fence.assertOwned();
+          editor.setStatus(
+            `Orchestrator: delete recovery could not release ${intent.originalRoot}`,
+          );
+          continue;
+        }
+        if (!(await fence.wait(() => clearLifecycleIntent(intent.attemptId)))) {
+          editor.setStatus(
+            `Orchestrator: delete recovery could not acknowledge ${intent.originalRoot}`,
+          );
+        }
+      } else if (!(await rollbackUncommittedLifecycle(intent, fence))) {
+        editor.setStatus(
+          `Orchestrator: delete recovery needs attention for ${intent.originalRoot}`,
+        );
+      }
+    } catch {
+      editor.setStatus(
+        `Orchestrator: lifecycle recovery needs attention for ${intent.originalRoot}`,
+      );
+    } finally {
+      targetHeartbeat.stop();
+      repoHeartbeat?.stop();
+      releaseLease(targetLease);
+      if (repoLease) releaseLease(repoLease);
     }
   }
-
-  if (s.discovered) {
-    orchestratorSessions.delete(id);
-    discoveredIdByPath.delete(s.root);
-  } else if (id > 0) {
-    // Drop the live record explicitly. `close_window` fires
-    // `window_closed` → reconcile, which also prunes it, but an in-place
-    // / launch session left the directory untouched, so without this it
-    // could linger in the model and "come back" when the dialog reopens.
-    orchestratorSessions.delete(id);
-  }
-  // Permanently forget the persisted workspace so boot-time session
-  // discovery can't resurrect this row on the next launch. A worktree
-  // session already had its directory removed above (discovery GCs the
-  // now-dangling file), but an in-place / launch session keeps its
-  // directory, so its `workspaces/<root>.json` must be dropped explicitly
-  // or the row reappears after a restart.
-  editor.deleteWorkspace(s.root);
-  return { ok: true, repoRoot };
 }
 
 // Unified runner for a confirmed Stop / Archive / Delete over one or
 // many ids. Re-filters to eligible targets at execution time (the
 // selection or single row may have gone stale between confirm and
 // run), drives the in-flight progress markers, runs the per-id cores
-// sequentially, prunes acted-on ids from the selection, and triggers
-// one sync per touched repo at the end.
+// sequentially, and prunes acted-on ids from the selection.
 async function runConfirmedAction(
   action: BulkAction,
   ids: number[],
@@ -5989,15 +8069,17 @@ async function runConfirmedAction(
   }
   refreshOpenDialog();
 
-  const touchedRepos = new Set<string>();
   let okCount = 0;
   let lastErr = "";
+  let lastAttention = "";
   for (let i = 0; i < targets.length; i++) {
     const id = targets[i];
-    const res = action === "archive" ? await archiveOne(id) : await deleteOne(id);
+    const res = action === "archive"
+      ? await archiveOne(id)
+      : await deleteOne(id);
     if (res.ok) {
       okCount += 1;
-      if (res.repoRoot) touchedRepos.add(res.repoRoot);
+      if (res.attention) lastAttention = res.attention;
     } else {
       lastErr = res.err ?? editor.t("err.failed");
     }
@@ -6010,21 +8092,42 @@ async function runConfirmedAction(
     openDialog.bulkInFlight = null;
   }
 
-  const verb = action === "archive" ? editor.t("status.verb_archived") : editor.t("status.verb_deleted");
+  const verb = action === "archive"
+    ? editor.t("status.verb_archived")
+    : editor.t("status.verb_deleted");
   if (okCount === 0) {
-    setDialogError(editor.t("err.action_failed", { action, error: lastErr || editor.t("err.unknown_error") }));
+    setDialogError(
+      editor.t("err.action_failed", {
+        action,
+        error: lastErr || editor.t("err.unknown_error"),
+      }),
+    );
   } else if (lastErr) {
-    setDialogError(editor.t("err.partial_done", { verb, ok: String(okCount), total: String(targets.length), error: lastErr }));
+    setDialogError(
+      editor.t("err.partial_done", {
+        verb,
+        ok: String(okCount),
+        total: String(targets.length),
+        error: lastErr,
+      }),
+    );
+  } else if (lastAttention) {
+    editor.setStatus(lastAttention);
   } else {
-    editor.setStatus(editor.t("status.bulk_done", { verb, count: String(okCount) }));
+    editor.setStatus(
+      editor.t("status.bulk_done", { verb, count: String(okCount) }),
+    );
   }
-  for (const repo of touchedRepos) triggerSyncAsync(repo);
   refreshOpenDialog();
   // The batch emptied the selection, so the pane is back in
   // single-preview mode — restore focus to Visit (the bulk buttons
   // it may have been on are gone).
-  if (openPanel && selectedSessions().length < 2 && !openDialog.pendingConfirm) {
-    openPanel.setFocusKey("visit");
+  if (
+    openPanel && selectedSessions().length < 2 && !openDialog.pendingConfirm
+  ) {
+    const focusKey = selectedPreviewPrimaryKey();
+    openPanel.setFocusKey(focusKey);
+    pickerFocusKey = focusKey;
   }
 }
 
@@ -6048,15 +8151,9 @@ editor.defineMode(
     // text; session names don't contain `/`, so that's an
     // acceptable trade for the quick-focus.)
     ["/", "orchestrator_focus_filter"],
-    // Space toggles the highlighted row's membership in the bulk
-    // selection. Bound as a mode chord (not a widget smart-key) so
-    // it's user-rebindable in the keybinding editor and fires
-    // regardless of which control holds focus — the host's
-    // `dispatch_floating_widget_key` defers any explicitly-bound
-    // mode key, including bare chars, before the text-input path.
-    // The trade (same as `/`) is that Space can't be typed into the
-    // filter while the picker is open; session names don't contain
-    // spaces, so that's acceptable.
+    // Space remains a rebindable picker command, but it delegates to the
+    // focused widget unless the sessions list owns bulk selection. That keeps
+    // buttons, toggles, dropdowns, and filter text on their standard paths.
     ["Space", "orchestrator_toggle_select"],
     // Alt+T toggles "Show all worktrees" — the opt-in filter that
     // surfaces discovered on-disk worktree rows. Rebindable, same as
@@ -6110,30 +8207,16 @@ registerHandler("orchestrator_focus_filter", () => {
 // per-session preview — with its "visit" button — returns.
 function toggleSelectCurrent(): void {
   if (!openDialog || !openPanel) return;
-  // Inert while a confirm prompt is up — the selection is frozen
-  // behind the confirmation panel.
-  if (openDialog.pendingConfirm) return;
-  // Context-sensitive Space dispatch. OPEN_MODE binds Space to
-  // `orchestrator_toggle_select` *unconditionally* — it must, to keep
-  // Space out of the filter text input (the host's
-  // dispatch_floating_widget_key defers any explicitly-bound mode key
-  // before the text-input path). We branch on the focused widget so
-  // Space on the filter checkboxes / scope chip toggles *that*
-  // control rather than the list multi-select. Other focused widgets
-  // (sessions list, Visit button, +New, the filter input itself) fall
-  // through to the list multi-select — preserving today's behaviour
-  // for widgets that don't expose a natural toggle.
-  switch (pickerFocusKey) {
-    case "worktree-show":
-      toggleShowWorktrees();
-      return;
-    case "hide-trivial":
-      toggleHideTrivial();
-      return;
-    case "scope-toggle":
-      toggleScope();
-      return;
+  // OPEN_MODE owns Space so it can route the key to the focused widget instead
+  // of leaking it to the active editor mode. Only the sessions list owns bulk
+  // selection; every other focused control gets its standard smart-key action.
+  if (pickerFocusKey !== "sessions") {
+    openPanel.command(widgetKey("Space"));
+    return;
   }
+  // Inert while a confirm prompt is up — the selection is frozen behind the
+  // confirmation panel. Its buttons above still receive Space normally.
+  if (openDialog.pendingConfirm) return;
   const id = openDialog.filteredIds[openDialog.selectedIndex];
   if (typeof id !== "number") return;
   const wasBulk = selectedSessions().length >= 2;
@@ -6156,8 +8239,9 @@ function toggleSelectCurrent(): void {
     // a button still drives the list, so navigation keeps working).
     openPanel.setFocusKey("bulk-archive");
   } else if (wasBulk && !isBulk) {
-    // Back to single preview — restore focus to Visit.
-    openPanel.setFocusKey("visit");
+    const focusKey = selectedPreviewPrimaryKey();
+    openPanel.setFocusKey(focusKey);
+    pickerFocusKey = focusKey;
   }
 }
 registerHandler("orchestrator_toggle_select", toggleSelectCurrent);
@@ -6173,7 +8257,9 @@ function toggleScope(): void {
   // active filter just widens/narrows the global-search base.
   const prevId = openDialog.filteredIds[openDialog.selectedIndex];
   openDialog.filteredIds = filterSessions(openDialog.filter.value);
-  const nextIdx = prevId !== undefined ? openDialog.filteredIds.indexOf(prevId) : -1;
+  const nextIdx = prevId !== undefined
+    ? openDialog.filteredIds.indexOf(prevId)
+    : -1;
   openDialog.selectedIndex = nextIdx >= 0 ? nextIdx : 0;
   refreshOpenDialog();
 }
@@ -6198,7 +8284,9 @@ function toggleShowWorktrees(): void {
   }
   const prevId = openDialog.filteredIds[openDialog.selectedIndex];
   openDialog.filteredIds = filterSessions(openDialog.filter.value);
-  const nextIdx = prevId !== undefined ? openDialog.filteredIds.indexOf(prevId) : -1;
+  const nextIdx = prevId !== undefined
+    ? openDialog.filteredIds.indexOf(prevId)
+    : -1;
   openDialog.selectedIndex = nextIdx >= 0 ? nextIdx : 0;
   refreshOpenDialog();
   // Turning "Show all worktrees" ON re-scans *now* so the rows reflect every
@@ -6232,7 +8320,9 @@ function toggleHideTrivial(): void {
       if (!visible.has(id)) openDialog.selectedIds.delete(id);
     }
   }
-  const nextIdx = prevId !== undefined ? openDialog.filteredIds.indexOf(prevId) : -1;
+  const nextIdx = prevId !== undefined
+    ? openDialog.filteredIds.indexOf(prevId)
+    : -1;
   openDialog.selectedIndex = nextIdx >= 0 ? nextIdx : 0;
   refreshOpenDialog();
 }
@@ -6243,10 +8333,231 @@ registerHandler("orchestrator_toggle_trivial", toggleHideTrivial);
 // New-session floating form
 // =============================================================================
 
-function slugify(p: string): string {
-  // Drop any leading separator so the slug isn't anchored to the
-  // filesystem root; replace remaining separators with underscores.
-  return p.replace(/^[\\\/]+/, "").replace(/[\\\/]+/g, "_");
+function uniqueAttemptId(): string {
+  return `${Date.now().toString(36)}-${
+    Math.floor(Math.random() * 0x7fffffff).toString(36)
+  }-${Math.floor(Math.random() * 0x7fffffff).toString(36)}`;
+}
+
+const ORCHESTRATOR_STATE_FILE = editor.pathJoin(
+  editor.getDataDir(),
+  "orchestrator",
+  "state",
+  "orchestrator.json",
+);
+
+function inspectPersistedPluginState(): Record<string, unknown> | null {
+  const path = editor.localPath(ORCHESTRATOR_STATE_FILE);
+  if (!editor.fileExists(path)) return {};
+  const raw = editor.readFile(path);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readPersistedPluginState(): Record<string, unknown> {
+  return inspectPersistedPluginState() ?? {};
+}
+
+function sameStateValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+// `setGlobalState` updates this process's snapshot immediately and queues the
+// inter-process, merge-on-key durable write. Capture that host-normalized
+// snapshot (for example, nested `undefined` becomes JSON `null`) and wait for
+// the shared state file to acknowledge the exact queued value before performing
+// the side effect it describes. A process crash can therefore never leave an
+// unjournaled mutation.
+async function setDurableState(key: string, value: unknown): Promise<boolean> {
+  if (!editor.setGlobalState(key, value)) return false;
+  const deleting = value === null || value === undefined;
+  const expected = deleting ? undefined : editor.getGlobalState(key);
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const state = inspectPersistedPluginState();
+    if (state === null) {
+      if (Date.now() >= deadline) return false;
+      await editor.delay(10);
+      continue;
+    }
+    const present = Object.prototype.hasOwnProperty.call(state, key);
+    if (deleting ? !present : present && sameStateValue(state[key], expected)) {
+      return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await editor.delay(10);
+  }
+}
+
+interface InterprocessLease {
+  key: string;
+  token: string;
+  path: string;
+}
+
+interface LeaseIdentity {
+  key: string;
+  token: string;
+}
+
+interface LeaseOwner extends LeaseIdentity {
+  expiresAt: number;
+}
+
+const LEASE_TTL_MS = 30_000;
+
+function leaseRoot(): string {
+  return editor.pathJoin(editor.getTempDir(), "fresh-orchestrator-locks");
+}
+
+function readLeaseIdentity(path: string): LeaseIdentity | null {
+  const raw = editor.readFile(
+    editor.localPath(editor.pathJoin(path, "owner.json")),
+  );
+  if (!raw) return null;
+  try {
+    const owner = JSON.parse(raw) as LeaseIdentity;
+    return owner && typeof owner.key === "string" &&
+        typeof owner.token === "string"
+      ? owner
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function leaseHeartbeatPrefix(token: string): string {
+  return `heartbeat-${token}-`;
+}
+
+function readLeaseOwner(path: string): LeaseOwner | null {
+  const identity = readLeaseIdentity(path);
+  if (!identity) return null;
+  const prefix = leaseHeartbeatPrefix(identity.token);
+  let entries: DirEntry[];
+  try {
+    entries = editor.readDir(editor.localPath(path));
+  } catch {
+    return null;
+  }
+  let expiresAt = Number.NEGATIVE_INFINITY;
+  for (const entry of entries) {
+    if (!entry.is_file || !entry.name.startsWith(prefix)) continue;
+    const candidate = Number(entry.name.slice(prefix.length));
+    if (Number.isFinite(candidate)) expiresAt = Math.max(expiresAt, candidate);
+  }
+  return Number.isFinite(expiresAt) ? { ...identity, expiresAt } : null;
+}
+
+function writeLeaseHeartbeat(path: string, owner: LeaseOwner): boolean {
+  const prefix = leaseHeartbeatPrefix(owner.token);
+  const marker = `${prefix}${Math.floor(owner.expiresAt)}`;
+  const markerPath = editor.pathJoin(path, marker);
+  if (!editor.writeFile(editor.localPath(markerPath), "")) return false;
+  // Markers are immutable publications. Removing superseded markers after the
+  // new one exists avoids partial-read races without accumulating one file per
+  // renewal; a successor ignores this token's markers entirely.
+  let entries: DirEntry[];
+  try {
+    entries = editor.readDir(editor.localPath(path));
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (
+      entry.is_file && entry.name.startsWith(prefix) && entry.name !== marker
+    ) {
+      editor.removePath(editor.localPath(editor.pathJoin(path, entry.name)));
+    }
+  }
+  return true;
+}
+
+function writeLeaseOwner(path: string, owner: LeaseOwner): boolean {
+  return editor.writeFile(
+    editor.localPath(editor.pathJoin(path, "owner.json")),
+    JSON.stringify({ key: owner.key, token: owner.token }),
+  ) && writeLeaseHeartbeat(path, owner);
+}
+
+async function acquireLease(
+  key: string,
+  waitMs = 5000,
+): Promise<InterprocessLease | null> {
+  const root = leaseRoot();
+  if (!editor.createDir(editor.localPath(root))) return null;
+  const path = identityStoragePath(root, key) + ".lock";
+  if (!editor.createDir(editor.localPath(editor.pathDirname(path)))) {
+    return null;
+  }
+  const token = uniqueAttemptId();
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const candidate = `${path}.candidate-${token}`;
+    editor.removePath(editor.localPath(candidate));
+    if (
+      editor.createDir(editor.localPath(candidate)) &&
+      writeLeaseOwner(candidate, {
+        key,
+        token,
+        expiresAt: Date.now() + LEASE_TTL_MS,
+      }) &&
+      editor.renamePath(editor.localPath(candidate), editor.localPath(path))
+    ) {
+      return { key, token, path };
+    }
+    editor.removePath(editor.localPath(candidate));
+
+    const owner = readLeaseOwner(path);
+    if (!owner || owner.key !== key || owner.expiresAt <= Date.now()) {
+      const stale = `${path}.stale-${token}`;
+      if (editor.renamePath(editor.localPath(path), editor.localPath(stale))) {
+        editor.removePath(editor.localPath(stale));
+        continue;
+      }
+    }
+    if (Date.now() >= deadline) return null;
+    await editor.delay(25);
+  }
+}
+
+function renewLease(lease: InterprocessLease): boolean {
+  const owner = readLeaseIdentity(lease.path);
+  if (!owner || owner.token !== lease.token || owner.key !== lease.key) {
+    return false;
+  }
+  // The heartbeat filename is token-specific. If the canonical lease
+  // directory is replaced between the identity read and this write, an old
+  // owner can only add an ignored old-token file; it cannot overwrite the new
+  // owner's authority record.
+  if (
+    !writeLeaseHeartbeat(lease.path, {
+      key: lease.key,
+      token: lease.token,
+      expiresAt: Date.now() + LEASE_TTL_MS,
+    })
+  ) return false;
+  const current = readLeaseIdentity(lease.path);
+  return current?.token === lease.token && current.key === lease.key;
+}
+
+function releaseLease(lease: InterprocessLease): void {
+  const owner = readLeaseIdentity(lease.path);
+  if (!owner || owner.token !== lease.token || owner.key !== lease.key) return;
+  // Expire only this token. Renaming/removing the canonical directory here
+  // could delete a successor acquired during the release race.
+  writeLeaseHeartbeat(lease.path, {
+    key: lease.key,
+    token: lease.token,
+    expiresAt: 0,
+  });
 }
 
 // =============================================================================
@@ -6261,7 +8572,12 @@ function slugify(p: string): string {
 // =============================================================================
 
 type HistoryField = "project_path" | "name" | "cmd" | "branch";
-const HISTORY_FIELDS: HistoryField[] = ["project_path", "name", "cmd", "branch"];
+const HISTORY_FIELDS: HistoryField[] = [
+  "project_path",
+  "name",
+  "cmd",
+  "branch",
+];
 const HISTORY_CAP = 100;
 
 /// Plugin-side focus tracker for the new-session form. The host
@@ -6348,7 +8664,14 @@ function rebuildFormFocusCycle(): void {
   } else if (form.backend === "devcontainer") {
     cycle.push("project_path", "name", "cmd");
   } else if (form.backend === "ssh") {
-    cycle.push("ssh_host", "ssh_path", "ssh_identity", "ssh_options", "name", "cmd");
+    cycle.push(
+      "ssh_host",
+      "ssh_path",
+      "ssh_identity",
+      "ssh_options",
+      "name",
+      "cmd",
+    );
   } else if (form.backend === "kubernetes") {
     cycle.push("k8s_target");
     if (form.k8sTarget.value.trim().length === 0) {
@@ -6373,8 +8696,8 @@ function formFocusedKey(): string {
 
 function advanceFormFocus(delta: 1 | -1): void {
   if (formFocusCycle.length === 0) return;
-  formFocusIndex =
-    (formFocusIndex + delta + formFocusCycle.length) % formFocusCycle.length;
+  formFocusIndex = (formFocusIndex + delta + formFocusCycle.length) %
+    formFocusCycle.length;
 }
 
 function snapFormFocusTo(key: string): void {
@@ -6464,19 +8787,28 @@ function walkHistory(field: HistoryField, delta: -1 | 1): void {
   renderForm();
 }
 
-function formSlot(field: HistoryField): { value: string; cursor: number } | null {
+function formSlot(
+  field: HistoryField,
+): { value: string; cursor: number } | null {
   if (!form) return null;
   switch (field) {
-    case "project_path": return form.projectPath;
-    case "name": return form.name;
-    case "cmd": return form.cmd;
-    case "branch": return form.branch;
+    case "project_path":
+      return form.projectPath;
+    case "name":
+      return form.name;
+    case "cmd":
+      return form.cmd;
+    case "branch":
+      return form.branch;
   }
 }
 
-function lastNonEmptyLine(s: string): string {
-  const lines = (s || "").split(/\r?\n/).filter((l) => l.trim().length > 0);
-  return lines.length ? lines[lines.length - 1].trim() : "";
+function commandErrorSummary(s: string): string {
+  const lines = (s || "").split(/\r?\n/).map((line) => line.trim()).filter(
+    Boolean,
+  );
+  return lines.find((line) => /^(fatal|error):/i.test(line)) ??
+    lines[lines.length - 1] ?? "";
 }
 
 /// Split the user's "Agent Command" string into an argv suitable for
@@ -6579,8 +8911,11 @@ interface AgentEntry {
   // enables "Teach Fresh CLI". Absent ⇒ the agent has no autonomous shell to
   // drive the editor (aider), so the checkbox stays hidden for it.
   systemPrompt?: AgentSystemPrompt;
+  // The companion marker is passed only through the seeded terminal creation
+  // path; ordinary `createTerminal` launches intentionally stay unmarked.
+  companion?: "omp";
 }
-// The four launcher-priority agents come first (claude, codex, opencode), then
+// The launcher-priority agents come first (claude, codex, opencode, omp), then
 // the long-standing aider entry. Order here drives the preset-row order.
 const AGENT_REGISTRY: AgentEntry[] = [
   {
@@ -6637,6 +8972,15 @@ const AGENT_REGISTRY: AgentEntry[] = [
     systemPrompt: { via: "file", path: "AGENTS.md" },
   },
   {
+    id: "omp",
+    label: "omp",
+    match: /^omp$/,
+    spec: { continue: { resumeArgs: ["--continue"] } },
+    prompt: { style: "positional" },
+    systemPrompt: { via: "file", path: "AGENTS.md" },
+    companion: "omp",
+  },
+  {
     // aider keeps its conversation in the repo and reloads it with
     // `--restore-chat-history`; it has no caller-supplied session id, so it's
     // a continue-only (strategy B) agent. `--yes-always` auto-confirms; `-m`
@@ -6681,50 +9025,39 @@ const FRESH_CLI_SYSTEM_PROMPT = [
   "  return editor.describeWorkspace();",
   "",
   "  // README in a new pane to the RIGHT of what is there now",
-  "  await editor.splitWindow({ direction: \"vertical\", place: \"after\", file: \"README.md\" });",
+  '  await editor.splitWindow({ direction: "vertical", place: "after", file: "README.md" });',
   "",
   "  // ...to the LEFT instead, or stacked below",
-  "  await editor.splitWindow({ direction: \"vertical\", place: \"before\", file: \"README.md\" });",
-  "  await editor.splitWindow({ direction: \"horizontal\", place: \"after\", file: \"notes.md\" });",
+  '  await editor.splitWindow({ direction: "vertical", place: "before", file: "README.md" });',
+  '  await editor.splitWindow({ direction: "horizontal", place: "after", file: "notes.md" });',
   "",
   "  // ...without stealing focus from the pane the user is working in",
-  "  await editor.splitWindow({ direction: \"horizontal\", place: \"after\", file: \"notes.md\", keepFocus: true });",
+  '  await editor.splitWindow({ direction: "horizontal", place: "after", file: "notes.md", keepFocus: true });',
   "",
   "  // open a file at a line, in a pane you name",
   "  const ws = editor.describeWorkspace();",
-  "  editor.openFileInSplit(ws.panes[0].splitId, \"src/main.rs\", 42);",
+  '  editor.openFileInSplit(ws.panes[0].splitId, "src/main.rs", 42);',
   "",
   "  // show text you produced: write a file, then open it \u2014 you get highlighting, search, save, and ANSI colour",
-  "  await editor.splitWindow({ file: \"/tmp/report.md\" });",
+  '  await editor.splitWindow({ file: "/tmp/report.md" });',
   "",
   "  // new workspace on its own git worktree, running an agent; resolves once it is up",
-  "  const orch = editor.getPluginApi(\"orchestrator\");",
-  "  return await orch.newWorkspace({ path: \"/repo\", agent: \"claude\", prompt: \"fix the flaky test\", newBranch: \"fix/flaky\" });",
+  '  const orch = editor.getPluginApi("orchestrator");',
+  "  const callerWindowId = Number(editor.describeWorkspace().windowId);",
+  '  return await orch.newWorkspace({ windowId: callerWindowId, path: "/repo", agent: "claude", prompt: "fix the flaky test", newBranch: "fix/flaky" });',
   "",
-  "  // teach a human the code you just wrote: author a tour, then open it in the dock",
-  "  // steps are {step_id, title, file_path, lines: [from, to] (1-indexed, inclusive), explanation (markdown)}",
-  "  editor.writeFile(\"/repo/.fresh-tour.json\", JSON.stringify({",
-  "    title: \"Request pipeline\", description: \"How a request reaches the handler\",",
-  "    schema_version: \"1.0\", steps: [",
-  "      { step_id: 1, title: \"Entry point\", file_path: \"src/main.rs\", lines: [1, 40],",
-  "        explanation: \"## Where it starts\\n\\nThe listener is built here.\\n\\n- binds the socket\\n- spawns the accept loop\" },",
-  "    ],",
-  "  }, null, 2));",
-  "  return await editor.getPluginApi(\"code-tour\").openTour(\".fresh-tour.json\");",
-  "",
-  "  // an agent in THIS workspace, and what workspaces exist",
-  "  await orch.runAgent({ agent: \"claude\", prompt: \"...\" });",
-  "  return orch.listWorkspaces();",
+  "  // run an agent in an explicitly named workspace",
+  '  return await orch.runAgent({ windowId: callerWindowId, agent: "claude", prompt: "..." });',
   "",
   "  // after a mutation that does not answer, flush before reading",
   "  editor.setSplitRatio(splitId, 0.3);",
   "  await editor.flush();",
   "  return editor.describeWorkspace();",
   "",
-  "`direction` names the divider: \"vertical\" = side by side, \"horizontal\" = stacked. `place` is \"before\" (left/top) or \"after\" (right/bottom, the default).",
+  '`direction` names the divider: "vertical" = side by side, "horizontal" = stacked. `place` is "before" (left/top) or "after" (right/bottom, the default).',
   "Mutations are queued, so a read in the same script sees the state from before them \u2014 await the mutation (those that answer resolve once applied) or `await editor.flush()`.",
-  "Finding anything else: `\"$FRESH_BIN\" --cmd script api <query>` searches the whole API by name and docs; `--cmd script check <file>` flags unknown editor.* names without running; `--cmd script types` prints the .d.ts paths.",
-  "Launches answer with {\"workspaceId\",\"windowId\",\"root\"} \u2014 record workspaceId, it survives editor restarts; windowId does not.",
+  'Finding anything else: `"$FRESH_BIN" --cmd script api <query>` searches the whole API by name and docs; `--cmd script check <file>` flags unknown editor.* names without running; `--cmd script types` prints the .d.ts paths.',
+  'Launches answer with {"workspaceId","windowId","root"} \u2014 record workspaceId, it survives editor restarts; windowId does not.',
   "FRESH_WINDOW_ID is your window. After an `await` the focused pane may be someone else's, so prefer calls taking an explicit id.",
   "You are changing a workspace a human is watching: prefer reversible moves, do not close or overwrite panes you were not asked to touch, and read back what you changed before reporting success.",
   "Scripts run to completion and are then forgotten; whatever they create outlives them.",
@@ -6739,17 +9072,20 @@ const FRESH_CLI_BLOCK_END = "<!-- fresh-cli:end -->";
 // Write (or append) the Fresh CLI system prompt into an agent-read file
 // (`AGENTS.md`). If the file already exists, append a clearly-marked block
 // rather than overwriting the user's content; otherwise create it fresh.
-function writeFreshCliPromptFile(path: string): void {
-  const block = `${FRESH_CLI_BLOCK_START}\n${FRESH_CLI_SYSTEM_PROMPT}\n${FRESH_CLI_BLOCK_END}\n`;
-  if (editor.fileExists(editor.localPath(path))) {
-    const existing = editor.readFile(editor.localPath(path)) ?? "";
-    // Idempotent on retry / restart-recovery: never stack duplicate blocks.
-    if (existing.includes(FRESH_CLI_BLOCK_START)) return;
-    const sep = existing.length === 0 || existing.endsWith("\n") ? "\n" : "\n\n";
-    editor.writeFile(editor.localPath(path), existing + sep + block);
-  } else {
-    editor.writeFile(editor.localPath(path), block);
+type PluginFsPath = Parameters<typeof editor.writeFile>[0];
+
+function writeFreshCliPromptFile(path: PluginFsPath): boolean {
+  const block =
+    `${FRESH_CLI_BLOCK_START}\n${FRESH_CLI_SYSTEM_PROMPT}\n${FRESH_CLI_BLOCK_END}\n`;
+  if (editor.fileExists(path)) {
+    const existing = editor.readFile(path) ?? "";
+    if (existing.includes(FRESH_CLI_BLOCK_START)) return true;
+    const sep = existing.length === 0 || existing.endsWith("\n")
+      ? "\n"
+      : "\n\n";
+    return editor.writeFile(path, existing + sep + block);
   }
+  return editor.writeFile(path, block);
 }
 
 // The registry entry a typed command resolves to (by argv0 basename), or null
@@ -6786,7 +9122,12 @@ interface AgentPreset {
 }
 function agentPresets(): AgentPreset[] {
   const presets: AgentPreset[] = [
-    { label: editor.t("form.agent_terminal"), cmd: "", key: "agent-preset-terminal", resumes: false },
+    {
+      label: editor.t("form.agent_terminal"),
+      cmd: "",
+      key: "agent-preset-terminal",
+      resumes: false,
+    },
   ];
   for (const e of AGENT_REGISTRY) {
     presets.push({
@@ -6858,58 +9199,186 @@ function agentSessionUuid(): string {
   }
   return s;
 }
+const OMP_SESSION_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Resolve a user's agent argv into the argv to *launch* and the argv to run on
-// *restore* (resume), per the registry. Unknown commands (plain shells, custom
-// agents) pass through unchanged with no resume — i.e. today's behaviour.
+// OMP storage scope is part of an exact session identity. Keep its original
+// argv shape when an explicit UUID-backed selector is persisted.
+function ompResumeScopeArgs(options: string[]): string[] {
+  const scope: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < options.length; i++) {
+    const arg = options[i];
+    const key = arg === "--profile" || arg === "--session-dir"
+      ? arg
+      : arg.startsWith("--profile=")
+      ? "--profile"
+      : arg.startsWith("--session-dir=")
+      ? "--session-dir"
+      : null;
+    if (!key) continue;
+    if (seen.has(key)) throw new Error(`OMP ${key} may be supplied only once`);
+    seen.add(key);
+    if (arg === key) {
+      const value = options[++i];
+      if (!value || value === "--") {
+        throw new Error(`OMP ${key} requires a value`);
+      }
+      scope.push(arg, value);
+    } else {
+      if (arg.slice(key.length + 1).length === 0) {
+        throw new Error(`OMP ${key} requires a value`);
+      }
+      scope.push(arg);
+    }
+  }
+  return scope;
+}
+
+// Resolve a user's agent argv into three distinct lifecycles: the initial
+// launch (one-shot prompts included), exact conversation resume, and a clean
+// relaunch when generic resume is disabled. Unknown commands pass through
+// unchanged for both launch and relaunch.
 function resolveAgentLaunch(
   argv: string[],
   opts?: { auto?: boolean; prompt?: string; systemPrompt?: string },
-): { launch: string[]; resume?: string[] } {
-  if (argv.length === 0) return { launch: argv };
+): {
+  launch: string[];
+  relaunch: string[];
+  resume?: string[];
+  companion?: "omp";
+} {
+  if (argv.length === 0) return { launch: argv, relaunch: argv };
   const argv0 = argv[0];
   const base = editor.pathBasename(argv0) || argv0;
   const entry = AGENT_REGISTRY.find((e) => e.match.test(base));
-  // Unknown command (a plain shell / custom binary): pass through untouched.
-  // Auto mode and the start prompt are agent-registry features, so there's
-  // nothing to inject here.
-  if (!entry) return { launch: argv };
+  // The companion is an opaque built-in-preset capability, not a basename
+  // property. Explicit paths and PATH-substituted custom commands stay ordinary
+  // terminals even when their filename is `omp`.
+  if (!entry || (entry.id === "omp" && argv0 !== "omp")) {
+    return { launch: argv, relaunch: argv };
+  }
 
-  // Auto-mode flags ride on *both* launch and resume — a resumed session
-  // keeps the approval posture the user chose. Prompt is launch-only: it seeds
-  // the first turn and must never be replayed when rejoining the conversation.
+  // OMP has a pinned native launch grammar. The prompt suffix is launch-only;
+  // only an explicit UUID-backed selector is durable. Bare `--continue` is
+  // cwd-scoped and must not be replayed after a Fresh restart.
+  if (entry.id === "omp") {
+    const supplied = argv.slice(1);
+    const delimiter = supplied.indexOf("--");
+    const commandPrompt = delimiter >= 0 ? supplied.slice(delimiter + 1) : [];
+    const optionInput = delimiter >= 0
+      ? supplied.slice(0, delimiter)
+      : supplied;
+    const options = optionInput[0] === "launch"
+      ? optionInput.slice(1)
+      : optionInput;
+    const prompt = (opts?.prompt ?? "").trim();
+    if (commandPrompt.length > 0 && prompt) {
+      throw new Error(
+        "OMP prompt is ambiguous: use either Agent Command '--' payload or Start prompt",
+      );
+    }
+
+    ompResumeScopeArgs(options);
+    const disablesResume = options.some((arg) =>
+      arg === "--no-session" || arg.startsWith("--no-session=")
+    );
+    let selectorStart = -1;
+    let selectorEnd = -1;
+    let selectorResume: string[] | undefined;
+    for (let i = 0; i < options.length; i++) {
+      const arg = options[i];
+      if (arg === "--profile" || arg === "--session-dir") {
+        i++;
+        continue;
+      }
+      if (arg !== "--continue" && arg !== "-c" && arg !== "--resume") continue;
+      if (selectorStart >= 0) {
+        throw new Error("OMP session selector may be supplied only once");
+      }
+      selectorStart = i;
+      selectorEnd = i + 1;
+      if (arg === "--resume") {
+        const id = options[i + 1];
+        if (!id || !OMP_SESSION_UUID.test(id)) {
+          throw new Error("OMP --resume requires a UUID");
+        }
+        selectorEnd++;
+        selectorResume = [arg, id];
+        i++;
+      } else {
+        const id = options[i + 1];
+        if (id && OMP_SESSION_UUID.test(id)) {
+          selectorEnd++;
+          selectorResume = [arg, id];
+          i++;
+          // Bare continue is provisional for this launch only. The companion's
+          // authenticated snapshot will install an exact durable resume later.
+        }
+      }
+    }
+
+    const relaunchOptions = selectorStart < 0 ? options : [
+      ...options.slice(0, selectorStart),
+      ...options.slice(selectorEnd),
+    ];
+    const exactResumeOptions = selectorResume
+      ? [...relaunchOptions, ...selectorResume]
+      : undefined;
+    const launch = [argv0, "launch", ...options];
+    if (commandPrompt.length > 0) launch.push("--", ...commandPrompt);
+    else if (prompt) launch.push("--", prompt);
+    return {
+      launch,
+      relaunch: [argv0, "launch", ...relaunchOptions],
+      ...(exactResumeOptions && !disablesResume
+        ? { resume: [argv0, ...exactResumeOptions] }
+        : {}),
+      companion: "omp",
+    };
+  }
+
+  // Auto-mode flags survive every lifecycle. Start/system prompts seed only
+  // the initial turn, so a clean relaunch must omit them just like resume does.
   const autoArgs = opts?.auto && entry.auto ? entry.auto : [];
   const prompt = (opts?.prompt ?? "").trim();
   const promptArgs = prompt && entry.prompt
     ? agentPromptArgs(entry.prompt, prompt)
     : [];
-  // "Teach Fresh CLI" for a flag-style agent (claude) rides launch only —
-  // like the start prompt, it seeds the first turn and must not replay on
-  // resume. File-style agents (codex/opencode) get the text written into a
-  // file instead, so they never reach here.
   const sysPrompt = (opts?.systemPrompt ?? "").trim();
   const sysPromptArgs = sysPrompt && entry.systemPrompt?.via === "flag"
     ? [entry.systemPrompt.flag, sysPrompt]
     : [];
-  // Flags first (auto + system prompt), then the (trailing) positional prompt
-  // so a positional start-prompt stays last.
-  const withAuto = [...argv, ...autoArgs, ...sysPromptArgs];
+  const relaunch = [...argv, ...autoArgs];
+  const initial = [...relaunch, ...sysPromptArgs];
 
   if (entry.spec.provision) {
     const id = agentSessionUuid();
     const { idFlag, resumeArgs } = entry.spec.provision;
     return {
-      launch: [...withAuto, idFlag, id, ...promptArgs],
-      resume: [argv0, ...resumeArgs.map((a) => a.replace("{id}", id)), ...autoArgs],
+      launch: [...initial, idFlag, id, ...promptArgs],
+      relaunch,
+      resume: [
+        argv0,
+        ...resumeArgs.map((a) => a.replace("{id}", id)),
+        ...autoArgs,
+      ],
+      companion: entry.companion,
     };
   }
   if (entry.spec.continue) {
     return {
-      launch: [...withAuto, ...promptArgs],
+      launch: [...initial, ...promptArgs],
+      relaunch,
       resume: [argv0, ...entry.spec.continue.resumeArgs, ...autoArgs],
+      companion: entry.companion,
     };
   }
-  return { launch: [...withAuto, ...promptArgs] };
+  return {
+    launch: [...initial, ...promptArgs],
+    relaunch,
+    companion: entry.companion,
+  };
 }
 
 async function spawnCollect(
@@ -6917,7 +9386,7 @@ async function spawnCollect(
   args: string[],
   cwd: string,
 ): Promise<SpawnResult> {
-  return await editor.spawnProcess(command, args, cwd);
+  return await editor.spawnHostProcess(command, args, cwd);
 }
 
 /// Resolve the origin's default branch as `"origin/<name>"` from
@@ -7043,7 +9512,12 @@ interface WorktreeInfo {
 /// plain directory / shared root).
 async function classifyWorktree(path: string): Promise<WorktreeInfo | null> {
   if (!path) return null;
-  const top = await spawnCollect("git", ["-C", path, "rev-parse", "--show-toplevel"], path);
+  const top = await spawnCollect("git", [
+    "-C",
+    path,
+    "rev-parse",
+    "--show-toplevel",
+  ], path);
   if (top.exit_code !== 0) return null;
   const toplevel = (top.stdout || "").trim();
   if (!toplevel) return null;
@@ -7053,10 +9527,22 @@ async function classifyWorktree(path: string): Promise<WorktreeInfo | null> {
   // worktree (`<common>/worktrees/<id>`). That difference is the
   // canonical "is this a linked worktree?" test.
   const [gitDir, commonDir] = await Promise.all([
-    spawnCollect("git", ["-C", toplevel, "rev-parse", "--path-format=absolute", "--git-dir"], toplevel),
+    spawnCollect("git", [
+      "-C",
+      toplevel,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-dir",
+    ], toplevel),
     spawnCollect(
       "git",
-      ["-C", toplevel, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      [
+        "-C",
+        toplevel,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      ],
       toplevel,
     ),
   ]);
@@ -7080,6 +9566,8 @@ interface ParsedWorktree {
   path: string;
   branch: string;
   detached: boolean;
+  locked: boolean;
+  prunable: boolean;
 }
 
 /// Parse `git worktree list --porcelain` output. Blocks are
@@ -7093,12 +9581,22 @@ function parseWorktreePorcelain(stdout: string): ParsedWorktree[] {
     const line = raw.trimEnd();
     if (line.startsWith("worktree ")) {
       if (cur) out.push(cur);
-      cur = { path: line.slice("worktree ".length), branch: "", detached: false };
+      cur = {
+        path: line.slice("worktree ".length),
+        branch: "",
+        detached: false,
+        locked: false,
+        prunable: false,
+      };
     } else if (cur && line.startsWith("branch ")) {
       const ref = line.slice("branch ".length);
       cur.branch = ref.replace(/^refs\/heads\//, "");
     } else if (cur && line === "detached") {
       cur.detached = true;
+    } else if (cur && line.startsWith("locked")) {
+      cur.locked = true;
+    } else if (cur && line.startsWith("prunable")) {
+      cur.prunable = true;
     } else if (line === "" && cur) {
       out.push(cur);
       cur = null;
@@ -7139,62 +9637,113 @@ function sessionNameBaseFor(repoRoot: string): string {
   return slug.length > 0 ? slug : "session";
 }
 
-async function nextAutoSessionName(
-  repoRoot: string,
-  options?: { persist?: boolean },
-): Promise<string> {
-  // Root the auto-name in the project (`<project>-1`, `<project>-2`, …)
-  // rather than a bare `session-N`, so a dock row tells you which
-  // project the session belongs to (F6). The name also seeds the
-  // worktree branch.
-  //
-  // Persisted counter so consecutive empty submits keep incrementing
-  // even across plugin reloads. But the counter alone isn't
-  // sufficient: a previous run may have left a branch / worktree behind
-  // (orchestrator's archive / external git delete / interrupted
-  // submit), so `<project>-${counter+1}` can collide and
-  // `git worktree add` would fail with the noisy "already used by
-  // worktree at …" message. Probe the local git refs once and
-  // increment past any reserved `<project>-N` name before returning.
-  //
-  // `persist: false` (the default) computes the name without
-  // advancing the persisted counter — for placeholder previews
-  // that happen on every Project Path keystroke. The submit
-  // path passes `persist: true` so consecutive submissions
-  // increment normally.
-  const persist = options?.persist === true;
-  const base = sessionNameBaseFor(repoRoot);
-  const counterBefore = (editor.getGlobalState("orchestrator.session_counter") as
-    | number
-    | undefined) ?? 0;
-  let next = counterBefore + 1;
+function autoNameCounterKey(repoRoot: string): string {
+  return "orchestrator.session_counter:" +
+    encodeURIComponent(normRoot(repoRoot));
+}
+const autoNameHighWater = new Map<string, number>();
 
-  // Collect existing branch names that look like `<project>-N` so we
-  // can skip past them. `git for-each-ref` is faster and tighter
-  // than parsing `git worktree list` output. `.` is the only
-  // regex-special char the slug can contain, so escape it.
-  const refs = await spawnCollect(
-    "git",
-    ["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
-    repoRoot,
-  );
-  const taken = new Set<number>();
-  if (refs.exit_code === 0) {
-    const re = new RegExp(`^${base.replace(/[.]/g, "\\.")}-(\\d+)$`);
-    for (const line of (refs.stdout || "").split(/\r?\n/)) {
-      const m = re.exec(line.trim());
-      if (m) {
-        taken.add(parseInt(m[1], 10));
+async function allocateAutoSessionName(
+  repoRoot: string,
+  persist: boolean,
+  requireOwner?: () => void,
+): Promise<string> {
+  const base = sessionNameBaseFor(repoRoot);
+  const counterKey = autoNameCounterKey(repoRoot);
+  const persistedBefore = readPersistedPluginState()[counterKey];
+  let next = (typeof persistedBefore === "number" &&
+      Number.isFinite(persistedBefore)
+    ? Math.floor(persistedBefore)
+    : 0) + 1;
+  requireOwner?.();
+  if (persist) {
+    // Reserve in this runtime before the first await. The filesystem lease
+    // coordinates editor processes; this high-water mark coordinates the
+    // concurrent promises inside one plugin runtime.
+    next = Math.max(next, (autoNameHighWater.get(counterKey) ?? 0) + 1);
+    autoNameHighWater.set(counterKey, next);
+    requireOwner?.();
+  }
+
+  const lease = persist
+    ? await acquireLease(`name-allocation:${normRoot(repoRoot)}`, 10_000)
+    : null;
+  requireOwner?.();
+  if (persist && !lease) {
+    throw new Error("another workspace name allocation is still running");
+  }
+  const heartbeat = lease
+    ? startLeaseHeartbeat(
+      () => renewLease(lease),
+      (milliseconds) => editor.delay(milliseconds),
+      LEASE_TTL_MS,
+      "workspace name allocation",
+    )
+    : null;
+  try {
+    heartbeat?.assertOwned();
+    requireOwner?.();
+    const persisted = readPersistedPluginState()[counterKey];
+    const durableNext = (typeof persisted === "number" &&
+        Number.isFinite(persisted)
+      ? Math.floor(persisted)
+      : 0) + 1;
+    const refs = await spawnCollect(
+      "git",
+      [
+        "-C",
+        repoRoot,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads/",
+      ],
+      repoRoot,
+    );
+    heartbeat?.assertOwned();
+    requireOwner?.();
+    const taken = new Set<number>();
+    if (refs.exit_code === 0) {
+      const re = new RegExp(`^${base.replace(/[.]/g, "\\.")}-(\\d+)$`);
+      for (const line of (refs.stdout || "").split(/\r?\n/)) {
+        const match = re.exec(line.trim());
+        if (match) {
+          taken.add(parseInt(match[1], 10));
+        }
       }
     }
+    if (durableNext > next || taken.has(next)) {
+      next = Math.max(
+        durableNext,
+        persist ? (autoNameHighWater.get(counterKey) ?? 0) + 1 : next,
+      );
+      while (taken.has(next)) next += 1;
+      if (persist) autoNameHighWater.set(counterKey, next);
+    }
+    if (persist) {
+      heartbeat?.assertOwned();
+      requireOwner?.();
+      if (!(await setDurableState(counterKey, next))) {
+        throw new Error("could not durably reserve a workspace name");
+      }
+      heartbeat?.assertOwned();
+      requireOwner?.();
+    }
+    return `${base}-${next}`;
+  } finally {
+    heartbeat?.stop();
+    if (lease) releaseLease(lease);
   }
-  while (taken.has(next)) {
-    next += 1;
-  }
-  if (persist) {
-    editor.setGlobalState("orchestrator.session_counter", next);
-  }
-  return `${base}-${next}`;
+}
+
+async function nextAutoSessionName(
+  repoRoot: string,
+  options?: { persist?: boolean; requireOwner?: () => void },
+): Promise<string> {
+  return await allocateAutoSessionName(
+    repoRoot,
+    options?.persist === true,
+    options?.requireOwner,
+  );
 }
 
 // Subtitle splits the static prefix "Project:" from the project
@@ -7258,7 +9807,12 @@ function backendTabsRow(): WidgetSpec {
   const parts: WidgetSpec[] = [
     {
       kind: "raw",
-      entries: [styledRow([{ text: editor.t("form.run_in"), style: { fg: "ui.menu_disabled_fg" } }])],
+      entries: [
+        styledRow([{
+          text: editor.t("form.run_in"),
+          style: { fg: "ui.menu_disabled_fg" },
+        }]),
+      ],
     },
   ];
   for (const b of SESSION_BACKENDS) {
@@ -7275,7 +9829,12 @@ function backendTabsRow(): WidgetSpec {
   parts.push(flexSpacer());
   parts.push({
     kind: "raw",
-    entries: [styledRow([{ text: editor.t("form.switch_type"), style: { fg: "ui.menu_disabled_fg", italic: true } }])],
+    entries: [
+      styledRow([{
+        text: editor.t("form.switch_type"),
+        style: { fg: "ui.menu_disabled_fg", italic: true },
+      }]),
+    ],
   });
   return row(...parts);
 }
@@ -7292,7 +9851,10 @@ function backendTabsRow(): WidgetSpec {
 function agentPresetRow(): WidgetSpec {
   const presets = agentPresets();
   const activeKey = activeAgentPresetKey();
-  const selectedIndex = Math.max(0, presets.findIndex((p) => p.key === activeKey));
+  const selectedIndex = Math.max(
+    0,
+    presets.findIndex((p) => p.key === activeKey),
+  );
   return dropdown(presets.map((p) => p.label), {
     selectedIndex,
     // Strip the trailing colon from the shared "Agent:" label — the dropdown
@@ -7378,7 +9940,9 @@ function localBodyFields(): WidgetSpec[] {
         // rendered dim-italic, but that's invisible in a plain
         // capture). Submitting with the field empty uses this path.
         placeholder: form.defaultProjectPath
-          ? editor.t("form.project_path_default", { path: form.defaultProjectPath })
+          ? editor.t("form.project_path_default", {
+            path: form.defaultProjectPath,
+          })
           : editor.t("form.detecting_project_root"),
         fullWidth: true,
         key: "project_path",
@@ -7444,23 +10008,23 @@ function advancedSection(): WidgetSpec[] {
   fields.push(
     worktreeEnabled
       ? toggle(effectiveCreateWorktree, editor.t("form.create_worktree"), {
-          key: "worktree",
-        })
+        key: "worktree",
+      })
       : {
-          kind: "raw",
-          entries: [
-            styledRow([
-              {
-                text: editor.t("form.create_worktree_disabled"),
-                style: { fg: "editor.whitespace_indicator_fg" },
-              },
-              {
-                text: editor.t("form.disabled_non_git"),
-                style: { fg: "editor.whitespace_indicator_fg", italic: true },
-              },
-            ]),
-          ],
-        },
+        kind: "raw",
+        entries: [
+          styledRow([
+            {
+              text: editor.t("form.create_worktree_disabled"),
+              style: { fg: "editor.whitespace_indicator_fg" },
+            },
+            {
+              text: editor.t("form.disabled_non_git"),
+              style: { fg: "editor.whitespace_indicator_fg", italic: true },
+            },
+          ]),
+        ],
+      },
   );
 
   // "Checkout branch" — an existing branch to check out. Editable for ANY git
@@ -7525,7 +10089,9 @@ function devcontainerBodyFields(): WidgetSpec[] {
         value: form.projectPath.value,
         cursorByte: form.projectPath.cursor,
         placeholder: form.defaultProjectPath
-          ? editor.t("form.project_path_default", { path: form.defaultProjectPath })
+          ? editor.t("form.project_path_default", {
+            path: form.defaultProjectPath,
+          })
           : editor.t("form.devcontainer_path_placeholder"),
         fullWidth: true,
         key: "project_path",
@@ -7694,7 +10260,10 @@ function buildConnectingView(): WidgetSpec {
     kind: "raw",
     entries: [
       styledRow([
-        { text: `${label}: `, style: { fg: "ui.menu_disabled_fg", bold: true } },
+        {
+          text: `${label}: `,
+          style: { fg: "ui.menu_disabled_fg", bold: true },
+        },
         { text: value || "—", style: { fg: "ui.menu_disabled_fg" } },
       ]),
     ],
@@ -7703,15 +10272,38 @@ function buildConnectingView(): WidgetSpec {
   if (form.backend === "ssh") {
     rows.push(roRow(editor.t("form.ro_run_in"), editor.t("backend.ssh")));
     rows.push(roRow(editor.t("form.ro_host"), form.sshHost.value.trim()));
-    if (form.sshPath.value.trim()) rows.push(roRow(editor.t("form.ro_remote_path"), form.sshPath.value.trim()));
+    if (form.sshPath.value.trim()) {
+      rows.push(
+        roRow(editor.t("form.ro_remote_path"), form.sshPath.value.trim()),
+      );
+    }
   } else if (form.backend === "kubernetes") {
-    rows.push(roRow(editor.t("form.ro_run_in"), editor.t("backend.kubernetes")));
+    rows.push(
+      roRow(editor.t("form.ro_run_in"), editor.t("backend.kubernetes")),
+    );
     const ns = form.k8sNamespace.value.trim();
     const pod = form.k8sPod.value.trim();
-    rows.push(roRow(editor.t("form.ro_pod"), form.k8sTarget.value.trim() || `${ns}/${pod}`));
+    rows.push(
+      roRow(
+        editor.t("form.ro_pod"),
+        form.k8sTarget.value.trim() || `${ns}/${pod}`,
+      ),
+    );
   } else {
-    rows.push(roRow(editor.t("form.ro_run_in"), form.backend === "devcontainer" ? editor.t("backend.devcontainer") : editor.t("backend.local")));
-    rows.push(roRow(editor.t("form.ro_project"), form.projectPath.value.trim() || form.defaultProjectPath));
+    rows.push(
+      roRow(
+        editor.t("form.ro_run_in"),
+        form.backend === "devcontainer"
+          ? editor.t("backend.devcontainer")
+          : editor.t("backend.local"),
+      ),
+    );
+    rows.push(
+      roRow(
+        editor.t("form.ro_project"),
+        form.projectPath.value.trim() || form.defaultProjectPath,
+      ),
+    );
   }
   const name = form.name.value.trim();
   if (name) rows.push(roRow(editor.t("form.ro_workspace"), name));
@@ -7728,7 +10320,9 @@ function buildConnectingView(): WidgetSpec {
       entries: [
         styledRow([
           {
-            text: remote ? editor.t("form.connecting") : editor.t("form.creating_workspace"),
+            text: remote
+              ? editor.t("form.connecting")
+              : editor.t("form.creating_workspace"),
             style: { fg: "ui.menu_disabled_fg", bold: true, italic: true },
           },
           {
@@ -7742,7 +10336,11 @@ function buildConnectingView(): WidgetSpec {
     wrappingRow(
       button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
       spacer(2),
-      button(editor.t("form.btn_create"), { intent: "primary", key: "create", disabled: true }),
+      button(editor.t("form.btn_create"), {
+        intent: "primary",
+        key: "create",
+        disabled: true,
+      }),
     ),
   );
 }
@@ -7816,7 +10414,8 @@ function buildFormSpec(): WidgetSpec {
           // literal `(auto-generated)` — the user sees the exact
           // name an empty submit would create. Empty while the
           // ref probe runs.
-          placeholder: form.defaultSessionName || editor.t("form.auto_generating"),
+          placeholder: form.defaultSessionName ||
+            editor.t("form.auto_generating"),
           fullWidth: true,
           key: "name",
         }),
@@ -7886,7 +10485,10 @@ function buildFormSpec(): WidgetSpec {
           focusable: true,
         }),
         spacer(2),
-        button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
+        button(editor.t("form.btn_cancel"), {
+          intent: "danger",
+          key: "cancel",
+        }),
       )
       : wrappingRow(
         button(editor.t("run_agent.btn_run"), {
@@ -7895,7 +10497,10 @@ function buildFormSpec(): WidgetSpec {
           focusable: true,
         }),
         spacer(2),
-        button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
+        button(editor.t("form.btn_cancel"), {
+          intent: "danger",
+          key: "cancel",
+        }),
       ),
     spacer(0),
     // === Footer: keybinding helper, centered. ====================
@@ -7929,7 +10534,6 @@ function deriveProjectLabel(): string {
   return base || cwd;
 }
 
-
 function renderForm(): void {
   if (!form || !formPanel) return;
   // Keep the focus mirror in step with the spec's tabbable set
@@ -7941,9 +10545,12 @@ function renderForm(): void {
   formPanel.update(buildFormSpec());
 }
 
-function openForm(options?: { fromPicker?: boolean; target?: RunAgentTarget }): void {
+function openForm(
+  options?: { fromPicker?: boolean; target?: RunAgentTarget },
+): void {
   const lastCmd =
-    (editor.getGlobalState("orchestrator.last_cmd") as string | undefined) ?? "";
+    (editor.getGlobalState("orchestrator.last_cmd") as string | undefined) ??
+      "";
   form = {
     // Defaults to creating a workspace; "Run Agent…" opens the same form
     // pre-switched to the current one.
@@ -7992,7 +10599,13 @@ function openForm(options?: { fromPicker?: boolean; target?: RunAgentTarget }): 
     probeToken: 0,
     historyCursor: { project_path: -1, name: -1, cmd: -1, branch: -1 },
     historyDraft: { project_path: "", name: "", cmd: "", branch: "" },
-    completion: { field: null, items: [], selectedIndex: 0, anchor: "", token: 0 },
+    completion: {
+      field: null,
+      items: [],
+      selectedIndex: 0,
+      anchor: "",
+      token: 0,
+    },
   };
   formPanel = new FloatingWidgetPanel();
   mountFormPanel();
@@ -8053,7 +10666,8 @@ function mountFormPanel(focusKey?: string): void {
   // `focusKey` to keep focus where the user left it — flipping the "Launch in"
   // switch must not fling focus away from the control just used, or the next
   // ←/→ silently lands on whatever inherited focus instead.
-  const field = focusKey ?? (creating ? firstBodyFieldKey(form.backend) : "agent_dropdown");
+  const field = focusKey ??
+    (creating ? firstBodyFieldKey(form.backend) : "agent_dropdown");
   formPanel.setFocusKey(field);
   snapFormFocusTo(field);
 }
@@ -8075,7 +10689,8 @@ function localProjectDefault(): string {
   // authority; corroborate with the orchestrator's own per-session remote
   // facet (set for the active SSH / k8s row). Either signal ⇒ cwd is remote.
   const active = orchestratorSessions.get(editor.activeWindow());
-  const activeIsRemote = editor.getAuthorityLabel().length > 0 || !!active?.remote;
+  const activeIsRemote = editor.getAuthorityLabel().length > 0 ||
+    !!active?.remote;
   if (!activeIsRemote) return cwd;
   // Active window is remote: pick the lowest-id local (non-remote, non-
   // discovered) session's root — in practice the launch/base window. If there
@@ -8095,9 +10710,10 @@ function localProjectDefault(): string {
 /// (the canonical-root probe runs against the latter). Re-runs
 /// on every Project Path keystroke (debounced via the caller).
 async function probeProjectPathDefaults(): Promise<void> {
-  if (!form) return;
-  const token = ++form.probeToken;
-  const typedPath = form.projectPath.value.trim();
+  const owner = form;
+  if (!owner) return;
+  const token = ++owner.probeToken;
+  const typedPath = owner.projectPath.value.trim();
 
   // (1) Default Project Path: only meaningful when the user
   //     hasn't typed anything. Resolve a local default → canonical
@@ -8107,20 +10723,20 @@ async function probeProjectPathDefaults(): Promise<void> {
   if (!typedPath) {
     const localDefault = localProjectDefault();
     const resolved = await resolveCanonicalRepoRoot(localDefault);
-    if (!form || form.probeToken !== token) return;
-    form.defaultProjectPath = resolved || localDefault;
+    if (form !== owner || owner.probeToken !== token) return;
+    owner.defaultProjectPath = resolved || localDefault;
   } else {
     // User typed a path: that IS the project, no canonical
     // resolution needed. Defaults that depend on it (session
     // name, default branch) still need to run against it below.
-    form.defaultProjectPath = typedPath;
+    owner.defaultProjectPath = typedPath;
   }
 
   // (2) Is-inside-work-tree probe drives the worktree checkbox.
-  const effectivePath = typedPath || form.defaultProjectPath;
+  const effectivePath = typedPath || owner.defaultProjectPath;
   const isGit = await pathIsInsideGitWorkTree(effectivePath);
-  if (!form || form.probeToken !== token) return;
-  form.projectPathIsGit = isGit;
+  if (form !== owner || owner.probeToken !== token) return;
+  owner.projectPathIsGit = isGit;
 
   // (2b) Existing-linked-worktree detection. When the path is a
   //      worktree created by `git worktree add` (not the repo's main
@@ -8128,16 +10744,16 @@ async function probeProjectPathDefaults(): Promise<void> {
   //      natural action is to attach to it. Only flip on the
   //      detection transition so we don't fight a user who
   //      deliberately re-checks "create a new worktree".
-  const wasLinked = form.projectPathIsLinkedWorktree;
+  const wasLinked = owner.projectPathIsLinkedWorktree;
   if (isGit) {
     const info = await classifyWorktree(effectivePath);
-    if (!form || form.probeToken !== token) return;
-    form.projectPathIsLinkedWorktree = info?.isLinked === true;
+    if (form !== owner || owner.probeToken !== token) return;
+    owner.projectPathIsLinkedWorktree = info?.isLinked === true;
   } else {
-    form.projectPathIsLinkedWorktree = false;
+    owner.projectPathIsLinkedWorktree = false;
   }
-  if (form.projectPathIsLinkedWorktree && wasLinked !== true) {
-    form.createWorktree = false;
+  if (owner.projectPathIsLinkedWorktree && wasLinked !== true) {
+    owner.createWorktree = false;
   }
 
   // (3) Default branch + session name probes only make sense on
@@ -8149,20 +10765,20 @@ async function probeProjectPathDefaults(): Promise<void> {
       detectDefaultBranchWithFallback(effectivePath),
       nextAutoSessionName(effectivePath),
     ]);
-    if (!form || form.probeToken !== token) return;
-    form.defaultBranch = ref;
-    form.defaultBranchIsHeadFallback = isHeadFallback;
-    form.defaultSessionName = sessionName;
+    if (form !== owner || owner.probeToken !== token) return;
+    owner.defaultBranch = ref;
+    owner.defaultBranchIsHeadFallback = isHeadFallback;
+    owner.defaultSessionName = sessionName;
   } else {
     // Non-git: still surface a numeric placeholder for Session
     // Name so the user sees what an empty submit will produce.
     // `nextAutoSessionName` falls back cleanly when the refs
     // probe fails (no git → empty set → counter+1).
     const sessionName = await nextAutoSessionName(effectivePath);
-    if (!form || form.probeToken !== token) return;
-    form.defaultBranch = "";
-    form.defaultBranchIsHeadFallback = false;
-    form.defaultSessionName = sessionName;
+    if (form !== owner || owner.probeToken !== token) return;
+    owner.defaultBranch = "";
+    owner.defaultBranchIsHeadFallback = false;
+    owner.defaultSessionName = sessionName;
   }
   renderForm();
 }
@@ -8175,10 +10791,11 @@ async function probeProjectPathDefaults(): Promise<void> {
 /// latest scheduled probe wins" so back-to-back keystrokes
 /// collapse cleanly without an explicit timer handle.
 function scheduleProjectPathReprobe(): void {
-  if (!form) return;
-  const token = ++form.probeToken;
+  const owner = form;
+  if (!owner) return;
+  const token = ++owner.probeToken;
   void editor.delay(200).then(() => {
-    if (!form || form.probeToken !== token) return;
+    if (form !== owner || owner.probeToken !== token) return;
     void probeProjectPathDefaults();
   });
 }
@@ -8203,11 +10820,13 @@ const COMPLETION_MAX_ITEMS = 50;
 function scheduleCompletionRefresh(
   field: "project_path" | "branch",
 ): void {
-  if (!form) return;
-  const anchor = form[field === "project_path" ? "projectPath" : "branch"].value;
-  const token = ++form.completion.token;
-  form.completion.field = field;
-  form.completion.anchor = anchor;
+  const owner = form;
+  if (!owner) return;
+  const anchor =
+    owner[field === "project_path" ? "projectPath" : "branch"].value;
+  const token = ++owner.completion.token;
+  owner.completion.field = field;
+  owner.completion.anchor = anchor;
   // Path completion reads from `editor.readDir`, which is a
   // synchronous host call (no IPC waiting). Run it inline so
   // Tab pressed immediately after the last keystroke picks
@@ -8218,8 +10837,8 @@ function scheduleCompletionRefresh(
   // refreshed yet.
   if (field === "project_path") {
     const items = computePathCompletions(anchor);
-    if (!form || form.completion.token !== token) return;
-    setCompletionItems(field, items);
+    if (form !== owner || owner.completion.token !== token) return;
+    setCompletionItems(owner, field, items);
     return;
   }
   // Branch completion shells out to `git for-each-ref` — that
@@ -8230,10 +10849,10 @@ function scheduleCompletionRefresh(
   // tab completion exhibits while a long-running compspec is
   // catching up.
   void editor.delay(150).then(async () => {
-    if (!form || form.completion.token !== token) return;
-    const items = await fetchBranchCompletions(anchor);
-    if (!form || form.completion.token !== token) return;
-    setCompletionItems(field, items);
+    if (form !== owner || owner.completion.token !== token) return;
+    const items = await fetchBranchCompletions(anchor, owner);
+    if (form !== owner || owner.completion.token !== token) return;
+    setCompletionItems(owner, field, items);
   });
 }
 
@@ -8272,10 +10891,11 @@ function computePathCompletions(typed: string): string[] {
 }
 
 function setCompletionItems(
+  owner: NewSessionForm,
   field: "project_path" | "branch",
   items: string[],
 ): void {
-  if (!form) return;
+  if (form !== owner) return;
   // Compose the popup row list: live completion candidates
   // first (regular `kind: undefined`), then any history entries
   // for this field that aren't already in the live list,
@@ -8296,15 +10916,15 @@ function setCompletionItems(
       .map((value) => ({ value, kind: "history" as const }));
     composed = [...live, ...historyRows].slice(0, COMPLETION_MAX_ITEMS);
   }
-  form.completion.field = field;
-  form.completion.items = composed;
-  form.completion.selectedIndex = 0;
+  owner.completion.field = field;
+  owner.completion.items = composed;
+  owner.completion.selectedIndex = 0;
   // Push the candidate list to the host's Text-widget instance
   // state. The host repaints the popup chrome (dim separator,
   // side borders, selected-row highlight) on its own — the
   // plugin doesn't need to drive a re-render.
   if (formPanel) {
-    formPanel.setCompletions(field, form.completion.items);
+    formPanel.setCompletions(field, owner.completion.items);
   }
 }
 
@@ -8349,11 +10969,15 @@ async function fetchPathCompletions(typed: string): Promise<string[]> {
 /// by substring of the typed value — branch names commonly
 /// carry slash-separated prefixes (`feat/`, `release/`) that
 /// the user often doesn't type first.
-async function fetchBranchCompletions(typed: string): Promise<string[]> {
-  if (!form) return [];
-  const projectPath = form.projectPath.value.trim() || form.defaultProjectPath;
+async function fetchBranchCompletions(
+  typed: string,
+  owner: NewSessionForm,
+): Promise<string[]> {
+  if (form !== owner) return [];
+  const projectPath = owner.projectPath.value.trim() ||
+    owner.defaultProjectPath;
   if (!projectPath) return [];
-  if (form.projectPathIsGit === false) return [];
+  if (owner.projectPathIsGit === false) return [];
   const res = await spawnCollect(
     "git",
     [
@@ -8367,7 +10991,7 @@ async function fetchBranchCompletions(typed: string): Promise<string[]> {
     ],
     projectPath,
   );
-  if (res.exit_code !== 0) return [];
+  if (form !== owner || res.exit_code !== 0) return [];
   const lines = (res.stdout || "")
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -8391,8 +11015,16 @@ async function fetchBranchCompletions(typed: string): Promise<string[]> {
   // Stable order: exact-match-first, then prefix-match, then
   // substring; ties broken by length so shorter names surface.
   filtered.sort((a, b) => {
-    const ascore = a.toLowerCase() === needle ? 0 : a.toLowerCase().startsWith(needle) ? 1 : 2;
-    const bscore = b.toLowerCase() === needle ? 0 : b.toLowerCase().startsWith(needle) ? 1 : 2;
+    const ascore = a.toLowerCase() === needle
+      ? 0
+      : a.toLowerCase().startsWith(needle)
+      ? 1
+      : 2;
+    const bscore = b.toLowerCase() === needle
+      ? 0
+      : b.toLowerCase().startsWith(needle)
+      ? 1
+      : 2;
     if (ascore !== bscore) return ascore - bscore;
     return a.length - b.length || a.localeCompare(b);
   });
@@ -8455,21 +11087,13 @@ function restoreDockAfterForm(): boolean {
   return true;
 }
 
-// Cancel path: tear down the form, and if it was reached via the
-// picker (Alt+N or "+ New Session" button), reopen the picker so
-// Esc behaves like a true "back" rather than dropping the user
-// into the bare editor. When the dock is still mounted underneath,
-// just hand focus back to it instead.
+// Cancel path: tear down the form, and if it was reached via the picker
+// (Alt+N or "+ New Session" button), reopen the picker so Esc behaves like a
+// true "back" rather than dropping the user into the bare editor. Connection
+// attempts live on pending rows, not on the already-closed form, and are
+// cancelled only through that row's request-scoped handle.
 function cancelForm(): void {
   const wasFromPicker = !!form?.fromPicker;
-  // Cancelling while a remote connect is in flight: tell the host to abort it.
-  // The pending `attachRemoteAgent` promise rejects with "cancelled" (its catch
-  // is a no-op once `form` is null below) and the connect's late result is
-  // discarded host-side, so no window is ever built.
-  if (form?.submitting) {
-    pendingRemoteFacet = null;
-    editor.cancelRemoteAgent();
-  }
   closeForm();
   if (restoreDockAfterForm()) return;
   if (wasFromPicker) {
@@ -8490,23 +11114,47 @@ function cancelForm(): void {
 // live window takes its place; on failure the row flips to an error state
 // offering retry / dismiss.
 //
-// Remote attaches are *serialised*: the host's `cancelRemoteAgent()` cancels
-// EVERY in-flight connect, so two concurrent background attaches could not be
-// cancelled independently. Remote placeholders therefore run one at a time
-// through `remoteCreateQueue` / `remoteInFlightId`. Local creates have no such
-// constraint and run immediately, in parallel.
+// Remote attaches carry request-scoped cancellation handles, so each
+// placeholder owns and can cancel its own connection attempt. Local and remote
+// creates therefore run independently rather than sharing a process-wide
+// serialization queue.
 //
-// Still-creating specs are persisted (`savePendingSpecs`) so a quit + restart
-// re-surfaces them as resumable ("paused") rows via `recoverPendingWorkspaces`
-// on the `ready` hook.
+// Every still-creating attempt is persisted under its own durable key and
+// re-surfaces as a resumable ("paused") row via `recoverPendingWorkspaces`.
 // =============================================================================
 
-type CaptureResult = { ok: true; spec: CreateSpec } | { ok: false; error: string };
+type CaptureResult = { ok: true; spec: CreateSpec } | {
+  ok: false;
+  error: string;
+};
 
 // Resolve the (about-to-close) form into a `CreateSpec`, or return the
 // validation error that keeps the form open. Reads field values only — no
 // async work, no side effects — so the background worker never touches form
 // state that no longer exists.
+function remoteInputErrorText(error: RemoteInputError): string {
+  switch (error) {
+    case "ssh-host-required":
+      return editor.t("err.ssh_host_required");
+    case "invalid-ssh-port":
+      return "SSH port must be between 1 and 65535";
+    case "ssh-path-conflict":
+      return "SSH URL path conflicts with the Remote path field";
+    case "unmatched-quote":
+      return "SSH options contain an unmatched quote";
+    case "dangling-escape":
+      return "SSH options end with an incomplete escape";
+    case "conflicting-ssh-option":
+      return "SSH options must not override host, user, port, or identity";
+    case "missing-ssh-option-value":
+      return "An SSH option is missing its value";
+    case "unexpected-ssh-positional":
+      return "SSH options may contain options only, not another target";
+    case "invalid-ssh-target":
+      return "SSH target must be [user@]host[:port] or an ssh:// URL";
+  }
+}
+
 function captureCreateSpec(f: NewSessionForm): CaptureResult {
   const cmd = f.cmd.value.trim();
   const sessionName = f.name.value.trim();
@@ -8534,7 +11182,9 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
         // that supports them, so a bare terminal / custom command never gets
         // stray flags or a prompt appended.
         auto: !!agentEntryForCmd(cmd)?.auto && f.autoMode,
-        startPrompt: agentEntryForCmd(cmd)?.prompt ? f.startPrompt.value.trim() : "",
+        startPrompt: agentEntryForCmd(cmd)?.prompt
+          ? f.startPrompt.value.trim()
+          : "",
         teachFreshCli: !!agentEntryForCmd(cmd)?.systemPrompt && f.teachFreshCli,
         branch: f.branch.value.trim(),
         newBranch: f.newBranch.value.trim(),
@@ -8549,8 +11199,12 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
     const target = f.k8sTarget.value.trim();
     const namespace = f.k8sNamespace.value.trim();
     const pod = f.k8sPod.value.trim();
-    if (target && !pod) return { ok: false, error: editor.t("err.k8s_named_target") };
-    if (!namespace || !pod) return { ok: false, error: editor.t("err.k8s_ns_pod_required") };
+    if (target && !pod) {
+      return { ok: false, error: editor.t("err.k8s_named_target") };
+    }
+    if (!namespace || !pod) {
+      return { ok: false, error: editor.t("err.k8s_ns_pod_required") };
+    }
     const agentArgv = splitAgentCmd(cmd);
     const detail = `${namespace}/${pod}`;
     const label = sessionName || `k8s:${namespace}/${pod}`;
@@ -8585,23 +11239,21 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
   }
 
   if (f.backend === "ssh") {
-    // Parse `[user@]host[:port]` (also tolerates a pasted `ssh://…`). The user
-    // is optional — a bare `host` lets ssh resolve it from its own config.
-    const raw = f.sshHost.value.trim().replace(/^ssh:\/\//, "");
-    const portMatch = raw.match(/^(.+):(\d+)$/);
-    const port = portMatch ? parseInt(portMatch[2], 10) : null;
-    const hostPart = portMatch ? portMatch[1] : raw;
-    const at = hostPart.indexOf("@");
-    const user = at > 0 ? hostPart.slice(0, at) : undefined;
-    const host = at >= 0 ? hostPart.slice(at + 1) : hostPart;
-    if (!host) return { ok: false, error: editor.t("err.ssh_host_required") };
+    const parsedTarget = parseSshInput(f.sshHost.value, f.sshPath.value);
+    if (!parsedTarget.ok) {
+      return { ok: false, error: remoteInputErrorText(parsedTarget.error) };
+    }
+    const parsedArgs = parseSshExtraArgs(f.sshOptions.value);
+    if (!parsedArgs.ok) {
+      return { ok: false, error: remoteInputErrorText(parsedArgs.error) };
+    }
+    const { user, host, port, remotePath } = parsedTarget.value;
     const identity = f.sshIdentity.value.trim();
-    const remotePath = f.sshPath.value.trim();
-    const extraArgs = f.sshOptions.value.trim()
-      ? f.sshOptions.value.trim().split(/\s+/)
-      : [];
     const agentArgv = splitAgentCmd(cmd);
-    const target = user ? `${user}@${host}` : host;
+    const displayHost = host.includes(":") ? `[${host}]` : host;
+    const target = `${user ? `${user}@` : ""}${displayHost}${
+      port === null ? "" : `:${port}`
+    }`;
     const spec: RemoteAgentSpec = {
       transport: {
         kind: "ssh",
@@ -8609,8 +11261,10 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
         host,
         port,
         identity_file: identity || null,
-        remote_path: remotePath || null,
-        ...(extraArgs.length > 0 ? { extra_args: extraArgs } : {}),
+        remote_path: remotePath,
+        ...(parsedArgs.value.length > 0
+          ? { extra_args: parsedArgs.value }
+          : {}),
       },
       base_env: [],
       window: true,
@@ -8648,70 +11302,362 @@ function pendingCreatingMessage(spec: CreateSpec): string {
     : editor.t("dock.pending_connecting");
 }
 
-// Insert a placeholder row for a workspace to create and — unless it is a
-// restored (paused) row — close the form, surface the dock, and launch the
-// background worker. Returns the placeholder's synthetic id.
+interface PendingRecord {
+  version: 2;
+  attemptId: string;
+  label: string;
+  spec: CreateSpec;
+  visit: boolean;
+  phase: PendingCreate["phase"];
+  message: string;
+  updatedAt: number;
+}
+
+interface CreateJournal {
+  version: 1;
+  attemptId: string;
+  label: string;
+  spec: Extract<CreateSpec, { backend: "local" }>;
+  /** Whether the caller omitted the name; survives allocation and restart. */
+  autoNamed?: boolean;
+  phase: "prepared" | "mutating" | "starting" | "committed" | "rolled_back";
+  repoRoot: string;
+  root: string;
+  worktree?: {
+    repoRoot: string;
+    root: string;
+    branch: string;
+    baseRef: string;
+    expectedHead: string;
+    branchExisted: boolean;
+    createdBranch: boolean;
+    applied: boolean;
+  };
+  checkout?: {
+    root: string;
+    originalRef: string;
+    installedHead: string;
+    applied: boolean;
+  };
+  prompt?: {
+    path: string;
+    existed: boolean;
+    original: string;
+    written: string;
+    applied: boolean;
+  };
+  workspaceId?: string;
+}
+
+const PENDING_PREFIX = "orchestrator.pending:";
+const CREATE_JOURNAL_PREFIX = "orchestrator.create_journal:";
+const LEGACY_PENDING_KEY = "orchestrator.pending";
+const pendingLeases = new Map<string, InterprocessLease>();
+const pendingIdsByAttempt = new Map<string, number>();
+const rollbackFlights = new Map<string, Promise<boolean>>();
+const retryFlights = new Map<string, Promise<void>>();
+const dismissFlights = new Set<string>();
+const committingAttempts = new Set<string>();
+let pendingLeaseHeartbeatRunning = false;
+let recoveryRetryScheduled = false;
+const createWindowsByAttempt = new Map<string, number>();
+
+interface CreatedWorkspaceEffect {
+  workspaceId: string;
+  root: string;
+  windowId?: number;
+}
+
+async function findCreatedWorkspaceByAttempt(
+  attemptId: string,
+  rootHint?: string,
+  workspaceIdHint?: string,
+): Promise<CreatedWorkspaceEffect | null> {
+  const inventory = await lifecyclePersistenceEditor
+    .inspectWorkspaceCreateAttempt(
+      attemptId,
+      rootHint || null,
+      workspaceIdHint || null,
+    );
+  if (inventory.status === "error") {
+    throw new Error(`workspace persistence inventory failed: ${inventory.message}`);
+  }
+  if (inventory.status === "not_found") return null;
+  const root = normRoot(inventory.root);
+  const workspaceId = inventory.workspaceId;
+  const windows = editor.listWindows();
+  let windowId = createWindowsByAttempt.get(attemptId);
+  let window = windowId === undefined
+    ? undefined
+    : windows.find((candidate) =>
+      candidate.id === windowId && candidate.stable_id === workspaceId &&
+      normRoot(candidate.root) === root
+    );
+  if (windowId !== undefined && !window) {
+    createWindowsByAttempt.delete(attemptId);
+    windowId = undefined;
+  }
+  if (!window) {
+    window = windows.find((candidate) =>
+      candidate.stable_id === workspaceId && normRoot(candidate.root) === root
+    );
+    windowId = window?.id;
+  }
+  return { workspaceId, root, windowId };
+}
+
+async function findCreatedWorkspace(
+  journal: CreateJournal,
+): Promise<CreatedWorkspaceEffect | null> {
+  return await findCreatedWorkspaceByAttempt(
+    journal.attemptId,
+    journal.root,
+    journal.workspaceId,
+  );
+}
+
+async function deleteCreatedWorkspacePersistence(
+  root: string,
+  workspaceId: string,
+): Promise<boolean> {
+  return await forgetWorkspacePersistenceByIdentity(root, workspaceId);
+}
+// A newly-created prompt file has no target window yet, so the window-scoped
+// deletion API cannot authorize it. Move the content-matched file atomically
+// into host temp, delete it there, and put it back if temp deletion fails.
+function removeOwnedLocalFile(path: string): boolean {
+  const quarantine = editor.pathJoin(
+    editor.getTempDir(),
+    `fresh-orchestrator-rollback-${uniqueAttemptId()}`,
+  );
+  if (
+    !editor.renamePath(editor.localPath(path), editor.localPath(quarantine))
+  ) return false;
+  if (editor.removePath(editor.localPath(quarantine))) return true;
+  if (editor.fileExists(editor.localPath(path))) return false;
+  editor.renamePath(editor.localPath(quarantine), editor.localPath(path));
+  return false;
+}
+
+function pendingStateKey(attemptId: string): string {
+  return PENDING_PREFIX + attemptId;
+}
+
+function createJournalKey(attemptId: string): string {
+  return CREATE_JOURNAL_PREFIX + attemptId;
+}
+
+function loadCreateJournal(attemptId: string): CreateJournal | null {
+  const value = readPersistedPluginState()[createJournalKey(attemptId)];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const journal = value as CreateJournal;
+  return journal.attemptId === attemptId && journal.version === 1
+    ? journal
+    : null;
+}
+
+function handlePendingLeaseLoss(attemptId: string): void {
+  pendingLeases.delete(attemptId);
+  remoteAttachRequests.get(attemptId)?.cancel();
+  remoteAttachRequests.delete(attemptId);
+  const id = pendingIdsByAttempt.get(attemptId);
+  if (id === undefined) return;
+  const session = orchestratorSessions.get(id);
+  if (session?.pending?.attemptId !== attemptId) return;
+  orchestratorSessions.delete(id);
+  pendingIdsByAttempt.delete(attemptId);
+  settleCreateOutcome(id, {
+    ok: false,
+    error: "workspace transaction claim was lost",
+  });
+  if (openPanel) refreshOpenDialog();
+}
+
+function assertPendingAttemptOwned(attemptId: string): void {
+  const lease = pendingLeases.get(attemptId);
+  if (lease && renewLease(lease)) return;
+  handlePendingLeaseLoss(attemptId);
+  throw new Error("workspace transaction claim was lost");
+}
+
+async function setOwnedAttemptState(
+  attemptId: string,
+  key: string,
+  value: unknown,
+): Promise<boolean> {
+  try {
+    assertPendingAttemptOwned(attemptId);
+    const saved = await setDurableState(key, value);
+    assertPendingAttemptOwned(attemptId);
+    return saved;
+  } catch {
+    return false;
+  }
+}
+
+async function saveCreateJournal(journal: CreateJournal): Promise<boolean> {
+  return await setOwnedAttemptState(
+    journal.attemptId,
+    createJournalKey(journal.attemptId),
+    journal,
+  );
+}
+
+function startPendingLeaseHeartbeat(): void {
+  if (pendingLeaseHeartbeatRunning) return;
+  pendingLeaseHeartbeatRunning = true;
+  void (async () => {
+    while (pendingLeases.size > 0) {
+      await editor.delay(Math.floor(LEASE_TTL_MS / 3));
+      for (const [attemptId, lease] of [...pendingLeases]) {
+        if (renewLease(lease)) continue;
+        handlePendingLeaseLoss(attemptId);
+      }
+    }
+    pendingLeaseHeartbeatRunning = false;
+  })();
+}
+
+async function claimPendingAttempt(id: number): Promise<boolean> {
+  const pending = orchestratorSessions.get(id)?.pending;
+  if (!pending) return false;
+  const attemptId = pending.attemptId;
+  if (pendingLeases.has(attemptId)) {
+    try {
+      assertPendingAttemptOwned(attemptId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const lease = await acquireLease(`create-attempt:${attemptId}`, 10_000);
+  if (!lease) return false;
+  const current = orchestratorSessions.get(id)?.pending;
+  if (!current || current.attemptId !== attemptId) {
+    releaseLease(lease);
+    return false;
+  }
+  pendingLeases.set(attemptId, lease);
+  startPendingLeaseHeartbeat();
+  return true;
+}
+
+function releasePendingLease(attemptId: string): void {
+  const lease = pendingLeases.get(attemptId);
+  if (!lease) return;
+  pendingLeases.delete(attemptId);
+  releaseLease(lease);
+}
+
+async function persistPending(id: number): Promise<boolean> {
+  const session = orchestratorSessions.get(id);
+  const pending = session?.pending;
+  if (!session || !pending) return false;
+  const record: PendingRecord = {
+    version: 2,
+    attemptId: pending.attemptId,
+    label: session.label,
+    spec: pending.spec,
+    visit: pending.visit,
+    phase: pending.phase,
+    message: pending.message,
+    updatedAt: Date.now(),
+  };
+  return await setOwnedAttemptState(
+    pending.attemptId,
+    pendingStateKey(pending.attemptId),
+    record,
+  );
+}
+
+async function clearPendingAttempt(
+  _id: number,
+  attemptId: string,
+): Promise<boolean> {
+  // The marker remains authoritative while either durable transaction record
+  // exists. Retire both records under the attempt lease before clearing it.
+  if (
+    !(await setOwnedAttemptState(attemptId, createJournalKey(attemptId), null))
+  ) {
+    return false;
+  }
+  return await setOwnedAttemptState(
+    attemptId,
+    pendingStateKey(attemptId),
+    null,
+  );
+}
+
+function finishPendingAttempt(attemptId: string): void {
+  pendingIdsByAttempt.delete(attemptId);
+  releasePendingLease(attemptId);
+}
+
+// Insert one per-attempt placeholder. Human form submission may close its own
+// form; headless API calls never do, even when a human has the form open.
 function startPendingWorkspace(
   spec: CreateSpec,
-  opts?: { restored?: boolean; visit?: boolean; label?: string },
+  opts?: {
+    restored?: boolean;
+    visit?: boolean;
+    label?: string;
+    launch?: boolean;
+    submittedFromForm?: boolean;
+    attemptId?: string;
+    lease?: InterprocessLease;
+  },
 ): number {
   const id = allocPendingId();
   const restored = opts?.restored === true;
-  const remoteFacet: RemoteFacet | undefined =
-    spec.backend === "local" ? undefined : { ...spec.facet };
+  const attemptId = opts?.attemptId || uniqueAttemptId();
+  const remoteFacet: RemoteFacet | undefined = spec.backend === "local"
+    ? undefined
+    : { ...spec.facet };
   orchestratorSessions.set(id, {
     id,
-    // A restored row keeps the name it last showed (the resolved / relabelled
-    // one persisted alongside the spec); a fresh row starts from the spec's
-    // capture-time display label.
     label: opts?.label || spec.displayLabel,
     hostLabel: opts?.label || spec.displayLabel,
-    // Synthetic root — a placeholder owns no real directory yet, and a unique
-    // key keeps it in its own stable dock-order slot.
-    root: `pending:${id}`,
+    root: `pending:${attemptId}`,
     projectPath: spec.displayProject,
     sharedWorktree: false,
     terminalId: null,
-    state: "idle",
     lastOutputAt: null,
     createdAt: Date.now(),
     remote: remoteFacet,
     pending: {
+      attemptId,
+      restored,
       phase: restored ? "paused" : "creating",
-      message: restored ? editor.t("dock.pending_interrupted") : pendingCreatingMessage(spec),
+      message: restored
+        ? editor.t("dock.pending_interrupted")
+        : pendingCreatingMessage(spec),
       spec,
-      // A restored/resumed row never yanks focus on relaunch.
       visit: !restored && opts?.visit === true,
     },
   });
-  savePendingSpecs();
+  pendingIdsByAttempt.set(attemptId, id);
+  if (opts?.lease) {
+    pendingLeases.set(attemptId, opts.lease);
+    startPendingLeaseHeartbeat();
+  }
   if (!restored) {
-    closeForm();
+    if (opts?.submittedFromForm) closeForm();
     showDockUnfocused();
-    launchPendingCreate(id);
+    if (opts?.launch !== false) launchPendingCreate(id);
   }
   return id;
 }
 
-// Ensure the dock is visible without stealing keyboard focus — the user
-// asked to keep working ("stay put"). Used for a just-created placeholder
-// (so it's seen), and for the `autoOpenDock` setting at startup.
 function showDockUnfocused(): void {
-  // Open the dock if nothing is up yet. (Structured so the module-level
-  // `openPanel`'s narrowing survives the `openControlRoom` reassignment —
-  // mirrors `openMoveToFolderForCurrent`.)
+  // A headless API create is independent of a human editing the centered New
+  // Session form. Do not mount/blur the dock or clear NEW_SESSION_MODE under
+  // that form; its pending row becomes visible when the human closes it.
+  if (form && formPanel) return;
   if (!openPanel) {
-    // Mounted blurred from the first frame — a focused mount plus a
-    // follow-up blur would leave a tick-sized window where the dock
-    // owns the keyboard (command dispatch is budgeted across frames).
     openControlRoom({ dock: true, blurred: true });
     if (openPanel && dockMode) dockBlurred = true;
   }
   if (!openPanel) return;
-  // Keep keyboard focus in the editor ("stay put") — only the dock is shown.
-  // A centered modal picker (dockMode false) is left focused as-is. The
-  // explicit blur stays for the already-open case (and is a no-op right
-  // after a blurred mount).
   if (dockMode) {
     dockBlurred = true;
     editor.floatingPanelControl(openPanel.id(), "blur", 0);
@@ -8720,52 +11666,43 @@ function showDockUnfocused(): void {
   refreshOpenDialog();
 }
 
-// Dispatch the background worker for a placeholder (local runs immediately;
-// remote queues behind any in-flight connect).
-function launchPendingCreate(id: number): void {
-  const s = orchestratorSessions.get(id);
-  if (!s || !s.pending) return;
-  if (s.pending.spec.backend === "local") void runLocalCreate(id);
-  else enqueueRemoteCreate(id);
-}
+const localCreateFlights = new Map<string, Promise<void>>();
 
-// =============================================================================
-// Create completion — for callers that need the result, not just the row
-//
-// A workspace create is deliberately non-blocking: the dialog closes, the dock
-// shows a pending row, and the user keeps working. A *caller* (the headless
-// `orchestrator_agent_new`, driven from an agent's shell) has no dock to watch
-// and nothing to do until the workspace exists, so it needs the outcome — above
-// all the new workspace's durable id, which only exists once the window is born.
-//
-// Resolvers registered here are settled by the create worker at exactly the
-// points that end a create: success, failure, and dismissal. Nothing else may
-// resolve them, or a caller would be told a workspace exists that doesn't.
-// =============================================================================
+function launchPendingCreate(id: number): void {
+  const pending = orchestratorSessions.get(id)?.pending;
+  if (!pending) return;
+  const attemptId = pending.attemptId;
+  if (pending.spec.backend !== "local") {
+    if (!remoteAttachRequests.has(attemptId)) void runRemoteCreate(id);
+    return;
+  }
+  if (localCreateFlights.has(attemptId)) return;
+  const flight = runLocalCreate(id);
+  localCreateFlights.set(attemptId, flight);
+  const forget = (): void => {
+    if (localCreateFlights.get(attemptId) === flight) {
+      localCreateFlights.delete(attemptId);
+    }
+  };
+  void flight.then(forget, forget);
+}
 
 interface CreateOutcome {
   ok: boolean;
-  /// Per-process window handle. Valid until this editor exits.
   windowId?: number;
-  /// Durable workspace identity — the id to keep. Survives restarts.
   workspaceId?: string;
-  /// The workspace's root directory (its worktree, when it has one).
   root?: string;
   error?: string;
 }
 
 const createOutcomeResolvers = new Map<number, (r: CreateOutcome) => void>();
 
-// Await the outcome of the pending create `id`. The promise settles exactly
-// once; a create that is dismissed or fails settles with `ok: false`.
 function awaitCreateOutcome(id: number): Promise<CreateOutcome> {
   return new Promise((resolve) => {
     createOutcomeResolvers.set(id, resolve);
   });
 }
 
-// Settle a pending create's outcome, if anyone is waiting on it. Safe to call
-// on every terminal path — a create nobody awaited simply has no resolver.
 function settleCreateOutcome(id: number, outcome: CreateOutcome): void {
   const resolve = createOutcomeResolvers.get(id);
   if (!resolve) return;
@@ -8773,363 +11710,1163 @@ function settleCreateOutcome(id: number, outcome: CreateOutcome): void {
   resolve(outcome);
 }
 
-// Update a placeholder's status line (a no-op once the row is gone).
 function setPendingMessage(id: number, msg: string): void {
-  const s = orchestratorSessions.get(id);
-  if (!s || !s.pending) return;
-  s.pending.message = msg;
+  const session = orchestratorSessions.get(id);
+  if (!session?.pending) return;
+  session.pending.message = msg;
   if (openPanel) refreshOpenDialog();
 }
 
-// Keep the placeholder's label in step with the resolved session name (local
-// auto-generates it only inside the worker).
 function relabelPending(id: number, label: string): void {
-  const s = orchestratorSessions.get(id);
-  if (!s || !s.pending || !label || s.label === label) return;
-  s.label = label;
-  savePendingSpecs();
+  const session = orchestratorSessions.get(id);
+  if (!session?.pending || !label || session.label === label) return;
+  session.label = label;
   if (openPanel) refreshOpenDialog();
 }
 
-// Flip a placeholder into its error state with `reason`, surfacing it on the
-// row (and the status bar) and dropping it from the persisted set.
-function failPending(id: number, reason: string): void {
-  const s = orchestratorSessions.get(id);
-  if (!s || !s.pending) return;
-  s.pending.phase = "error";
-  s.pending.message = reason.trim() || editor.t("err.connection_failed");
-  if (s.remote) s.remote.state = "error";
-  editor.setStatus(editor.t("status.prefix", { msg: s.pending.message }));
-  savePendingSpecs();
-  if (openPanel) refreshOpenDialog();
-  // The row stays for the user to retry or dismiss, but a caller waiting on
-  // this create is done — it gets the reason rather than hanging.
-  settleCreateOutcome(id, { ok: false, error: s.pending.message });
-}
-
-// Return keyboard focus to the window that was active before a spawn/attach
-// dove into its new window — the "stay put, mark ready" contract. Safe if the
-// target window has since closed.
-function restoreActiveWindow(id: number): void {
-  if (id <= 0 || editor.activeWindow() === id) return;
-  if (!editor.listWindows().some((w) => w.id === id)) return;
-  editor.setActiveWindow(id);
-}
-
-// Re-run a failed or paused (restored) placeholder from scratch.
-function retryPending(id: number): void {
-  const s = orchestratorSessions.get(id);
-  if (!s || !s.pending) return;
-  s.pending.phase = "creating";
-  s.pending.message = pendingCreatingMessage(s.pending.spec);
-  if (s.remote) s.remote.state = "starting";
-  savePendingSpecs();
-  if (openPanel) refreshOpenDialog();
-  launchPendingCreate(id);
-}
-
-// Drop a placeholder for good. If it is the remote connect currently in
-// flight, tear that connect down first (the host's `cancelRemoteAgent`
-// cancels the single in-flight attach); a queued one is just removed.
-function dismissPending(id: number): void {
-  const s = orchestratorSessions.get(id);
-  if (!s || !s.pending) return;
-  if (remoteInFlightId === id) {
-    pendingRemoteFacet = null;
-    editor.cancelRemoteAgent();
-    remoteInFlightId = null;
+async function failPending(id: number, reason: string): Promise<void> {
+  const session = orchestratorSessions.get(id);
+  const pending = session?.pending;
+  if (!session || !pending) return;
+  try {
+    assertPendingAttemptOwned(pending.attemptId);
+  } catch {
+    return;
   }
-  const qi = remoteCreateQueue.indexOf(id);
-  if (qi >= 0) remoteCreateQueue.splice(qi, 1);
+  pending.phase = "error";
+  pending.message = reason.trim() || editor.t("err.connection_failed");
+  if (session.remote) session.remote.state = "error";
+  await persistPending(id);
+  editor.setStatus(editor.t("status.prefix", { msg: pending.message }));
+  if (openPanel) refreshOpenDialog();
+  settleCreateOutcome(id, { ok: false, error: pending.message });
+}
+
+async function waitForWindowClosed(windowId: number): Promise<boolean> {
+  const deadline = Date.now() + 10_000;
+  while (
+    editor.listWindows().some((window) => window.id === windowId) ||
+    closingWindowIds.has(windowId)
+  ) {
+    if (Date.now() >= deadline) return false;
+    await editor.delay(10);
+  }
+  return true;
+}
+
+async function closeCreatedWindow(
+  windowId: number,
+  preferredPredecessor?: number,
+): Promise<boolean> {
+  const windows = editor.listWindows();
+  const present = windows.some((window) => window.id === windowId);
+  if (!present && !closingWindowIds.has(windowId)) return true;
+  if (present && editor.activeWindow() === windowId) {
+    const fallback = windows.find((window) =>
+      window.id === preferredPredecessor && window.id !== windowId
+    ) ?? windows.find((window) =>
+      window.id !== windowId
+    );
+    if (
+      !fallback || !editor.setActiveWindow(fallback.id) ||
+      !(await waitForActiveWindow(fallback.id))
+    ) return false;
+  }
+  if (present) {
+    editor.signalWindow(windowId, "SIGKILL");
+    closingWindowIds.add(windowId);
+    if (!editor.closeWindow(windowId)) {
+      closingWindowIds.delete(windowId);
+      return false;
+    }
+  }
+  return await waitForWindowClosed(windowId);
+}
+
+interface RollbackCreateOptions {
+  target?: { root: string; heartbeat: LeaseHeartbeat };
+  preferredPredecessor?: number;
+}
+
+async function rollbackCreateJournal(
+  journal: CreateJournal,
+  options?: RollbackCreateOptions,
+): Promise<boolean> {
+  const existing = rollbackFlights.get(journal.attemptId);
+  if (existing) return await existing;
+  const flight = (async () => {
+    const targetRoot = journal.worktree?.root ?? journal.checkout?.root ??
+      journal.root;
+    const canonicalTarget = normRoot(targetRoot);
+    if (options?.target && normRoot(options.target.root) !== canonicalTarget) {
+      return false;
+    }
+    let acquiredLease: InterprocessLease | null = null;
+    let targetHeartbeat = options?.target?.heartbeat ?? null;
+    try {
+      assertPendingAttemptOwned(journal.attemptId);
+      if (!targetHeartbeat) {
+        acquiredLease = await acquireLease(
+          `workspace-target:${canonicalTarget}`,
+          10_000,
+        );
+        assertPendingAttemptOwned(journal.attemptId);
+        if (!acquiredLease) return false;
+        targetHeartbeat = startLeaseHeartbeat(
+          () => renewLease(acquiredLease!),
+          (milliseconds) => editor.delay(milliseconds),
+          LEASE_TTL_MS,
+          "workspace rollback",
+        );
+      }
+      const checkOwned = (): void => {
+        assertPendingAttemptOwned(journal.attemptId);
+        targetHeartbeat!.assertOwned();
+      };
+      checkOwned();
+      let ok = true;
+      const createdWorkspace = await findCreatedWorkspace(journal);
+      if (createdWorkspace?.windowId !== undefined) {
+        checkOwned();
+        ok = (await closeCreatedWindow(
+          createdWorkspace.windowId,
+          options?.preferredPredecessor,
+        )) && ok;
+        checkOwned();
+      }
+      if (ok && createdWorkspace) {
+        checkOwned();
+        ok = (await deleteCreatedWorkspacePersistence(
+          createdWorkspace.root,
+          createdWorkspace.workspaceId,
+        )) && ok;
+        checkOwned();
+      }
+      if (ok && createdWorkspace) {
+        createWindowsByAttempt.delete(journal.attemptId);
+        journal.workspaceId = undefined;
+      }
+
+      const prompt = journal.prompt;
+      if (prompt) {
+        checkOwned();
+        const current = editor.readFile(editor.localPath(prompt.path));
+        if (current === prompt.written) {
+          checkOwned();
+          const restored = prompt.existed
+            ? editor.writeFile(editor.localPath(prompt.path), prompt.original)
+            : removeOwnedLocalFile(prompt.path);
+          if (restored) journal.prompt = undefined;
+        } else if (
+          current === prompt.original || (!prompt.existed && current === null)
+        ) {
+          journal.prompt = undefined;
+        } else {
+          ok = false;
+        }
+      }
+
+      const checkout = journal.checkout;
+      if (checkout) {
+        checkOwned();
+        const [head, status] = await Promise.all([
+          spawnCollect(
+            "git",
+            ["-C", checkout.root, "rev-parse", "HEAD"],
+            checkout.root,
+          ),
+          spawnCollect(
+            "git",
+            ["-C", checkout.root, "status", "--porcelain"],
+            checkout.root,
+          ),
+        ]);
+        checkOwned();
+        const atInstalled = head.exit_code === 0 &&
+          (head.stdout || "").trim() === checkout.installedHead;
+        if (atInstalled && (status.stdout || "").trim() === "") {
+          checkOwned();
+          const restored = await spawnCollect(
+            "git",
+            ["-C", checkout.root, "checkout", checkout.originalRef],
+            checkout.root,
+          );
+          checkOwned();
+          ok = restored.exit_code === 0 && ok;
+          if (restored.exit_code === 0) journal.checkout = undefined;
+        } else if (!atInstalled) {
+          journal.checkout = undefined;
+        } else {
+          ok = false;
+        }
+      }
+
+      const worktree = journal.worktree;
+      if (worktree) {
+        const dropCreatedBranch = async (): Promise<boolean> => {
+          if (
+            !worktree.createdBranch || worktree.branchExisted !== false ||
+            !worktree.branch
+          ) return true;
+          checkOwned();
+          const branchHead = await spawnCollect(
+            "git",
+            [
+              "-C",
+              worktree.repoRoot,
+              "rev-parse",
+              "--verify",
+              `refs/heads/${worktree.branch}`,
+            ],
+            worktree.repoRoot,
+          );
+          checkOwned();
+          if (branchHead.exit_code !== 0) return true;
+          if ((branchHead.stdout || "").trim() !== worktree.expectedHead) {
+            return false;
+          }
+          const claim = await spawnCollect(
+            "git",
+            [
+              "-C",
+              worktree.repoRoot,
+              "reflog",
+              "show",
+              "-1",
+              "--format=%gs",
+              `refs/heads/${worktree.branch}`,
+            ],
+            worktree.repoRoot,
+          );
+          checkOwned();
+          if (
+            claim.exit_code !== 0 ||
+            (claim.stdout || "").trim() !==
+              `fresh-orchestrator-create:${journal.attemptId}`
+          ) return false;
+          const dropped = await spawnCollect(
+            "git",
+            [
+              "-C",
+              worktree.repoRoot,
+              "update-ref",
+              "-m",
+              `fresh-orchestrator-rollback:${journal.attemptId}`,
+              "-d",
+              `refs/heads/${worktree.branch}`,
+              worktree.expectedHead,
+            ],
+            worktree.repoRoot,
+          );
+          checkOwned();
+          return dropped.exit_code === 0;
+        };
+
+        checkOwned();
+        const listed = await listLinkedWorktrees(worktree.repoRoot);
+        checkOwned();
+        const owned = listed?.worktrees.find((entry) =>
+          normRoot(entry.path) === normRoot(worktree.root)
+        );
+        if (owned) {
+          const [head, status] = await Promise.all([
+            spawnCollect(
+              "git",
+              ["-C", worktree.root, "rev-parse", "HEAD"],
+              worktree.root,
+            ),
+            spawnCollect(
+              "git",
+              ["-C", worktree.root, "status", "--porcelain"],
+              worktree.root,
+            ),
+          ]);
+          checkOwned();
+          const branchMatches = owned.branch === worktree.branch ||
+            (!owned.branch &&
+              (head.stdout || "").trim() === worktree.expectedHead);
+          const safeToRemove = !owned.locked && !owned.prunable &&
+            branchMatches && head.exit_code === 0 &&
+            (head.stdout || "").trim() === worktree.expectedHead &&
+            status.exit_code === 0 && (status.stdout || "").trim() === "";
+          if (!safeToRemove) {
+            ok = false;
+          } else {
+            checkOwned();
+            const removed = await spawnCollect(
+              "git",
+              [
+                "-C",
+                worktree.repoRoot,
+                "worktree",
+                "remove",
+                worktree.root,
+              ],
+              worktree.repoRoot,
+            );
+            checkOwned();
+            if (removed.exit_code !== 0) {
+              ok = false;
+            } else {
+              const branchClean = await dropCreatedBranch();
+              ok = branchClean && ok;
+              if (branchClean) journal.worktree = undefined;
+            }
+          }
+        } else {
+          const branchClean = await dropCreatedBranch();
+          ok = branchClean && ok;
+          if (branchClean) journal.worktree = undefined;
+        }
+      }
+
+      journal.phase = ok ? "rolled_back" : journal.phase;
+      if (!(await saveCreateJournal(journal))) return false;
+      checkOwned();
+      return ok;
+    } catch {
+      return false;
+    } finally {
+      if (acquiredLease) {
+        targetHeartbeat?.stop();
+        releaseLease(acquiredLease);
+      }
+    }
+  })().finally(() => rollbackFlights.delete(journal.attemptId));
+  rollbackFlights.set(journal.attemptId, flight);
+  return await flight;
+}
+
+function retryPending(id: number): void {
+  const session = orchestratorSessions.get(id);
+  const pending = session?.pending;
+  if (!session || !pending || pending.phase === "creating") return;
+  const previousAttempt = pending.attemptId;
+  if (retryFlights.has(previousAttempt)) return;
+  const flight = (async () => {
+    try {
+      assertPendingAttemptOwned(previousAttempt);
+    } catch {
+      return;
+    }
+    pending.phase = "creating";
+    pending.message = "Retiring the previous workspace attempt…";
+    if (!(await persistPending(id))) return;
+    const stillOwnsPrevious = (): boolean => {
+      if (
+        orchestratorSessions.get(id)?.pending?.attemptId !== previousAttempt
+      ) {
+        return false;
+      }
+      try {
+        assertPendingAttemptOwned(previousAttempt);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const previousJournal = loadCreateJournal(previousAttempt);
+    if (previousJournal && !(await rollbackCreateJournal(previousJournal))) {
+      if (stillOwnsPrevious()) {
+        await failPending(
+          id,
+          "workspace cleanup is incomplete; retry was refused",
+        );
+      }
+      return;
+    }
+    if (!stillOwnsPrevious()) return;
+    if (!(await clearPendingAttempt(id, previousAttempt))) {
+      if (stillOwnsPrevious()) {
+        await failPending(
+          id,
+          "could not retire the previous workspace attempt",
+        );
+      }
+      return;
+    }
+    if (!stillOwnsPrevious()) return;
+    finishPendingAttempt(previousAttempt);
+    const attemptId = uniqueAttemptId();
+    session.root = `pending:${attemptId}`;
+    pending.attemptId = attemptId;
+    pending.restored = false;
+    pending.phase = "creating";
+    pending.message = pendingCreatingMessage(pending.spec);
+    if (session.remote) session.remote.state = "starting";
+    pendingIdsByAttempt.set(attemptId, id);
+    if (!(await claimPendingAttempt(id)) || !(await persistPending(id))) {
+      orchestratorSessions.delete(id);
+      pendingIdsByAttempt.delete(attemptId);
+      releasePendingLease(attemptId);
+      settleCreateOutcome(id, {
+        ok: false,
+        error: "could not claim the workspace transaction",
+      });
+      return;
+    }
+    if (orchestratorSessions.get(id)?.pending?.attemptId !== attemptId) return;
+    if (openPanel) refreshOpenDialog();
+    launchPendingCreate(id);
+  })().finally(() => retryFlights.delete(previousAttempt));
+  retryFlights.set(previousAttempt, flight);
+  void flight;
+}
+
+function dismissPending(id: number): void {
+  const session = orchestratorSessions.get(id);
+  const pending = session?.pending;
+  if (
+    !session || !pending || dismissFlights.has(pending.attemptId) ||
+    committingAttempts.has(pending.attemptId)
+  ) return;
+  const attemptId = pending.attemptId;
+  try {
+    assertPendingAttemptOwned(attemptId);
+  } catch {
+    return;
+  }
+  const createFlight = localCreateFlights.get(attemptId) ??
+    remoteAttachRequests.get(attemptId) ?? retryFlights.get(attemptId);
+  dismissFlights.add(attemptId);
+  settleCreateOutcome(id, {
+    ok: false,
+    error: "workspace creation was dismissed",
+  });
+  remoteAttachRequests.get(attemptId)?.cancel();
+  remoteAttachRequests.delete(attemptId);
+  // Removing the row fences the worker immediately while the exact attempt
+  // lease remains held for compensation and durable retirement.
   orchestratorSessions.delete(id);
-  savePendingSpecs();
   if (openPanel) {
     refreshOpenDialog();
     syncDockSelectionToActive();
   }
-}
-
-// Best-effort teardown of a worktree this local create added but then had to
-// abandon (the placeholder was dismissed mid-flight). Leaving it would orphan
-// the branch + directory with nothing tracking it. `--force` since the tree is
-// freshly created; any failure is swallowed — there's nothing else to do from
-// a cancellation path.
-async function discardCreatedWorktree(repoRoot: string, root: string): Promise<void> {
-  await spawnCollect(
-    "git",
-    ["-C", repoRoot, "worktree", "remove", "--force", root],
-    repoRoot,
-  );
-}
-
-// Background worker: create a local worktree (when requested) and spawn the
-// session window, swapping the placeholder for the real row. Idempotent on a
-// resume — if the target worktree already exists (a prior run made it before
-// the editor quit) the add is skipped and the session opens in place.
-//
-// Cancellation: `dismissPending` deletes the session from the map, so each
-// `orchestratorSessions.get(id)?.pending` check below is also a cancel point.
-// Because a local create has real side effects (a worktree on disk, a spawned
-// window), the checkpoints after those effects undo them rather than just
-// bailing — so a dismissed create leaves nothing behind.
-async function runLocalCreate(id: number): Promise<void> {
-  const s0 = orchestratorSessions.get(id);
-  if (!s0 || !s0.pending || s0.pending.spec.backend !== "local") return;
-  const spec = s0.pending.spec;
-  const cmd = spec.cmd;
-  const checkoutBranch = spec.branch;
-  const newBranch = spec.newBranch;
-  const projectPath = spec.projectPath;
-
-  // Re-probe is-git so we trust the latest filesystem state, not a UI flag.
-  const isGit = await pathIsInsideGitWorkTree(projectPath);
-  if (!orchestratorSessions.get(id)?.pending) return; // dismissed mid-probe
-  const createWorktree = isGit === true && spec.createWorktree;
-
-  let repoRoot = projectPath;
-  if (createWorktree) {
-    const canonical = await resolveCanonicalRepoRoot(projectPath);
-    if (canonical) repoRoot = canonical;
-  }
-
-  const sessionName = spec.name ||
-    (await nextAutoSessionName(repoRoot, { persist: true }));
-  if (!orchestratorSessions.get(id)?.pending) return;
-  // Pin the auto-resolved name back into the spec so a retry or a
-  // restart-recovery targets the *same* worktree instead of allocating a fresh
-  // `<proj>-(N+1)` — which would bypass the `rootExists` idempotency below and
-  // orphan the worktree a prior attempt already created.
-  if (!spec.name) {
-    spec.name = sessionName;
-    savePendingSpecs();
-  }
-  relabelPending(id, sessionName);
-
-  const root = createWorktree
-    ? editor.pathJoin(editor.getDataDir(), "orchestrator", slugify(repoRoot), sessionName)
-    : projectPath;
-
-  // Recovery idempotency: a worktree left on disk by an interrupted run is
-  // reused rather than re-added (a re-add would fail and error the row).
-  const rootExists = createWorktree && editor.fileExists(editor.localPath(root));
-  // Whether *this* run put the worktree on disk (vs. reusing an existing one),
-  // so a mid-flight dismissal can remove exactly what it created.
-  let addedWorktree = false;
-  if (createWorktree && !rootExists) {
-    setPendingMessage(id, editor.t("dock.pending_adding_worktree"));
-    const parent = editor.pathDirname(root);
-    if (!editor.createDir(editor.localPath(parent))) {
-      failPending(id, editor.t("err.mkdir_failed", { path: parent }));
+  void (async () => {
+    if (createFlight) {
+      try {
+        await createFlight;
+      } catch {
+        // The rollback below remains authoritative even if the worker failed.
+      }
+    }
+    try {
+      assertPendingAttemptOwned(attemptId);
+    } catch {
+      dismissFlights.delete(attemptId);
       return;
     }
-    const defaultBranch = await detectDefaultBranch(repoRoot);
-    // Fork point for the new worktree: the explicit checkout branch, or the
-    // detected default when the user left it blank.
-    const base = checkoutBranch || defaultBranch;
-    if (newBranch) {
-      // "New branch name" set: cut a fresh branch off `base`. A pre-existing
-      // branch of that name is a hard error — NO silent fallback to checking
-      // it out (that would put the user on someone else's history).
-      const addRes = await spawnCollect(
-        "git",
-        ["-C", repoRoot, "worktree", "add", root, "-b", newBranch, base],
-        repoRoot,
-      );
-      if (addRes.exit_code !== 0) {
-        if (/already exists/i.test(addRes.stderr || "")) {
-          failPending(id, editor.t("err.branch_exists", { branch: newBranch }));
-        } else {
-          failPending(
-            id,
-            lastNonEmptyLine(addRes.stderr) || editor.t("err.worktree_add_failed"),
-          );
-        }
-        return;
-      }
-    } else if (checkoutBranch) {
-      // "Checkout branch" set (no new branch): check that existing branch/ref
-      // out into the new worktree.
-      const addRes = await spawnCollect(
-        "git",
-        ["-C", repoRoot, "worktree", "add", root, checkoutBranch],
-        repoRoot,
-      );
-      if (addRes.exit_code !== 0) {
-        failPending(
-          id,
-          lastNonEmptyLine(addRes.stderr) || editor.t("err.worktree_add_failed"),
-        );
-        return;
-      }
+    const journal = loadCreateJournal(attemptId);
+    const cleaned = !journal || await rollbackCreateJournal(journal);
+    const retired = cleaned && await clearPendingAttempt(id, attemptId);
+    if (retired) {
+      finishPendingAttempt(attemptId);
     } else {
-      // Neither field set — today's behaviour: cut `<sessionName>` off the
-      // default branch, falling back to checking out an existing branch of
-      // that name (only for this default case).
-      let addRes = await spawnCollect(
-        "git",
-        ["-C", repoRoot, "worktree", "add", root, "-b", sessionName, defaultBranch],
-        repoRoot,
-      );
-      if (addRes.exit_code !== 0) {
-        const fallback = await spawnCollect(
-          "git",
-          ["-C", repoRoot, "worktree", "add", root, sessionName],
-          repoRoot,
-        );
-        if (fallback.exit_code !== 0) {
-          failPending(
-            id,
-            lastNonEmptyLine(fallback.stderr) ||
-              lastNonEmptyLine(addRes.stderr) ||
-              editor.t("err.worktree_add_failed"),
-          );
-          return;
-        }
-        addRes = fallback;
+      try {
+        assertPendingAttemptOwned(attemptId);
+      } catch {
+        dismissFlights.delete(attemptId);
+        return;
+      }
+      pending.phase = "error";
+      pending.message = cleaned
+        ? "could not durably retire the dismissed workspace attempt"
+        : "workspace cleanup is incomplete; dismissal was refused";
+      orchestratorSessions.set(id, session);
+      pendingIdsByAttempt.set(attemptId, id);
+      if (!(await persistPending(id))) {
+        orchestratorSessions.delete(id);
+        pendingIdsByAttempt.delete(attemptId);
+      } else if (openPanel) {
+        refreshOpenDialog();
       }
     }
-    addedWorktree = true;
-  }
+    dismissFlights.delete(attemptId);
+  })();
+}
 
-  // Non-worktree (in-place) checkout: switch the project's own working tree
-  // to `checkoutBranch`. Refuse unless the tree is clean AND fully pushed —
-  // a checkout here mutates the user's real repo, so we never risk stranding
-  // uncommitted or unpushed work (and never use `-f`). `newBranch` is ignored
-  // in this path.
-  if (!createWorktree && checkoutBranch) {
-    setPendingMessage(id, editor.t("dock.pending_adding_worktree"));
-    const statusRes = await spawnCollect(
-      "git",
-      ["-C", projectPath, "status", "--porcelain"],
-      projectPath,
-    );
-    if ((statusRes.stdout || "").trim().length > 0) {
-      failPending(id, editor.t("err.checkout_unclean"));
-      return;
-    }
-    const upstreamRes = await spawnCollect(
-      "git",
-      ["-C", projectPath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-      projectPath,
-    );
-    if (upstreamRes.exit_code !== 0) {
-      failPending(id, editor.t("err.checkout_no_upstream"));
-      return;
-    }
-    const unpushedRes = await spawnCollect(
-      "git",
-      ["-C", projectPath, "rev-list", "--count", "@{u}..HEAD"],
-      projectPath,
-    );
-    if (parseInt((unpushedRes.stdout || "0").trim(), 10) > 0) {
-      failPending(id, editor.t("err.checkout_unpushed"));
-      return;
-    }
-    const coRes = await spawnCollect(
-      "git",
-      ["-C", projectPath, "checkout", checkoutBranch],
-      projectPath,
-    );
-    if (coRes.exit_code !== 0) {
-      failPending(
-        id,
-        lastNonEmptyLine(coRes.stderr) || editor.t("err.worktree_add_failed"),
-      );
-      return;
-    }
+// Background worker follows below. Every filesystem/git mutation has a durable
+// intent in CreateJournal first and a single rollback path for failure,
+// dismissal, and restart recovery.
+const createTargetReservations = new Set<string>();
+
+async function prepareInPlaceCreate(
+  id: number,
+  spec: Extract<CreateSpec, { backend: "local" }>,
+  journal: CreateJournal,
+  root: string,
+  isGit: boolean | null,
+  reserveTarget: (root: string) => Promise<void>,
+  requireActive: () => void,
+): Promise<string> {
+  journal.root = root;
+  await reserveTarget(root);
+  if (!spec.branch) return "";
+  if (isGit !== true) throw new Error(editor.t("err.not_git_repo"));
+  setPendingMessage(id, editor.t("dock.pending_adding_worktree"));
+  const [currentHeadResult, targetHeadResult] = await Promise.all([
+    spawnCollect("git", ["-C", root, "rev-parse", "HEAD"], root),
+    spawnCollect("git", ["-C", root, "rev-parse", spec.branch], root),
+  ]);
+  requireActive();
+  if (currentHeadResult.exit_code !== 0 || targetHeadResult.exit_code !== 0) {
+    throw new Error(editor.t("err.worktree_add_failed"));
   }
-  if (!orchestratorSessions.get(id)?.pending) {
-    // Dismissed while the worktree was being added — remove what we just
-    // created so a dismissed create leaves nothing orphaned on disk.
-    if (addedWorktree) await discardCreatedWorktree(repoRoot, root);
-    settleCreateOutcome(id, { ok: false, error: "workspace creation was dismissed" });
+  const currentHead = (currentHeadResult.stdout || "").trim();
+  const targetHead = (targetHeadResult.stdout || "").trim();
+  if (currentHead === targetHead) return spec.branch;
+
+  const persistedTenants = await inspectWorkspacePersistence(root);
+  requireActive();
+  const liveTenant = editor.listWindows().some((window) =>
+    normRoot(window.root) === normRoot(root)
+  );
+  if (liveTenant || persistedTenants.length > 0) {
+    throw new Error(
+      "in-place checkout refused while another workspace uses this root",
+    );
+  }
+  let original = await spawnCollect(
+    "git",
+    ["-C", root, "symbolic-ref", "--quiet", "--short", "HEAD"],
+    root,
+  );
+  requireActive();
+  if (original.exit_code !== 0 || !(original.stdout || "").trim()) {
+    original = currentHeadResult;
+  }
+  const originalRef = (original.stdout || "").trim();
+  const [status, upstream, unpushed] = await Promise.all([
+    spawnCollect("git", ["-C", root, "status", "--porcelain"], root),
+    spawnCollect(
+      "git",
+      [
+        "-C",
+        root,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{u}",
+      ],
+      root,
+    ),
+    spawnCollect(
+      "git",
+      ["-C", root, "rev-list", "--count", "@{u}..HEAD"],
+      root,
+    ),
+  ]);
+  requireActive();
+  if ((status.stdout || "").trim()) {
+    throw new Error(editor.t("err.checkout_unclean"));
+  }
+  if (upstream.exit_code !== 0) {
+    throw new Error(editor.t("err.checkout_no_upstream"));
+  }
+  if (parseInt((unpushed.stdout || "0").trim(), 10) > 0) {
+    throw new Error(editor.t("err.checkout_unpushed"));
+  }
+  journal.phase = "mutating";
+  journal.checkout = {
+    root,
+    originalRef,
+    installedHead: targetHead,
+    applied: false,
+  };
+  if (!(await saveCreateJournal(journal))) {
+    throw new Error("could not journal the in-place checkout");
+  }
+  const checkedOut = await spawnCollect(
+    "git",
+    ["-C", root, "checkout", spec.branch],
+    root,
+  );
+  requireActive();
+  if (checkedOut.exit_code !== 0) {
+    throw new Error(
+      commandErrorSummary(checkedOut.stderr) ||
+        editor.t("err.worktree_add_failed"),
+    );
+  }
+  const installed = await spawnCollect(
+    "git",
+    ["-C", root, "rev-parse", "HEAD"],
+    root,
+  );
+  requireActive();
+  if (
+    installed.exit_code !== 0 ||
+    (installed.stdout || "").trim() !== targetHead
+  ) {
+    throw new Error("in-place checkout did not install the requested commit");
+  }
+  journal.checkout.applied = true;
+  if (!(await saveCreateJournal(journal))) {
+    throw new Error("could not acknowledge the in-place checkout");
+  }
+  return spec.branch;
+}
+
+interface PreparedWorktreeCreate {
+  root: string;
+  sessionName: string;
+  reportedBranch: string;
+}
+
+async function prepareWorktreeCreate(
+  id: number,
+  spec: Extract<CreateSpec, { backend: "local" }>,
+  journal: CreateJournal,
+  repoRoot: string,
+  initialSessionName: string,
+  restored: boolean,
+  autoNamed: boolean,
+  reserveTarget: (root: string) => Promise<void>,
+  requireActive: () => void,
+): Promise<PreparedWorktreeCreate> {
+  let sessionName = initialSessionName;
+  const reserveNextName = async (): Promise<void> => {
+    sessionName = await nextAutoSessionName(repoRoot, {
+      persist: true,
+      requireOwner: requireActive,
+    });
+    requireActive();
+    spec.name = sessionName;
+    journal.label = sessionName;
+    journal.spec = spec;
+    relabelPending(id, sessionName);
+    if (!(await persistPending(id)) || !(await saveCreateJournal(journal))) {
+      throw new Error("could not durably retry the workspace name");
+    }
+  };
+
+  for (let allocationAttempt = 0; allocationAttempt < 20; allocationAttempt++) {
+    const root = identityStoragePath(
+      identityStoragePath(
+        editor.pathJoin(editor.getDataDir(), "orchestrator", "worktrees"),
+        repoRoot,
+      ),
+      sessionName,
+    );
+    journal.root = root;
+    journal.label = sessionName;
+    journal.spec = spec;
+    await reserveTarget(root);
+
+    const listed = await listLinkedWorktrees(repoRoot);
+    requireActive();
+    const existing = listed?.worktrees.find((entry) =>
+      normRoot(entry.path) === normRoot(root)
+    );
+    const branch = spec.newBranch || spec.branch || sessionName;
+    const priorIntent = journal.worktree;
+    if (existing || editor.fileExists(editor.localPath(root))) {
+      const exactRecoveredIntent = restored && !!priorIntent &&
+        normRoot(priorIntent.repoRoot) === normRoot(repoRoot) &&
+        normRoot(priorIntent.root) === normRoot(root) &&
+        priorIntent.branch === branch;
+      if (!existing || !exactRecoveredIntent) {
+        if (!restored && autoNamed && !spec.newBranch && !spec.branch) {
+          await reserveNextName();
+          continue;
+        }
+        throw new Error(`worktree target is not owned by this create: ${root}`);
+      }
+      if (existing.locked || existing.prunable) {
+        throw new Error(`worktree target is not safe to recover: ${root}`);
+      }
+      let identityMatches = existing.branch === branch;
+      if (!identityMatches && !existing.branch) {
+        const [actual, expected] = await Promise.all([
+          spawnCollect("git", ["-C", root, "rev-parse", "HEAD"], root),
+          spawnCollect(
+            "git",
+            ["-C", repoRoot, "rev-parse", priorIntent!.expectedHead],
+            repoRoot,
+          ),
+        ]);
+        requireActive();
+        identityMatches = actual.exit_code === 0 && expected.exit_code === 0 &&
+          (actual.stdout || "").trim() === (expected.stdout || "").trim();
+      }
+      if (!identityMatches) {
+        throw new Error(`worktree target identity changed: ${root}`);
+      }
+      priorIntent!.applied = true;
+      if (!(await saveCreateJournal(journal))) {
+        throw new Error("could not acknowledge the recovered worktree");
+      }
+      return {
+        root,
+        sessionName,
+        reportedBranch: existing.branch || branch,
+      };
+    }
+
+    setPendingMessage(id, editor.t("dock.pending_adding_worktree"));
+    const defaultBranch = await detectDefaultBranch(repoRoot);
+    requireActive();
+    const baseRef = spec.branch || defaultBranch;
+    const baseHeadResult = await spawnCollect(
+      "git",
+      ["-C", repoRoot, "rev-parse", baseRef],
+      repoRoot,
+    );
+    requireActive();
+    if (baseHeadResult.exit_code !== 0) {
+      throw new Error(
+        commandErrorSummary(baseHeadResult.stderr) || `unknown ref: ${baseRef}`,
+      );
+    }
+    const baseHead = (baseHeadResult.stdout || "").trim();
+    const createdBranch = !!spec.newBranch || (!spec.branch && !spec.newBranch);
+    journal.phase = "mutating";
+    journal.worktree = {
+      repoRoot,
+      root,
+      branch,
+      baseRef,
+      expectedHead: baseHead,
+      branchExisted: false,
+      createdBranch: false,
+      applied: false,
+    };
+    if (!(await saveCreateJournal(journal))) {
+      throw new Error("could not journal the worktree creation");
+    }
+
+    if (createdBranch) {
+      const ref = `refs/heads/${branch}`;
+      const claimMessage = `fresh-orchestrator-create:${journal.attemptId}`;
+      const claimed = await spawnCollect(
+        "git",
+        [
+          "-C",
+          repoRoot,
+          "update-ref",
+          "-m",
+          claimMessage,
+          ref,
+          baseHead,
+          "0000000000000000000000000000000000000000",
+        ],
+        repoRoot,
+      );
+      requireActive();
+      let ownsBranch = claimed.exit_code === 0;
+      let branchExists = false;
+      if (!ownsBranch) {
+        const [head, reflog] = await Promise.all([
+          spawnCollect(
+            "git",
+            ["-C", repoRoot, "rev-parse", "--verify", ref],
+            repoRoot,
+          ),
+          spawnCollect(
+            "git",
+            ["-C", repoRoot, "reflog", "show", "-1", "--format=%gs", ref],
+            repoRoot,
+          ),
+        ]);
+        requireActive();
+        branchExists = head.exit_code === 0;
+        ownsBranch = branchExists && (head.stdout || "").trim() === baseHead &&
+          reflog.exit_code === 0 &&
+          (reflog.stdout || "").trim() === claimMessage;
+      }
+      if (!ownsBranch) {
+        journal.worktree = undefined;
+        if (!(await saveCreateJournal(journal))) {
+          throw new Error("could not retire the failed branch claim");
+        }
+        if (autoNamed && !spec.newBranch && !spec.branch && branchExists) {
+          await reserveNextName();
+          continue;
+        }
+        if (branchExists) {
+          throw new Error(editor.t("err.branch_exists", { branch }));
+        }
+        throw new Error(
+          commandErrorSummary(claimed.stderr) || "could not create the branch",
+        );
+      }
+      journal.worktree.createdBranch = true;
+      if (!(await saveCreateJournal(journal))) {
+        throw new Error("could not acknowledge the branch claim");
+      }
+    }
+
+    const parent = editor.pathDirname(root);
+    requireActive();
+    if (!editor.createDir(editor.localPath(parent))) {
+      throw new Error(editor.t("err.mkdir_failed", { path: parent }));
+    }
+    const added = await spawnCollect(
+      "git",
+      ["-C", repoRoot, "worktree", "add", root, branch],
+      repoRoot,
+    );
+    requireActive();
+    if (added.exit_code === 0) {
+      journal.worktree.applied = true;
+      if (!(await saveCreateJournal(journal))) {
+        throw new Error("could not acknowledge the created worktree");
+      }
+      return { root, sessionName, reportedBranch: branch };
+    }
+
+    const listedAfterFailure = await listLinkedWorktrees(repoRoot);
+    requireActive();
+    const partial = listedAfterFailure?.worktrees.find((entry) =>
+      normRoot(entry.path) === normRoot(root)
+    );
+    let mutationObserved = !!partial && partial.branch === branch;
+    if (partial && !partial.branch) {
+      const head = await spawnCollect(
+        "git",
+        ["-C", root, "rev-parse", "HEAD"],
+        root,
+      );
+      requireActive();
+      mutationObserved = head.exit_code === 0 &&
+        (head.stdout || "").trim() === baseHead;
+    }
+    if (mutationObserved) journal.worktree.applied = true;
+    else if (!createdBranch) journal.worktree = undefined;
+    if (!(await saveCreateJournal(journal))) {
+      throw new Error("could not checkpoint the failed worktree mutation");
+    }
+    throw new Error(
+      commandErrorSummary(added.stderr) || editor.t("err.worktree_add_failed"),
+    );
+  }
+  throw new Error("could not allocate a unique workspace name");
+}
+
+async function runLocalCreate(id: number): Promise<void> {
+  const initialSession = orchestratorSessions.get(id);
+  const initialPending = initialSession?.pending;
+  if (
+    !initialSession || !initialPending ||
+    initialPending.spec.backend !== "local"
+  ) return;
+  const attemptId = initialPending.attemptId;
+  const spec = initialPending.spec;
+  const restored = initialPending.restored;
+  let targetLease: InterprocessLease | null = null;
+  let targetHeartbeat: LeaseHeartbeat | null = null;
+  let reservedRoot = "";
+  let preferredPredecessor: number | undefined;
+
+  const releaseTarget = (): void => {
+    if (reservedRoot) createTargetReservations.delete(reservedRoot);
+    reservedRoot = "";
+    targetHeartbeat?.stop();
+    targetHeartbeat = null;
+    if (targetLease) releaseLease(targetLease);
+    targetLease = null;
+  };
+  const requireActive = (): void => {
+    const pending = orchestratorSessions.get(id)?.pending;
+    if (pending?.attemptId !== attemptId) {
+      throw new Error("workspace creation was dismissed");
+    }
+    assertPendingAttemptOwned(attemptId);
+    targetHeartbeat?.assertOwned();
+  };
+  const reserveTarget = async (root: string): Promise<void> => {
+    releaseTarget();
+    targetLease = await acquireLease(
+      `workspace-target:${normRoot(root)}`,
+      10_000,
+    );
+    if (!targetLease) throw new Error(`workspace target is busy: ${root}`);
+    targetHeartbeat = startLeaseHeartbeat(
+      () => renewLease(targetLease!),
+      (milliseconds) => editor.delay(milliseconds),
+      LEASE_TTL_MS,
+      "workspace creation",
+    );
+    reservedRoot = normRoot(root);
+    createTargetReservations.add(reservedRoot);
+    requireActive();
+  };
+
+  if (!(await claimPendingAttempt(id))) {
+    orchestratorSessions.delete(id);
+    pendingIdsByAttempt.delete(attemptId);
+    settleCreateOutcome(id, {
+      ok: false,
+      error: "could not claim the workspace transaction",
+    });
+    return;
+  }
+  if (!(await persistPending(id))) {
+    await failPending(id, "could not durably claim the workspace transaction");
     return;
   }
 
-  if (cmd) editor.setGlobalState("orchestrator.last_cmd", cmd);
-
-  // Attach-to-existing-worktree classification for the no-worktree path
-  // (a linked worktree the user pointed at directly).
-  const attachInfo = !createWorktree ? await classifyWorktree(root) : null;
-  const isLinkedAttach = attachInfo?.isLinked === true;
-  const effectiveProjectPath = isLinkedAttach ? attachInfo!.mainRoot : projectPath;
-  const reportedBranch = createWorktree
-    ? (newBranch || checkoutBranch || sessionName)
-    : (checkoutBranch || (isLinkedAttach ? attachInfo!.branch : ""));
-
-  appendHistory("project_path", projectPath);
-  appendHistory("name", sessionName);
-  if (cmd) appendHistory("cmd", cmd);
-  if (createWorktree) appendHistory("branch", reportedBranch);
-
-  // "Teach Fresh CLI": inject the CLI system prompt and (below) mint a
-  // capability token. `via: "file"` writes an AGENTS.md the agent reads at
-  // startup; `via: "flag"` rides the launch argv (resolved just below).
-  const teachEntry = spec.teachFreshCli ? agentEntryForCmd(cmd) : null;
-  const teach = teachEntry?.systemPrompt ?? null;
-  if (teach?.via === "file") {
-    writeFreshCliPromptFile(editor.pathJoin(root, teach.path));
+  let journal = loadCreateJournal(attemptId);
+  const autoNamed = journal?.autoNamed ?? spec.name === "";
+  if (!journal) {
+    journal = {
+      version: 1,
+      attemptId,
+      label: initialSession.label,
+      spec,
+      autoNamed,
+      phase: "prepared",
+      repoRoot: spec.projectPath,
+      root: spec.projectPath,
+    };
+    if (!(await saveCreateJournal(journal))) {
+      await failPending(
+        id,
+        "could not create the workspace transaction journal",
+      );
+      return;
+    }
+  } else if (journal.autoNamed === undefined) {
+    journal.autoNamed = autoNamed;
   }
 
-  const argv = splitAgentCmd(cmd);
-  const { launch: launchArgv, resume: resumeArgv } = resolveAgentLaunch(argv, {
-    auto: spec.auto,
-    prompt: spec.startPrompt,
-    systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
-  });
-  const sharedWorktree = !createWorktree && !isLinkedAttach;
-
-  // Capture the user's current window so focus can return to it after
-  // `createWindowWithTerminal` dives into the new one — unless the user chose
-  // "Create & Visit", in which case focus stays in the new workspace.
-  const visit = orchestratorSessions.get(id)?.pending?.visit ?? false;
-  const restoreTo = editor.activeWindow();
-  setPendingMessage(id, editor.t("dock.pending_starting"));
+  // `initialState.create_attempt` is checkpointed atomically with the window.
+  // It closes the crash gap between host creation and this journal learning the
+  // durable workspace id, without persisting a process-local window id.
+  let committedEffect: CreatedWorkspaceEffect | null;
   try {
+    committedEffect = await findCreatedWorkspace(journal);
+  } catch (error) {
+    await failPending(
+      id,
+      error instanceof Error ? error.message : String(error),
+    );
+    return;
+  }
+  if (committedEffect?.windowId !== undefined) {
+    journal.phase = "committed";
+    journal.workspaceId = committedEffect.workspaceId;
+    if (!(await saveCreateJournal(journal))) {
+      await failPending(id, "could not recover the created workspace identity");
+      return;
+    }
+    committingAttempts.add(attemptId);
+    requireActive();
+    if (!(await clearPendingAttempt(id, attemptId))) {
+      committingAttempts.delete(attemptId);
+      await failPending(id, "could not durably retire the created workspace");
+      return;
+    }
+    requireActive();
+    editor.setWindowStateTo(committedEffect.windowId, "create_attempt", null);
+    finishPendingAttempt(attemptId);
+    reconcileSessions();
+    orchestratorSessions.delete(id);
+    createWindowsByAttempt.delete(attemptId);
+    committingAttempts.delete(attemptId);
+    settleCreateOutcome(id, {
+      ok: true,
+      windowId: committedEffect.windowId,
+      workspaceId: committedEffect.workspaceId,
+      root: committedEffect.root,
+    });
+    if (openPanel) refreshOpenDialog();
+    return;
+  }
+  const transaction = new DurableCreateTransaction<
+    CreateJournal["phase"],
+    CreateJournal
+  >(
+    journal,
+    saveCreateJournal,
+    (_phase, message) => {
+      if (message) setPendingMessage(id, message);
+    },
+  );
+
+  try {
+    const projectPath = spec.projectPath;
+    const worktreeInfo = await classifyWorktree(projectPath);
+    requireActive();
+    const isGit = worktreeInfo !== null;
+    const createWorktree = isGit && spec.createWorktree;
+    const repoRoot = createWorktree
+      ? worktreeInfo!.mainRoot
+      : worktreeInfo?.toplevel ?? projectPath;
+    journal.repoRoot = repoRoot;
+
+    let sessionName = spec.name || (restored ? journal.label : "");
+    if (!sessionName) {
+      sessionName = await nextAutoSessionName(repoRoot, {
+        persist: true,
+        requireOwner: requireActive,
+      });
+      requireActive();
+      spec.name = sessionName;
+      journal.label = sessionName;
+      journal.spec = spec;
+      relabelPending(id, sessionName);
+      if (!(await persistPending(id)) || !(await saveCreateJournal(journal))) {
+        throw new Error("could not durably reserve the workspace name");
+      }
+    } else {
+      relabelPending(id, sessionName);
+    }
+
+    let root = worktreeInfo?.toplevel ?? projectPath;
+    let reportedBranch = "";
+    if (createWorktree) {
+      const prepared = await prepareWorktreeCreate(
+        id,
+        spec,
+        journal,
+        repoRoot,
+        sessionName,
+        restored,
+        autoNamed,
+        reserveTarget,
+        requireActive,
+      );
+      root = prepared.root;
+      sessionName = prepared.sessionName;
+      reportedBranch = prepared.reportedBranch;
+    } else {
+      reportedBranch = await prepareInPlaceCreate(
+        id,
+        spec,
+        journal,
+        root,
+        isGit,
+        reserveTarget,
+        requireActive,
+      );
+    }
+
+    const isLinkedAttach = !createWorktree && worktreeInfo?.isLinked === true;
+    const effectiveProjectPath = worktreeInfo?.mainRoot ?? projectPath;
+    if (!reportedBranch && isLinkedAttach) {
+      reportedBranch = worktreeInfo!.branch;
+    }
+    const sharedWorktree = !createWorktree && !isLinkedAttach;
+
+    const teachEntry = spec.teachFreshCli ? agentEntryForCmd(spec.cmd) : null;
+    const teach = teachEntry?.systemPrompt ?? null;
+    if (teach?.via === "file") {
+      const promptPath = editor.pathJoin(root, teach.path);
+      const existed = editor.fileExists(editor.localPath(promptPath));
+      const original = existed
+        ? (editor.readFile(editor.localPath(promptPath)) ?? "")
+        : "";
+      if (!original.includes(FRESH_CLI_BLOCK_START)) {
+        const block =
+          `${FRESH_CLI_BLOCK_START}\n${FRESH_CLI_SYSTEM_PROMPT}\n${FRESH_CLI_BLOCK_END}\n`;
+        const separator = original.length === 0 || original.endsWith("\n")
+          ? "\n"
+          : "\n\n";
+        const written = existed ? original + separator + block : block;
+        journal.phase = "mutating";
+        journal.prompt = {
+          path: promptPath,
+          existed,
+          original,
+          written,
+          applied: false,
+        };
+        if (!(await saveCreateJournal(journal))) {
+          throw new Error("could not journal the Fresh prompt injection");
+        }
+        requireActive();
+        if (!editor.writeFile(editor.localPath(promptPath), written)) {
+          throw new Error(`could not write ${promptPath}`);
+        }
+        requireActive();
+        journal.prompt.applied = true;
+        if (!(await saveCreateJournal(journal))) {
+          throw new Error("could not acknowledge the Fresh prompt injection");
+        }
+      }
+    }
+
+    const argv = splitAgentCmd(spec.cmd);
+    const {
+      launch: launchArgv,
+      resume: resumeArgv,
+      relaunch: relaunchArgv,
+      companion,
+    } = resolveAgentLaunch(argv, {
+      auto: spec.auto,
+      prompt: spec.startPrompt,
+      systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
+    });
+    const visit = orchestratorSessions.get(id)?.pending?.visit ?? false;
+    await transaction.checkpoint(
+      "starting",
+      "could not journal terminal creation",
+      (current) => {
+        current.root = root;
+        current.repoRoot = repoRoot;
+        current.spec = spec;
+      },
+      editor.t("dock.pending_starting"),
+    );
+
+    requireActive();
     const result = await editor.createWindowWithTerminal({
       root,
       label: sessionName,
       cwd: root,
       command: launchArgv.length > 0 ? launchArgv : undefined,
-      title: launchArgv.length > 0 ? launchArgv[0] : undefined,
+      title: companion === "omp"
+        ? undefined
+        : launchArgv.length > 0
+        ? editor.pathBasename(launchArgv[0]) || launchArgv[0]
+        : undefined,
       resume: resumeArgv,
-      // Always mint the capability token bound to this window so
-      // `fresh --cmd script ...` from inside the workspace is authorised —
-      // whether or not the agent was taught about it. `teach` only gates the
-      // prompt.
+      relaunch: relaunchArgv,
+      companion,
       allowScript: FRESH_CLI_ALLOW_SCRIPT,
+      selectedAgent: true,
+      activate: false,
+      initialState: {
+        project_path: effectiveProjectPath,
+        shared_worktree: sharedWorktree,
+        create_attempt: attemptId,
+      },
     });
-    const winId = result.windowId;
-    // Dismissed during the (awaited) spawn: the window was born and dove in,
-    // but the user has since dismissed this workspace. Tear the window (and its
-    // agent process) down and remove any worktree we added, rather than
-    // resurrecting the dismissed row as a live session.
-    if (!orchestratorSessions.get(id)?.pending) {
-      // `close_window` refuses the active window (the spawn dove into it), so
-      // move focus off it first — back where the user was, or any other window.
-      restoreActiveWindow(restoreTo);
-      if (editor.activeWindow() === winId) {
-        const other = editor.listWindows().find((w) => w.id !== winId);
-        if (other) editor.setActiveWindow(other.id);
-      }
-      if (result.terminalId) editor.signalWindow(winId, "SIGKILL");
-      editor.closeWindow(winId);
-      if (addedWorktree) await discardCreatedWorktree(repoRoot, root);
-      settleCreateOutcome(id, { ok: false, error: "workspace creation was dismissed" });
-      return;
+    requireActive();
+    createWindowsByAttempt.set(attemptId, result.windowId);
+    committingAttempts.add(attemptId);
+    journal.workspaceId = result.stableId;
+    journal.phase = "committed";
+    if (!(await saveCreateJournal(journal))) {
+      throw new Error("could not durably publish the created workspace");
     }
-    editor.setWindowState("project_path", effectiveProjectPath);
-    editor.setWindowState("shared_worktree", sharedWorktree);
-    const discId = discoveredIdByPath.get(root);
-    if (discId !== undefined) {
-      orchestratorSessions.delete(discId);
+    requireActive();
+    if (visit) {
+      preferredPredecessor = editor.activeWindow();
+      if (
+        preferredPredecessor !== result.windowId &&
+        (!editor.setActiveWindow(result.windowId) ||
+          !(await waitForActiveWindow(result.windowId)))
+      ) {
+        throw new Error("could not activate the created workspace");
+      }
+      requireActive();
+    }
+    if (!(await clearPendingAttempt(id, attemptId))) {
+      throw new Error("could not durably retire the created workspace");
+    }
+    requireActive();
+    editor.setWindowStateTo(result.windowId, "create_attempt", null);
+
+    const discoveredId = discoveredIdByPath.get(root);
+    if (discoveredId !== undefined) {
+      orchestratorSessions.delete(discoveredId);
       discoveredIdByPath.delete(root);
     }
-    // The real window supersedes the placeholder.
     orchestratorSessions.delete(id);
-    savePendingSpecs();
-    orchestratorSessions.set(winId, {
-      id: winId,
+    publishLiveSession({
+      id: result.windowId,
       stableId: result.stableId || undefined,
       label: customNameFor(result.stableId || undefined, root) ?? sessionName,
       hostLabel: sessionName,
@@ -9137,177 +12874,370 @@ async function runLocalCreate(id: number): Promise<void> {
       projectPath: effectiveProjectPath,
       sharedWorktree,
       terminalId: result.terminalId,
-      state: "running",
+      lastOutputAt: null,
       createdAt: Date.now(),
       branch: reportedBranch || undefined,
     });
-    // The workspace exists and is running: hand a waiting caller its ids. The
-    // durable `stableId` is minted with the window, so it is already final —
-    // this is the only moment it can be reported from.
+    createWindowsByAttempt.delete(attemptId);
+    if (spec.cmd) editor.setGlobalState("orchestrator.last_cmd", spec.cmd);
+    appendHistory("project_path", projectPath);
+    appendHistory("name", sessionName);
+    if (spec.cmd) appendHistory("cmd", spec.cmd);
+    if (createWorktree) appendHistory("branch", reportedBranch);
+    finishPendingAttempt(attemptId);
+    committingAttempts.delete(attemptId);
     settleCreateOutcome(id, {
       ok: true,
-      windowId: winId,
+      windowId: result.windowId,
       workspaceId: result.stableId,
       root,
     });
-    if (visit) {
-      // Create & Visit: `createWindowWithTerminal` already dove into the new
-      // window; hand it the keyboard (blur the dock) so the user lands in it.
-      if (openPanel && dockMode) {
-        dockBlurred = true;
-        editor.floatingPanelControl(openPanel.id(), "blur", 0);
-        editor.setEditorMode(null);
-      }
-    } else {
-      // Stay put: undo the dive `createWindowWithTerminal` performed.
-      restoreActiveWindow(restoreTo);
+    if (visit && openPanel && dockMode) {
+      dockBlurred = true;
+      editor.floatingPanelControl(openPanel.id(), "blur", 0);
+      editor.setEditorMode(null);
     }
     if (openPanel) {
       refreshOpenDialog();
       syncDockSelectionToActive();
     }
-  } catch (e) {
-    failPending(id, e instanceof Error ? e.message : String(e));
+  } catch (error) {
+    committingAttempts.delete(attemptId);
+    const heldTarget = targetHeartbeat && reservedRoot
+      ? { root: reservedRoot, heartbeat: targetHeartbeat }
+      : undefined;
+    const cleanupOk = await rollbackCreateJournal(journal, {
+      target: heldTarget,
+      preferredPredecessor,
+    });
+    const current = orchestratorSessions.get(id)?.pending;
+    const reason = error instanceof Error ? error.message : String(error);
+    if (current?.attemptId === attemptId) {
+      await failPending(
+        id,
+        cleanupOk ? reason : `${reason}; workspace cleanup is incomplete`,
+      );
+    } else {
+      settleCreateOutcome(id, {
+        ok: false,
+        error: "workspace creation was dismissed",
+      });
+    }
+  } finally {
+    releaseTarget();
   }
 }
 
-// Queue a remote placeholder and pump the (serialised) remote worker.
-function enqueueRemoteCreate(id: number): void {
-  const s = orchestratorSessions.get(id);
-  if (s?.pending && remoteInFlightId !== null) {
-    // Something is already connecting — show that this one is waiting.
-    setPendingMessage(id, editor.t("dock.pending_queued"));
+// Remote connects are independently cancellable host requests. No queue: two
+// rows may connect concurrently and dismissing one cannot tear down the other.
+async function runRemoteCreate(id: number): Promise<void> {
+  const session = orchestratorSessions.get(id);
+  const pending = session?.pending;
+  if (
+    !session || !pending ||
+    (pending.spec.backend !== "ssh" && pending.spec.backend !== "kubernetes")
+  ) return;
+  const attemptId = pending.attemptId;
+  const spec = pending.spec;
+  const visit = pending.visit;
+  let createdWindowId: number | undefined;
+  let preferredPredecessor: number | undefined;
+  const requireActive = (): void => {
+    if (orchestratorSessions.get(id)?.pending?.attemptId !== attemptId) {
+      throw new Error("workspace creation was dismissed");
+    }
+    assertPendingAttemptOwned(attemptId);
+  };
+  if (!(await claimPendingAttempt(id))) {
+    orchestratorSessions.delete(id);
+    pendingIdsByAttempt.delete(attemptId);
+    settleCreateOutcome(id, {
+      ok: false,
+      error: "could not claim the remote workspace transaction",
+    });
+    return;
   }
-  remoteCreateQueue.push(id);
-  pumpRemoteQueue();
+  pending.phase = "creating";
+  pending.message = editor.t("dock.pending_connecting");
+  if (session.remote) session.remote.state = "starting";
+  if (!(await persistPending(id))) {
+    await failPending(id, "could not durably start the remote workspace");
+    return;
+  }
+  requireActive();
+  if (openPanel) refreshOpenDialog();
+  const request = editor.attachRemoteAgent({
+    ...spec.spec,
+    activate: false,
+    initialState: { create_attempt: attemptId },
+  });
+  remoteAttachRequests.set(attemptId, request);
+  try {
+    const result = await request;
+    requireActive();
+    const windowId = result.windowId;
+    if (
+      typeof windowId !== "number" || !Number.isInteger(windowId) ||
+      windowId <= 0
+    ) {
+      throw new Error("remote attach did not return a window identity");
+    }
+    createdWindowId = windowId;
+    createWindowsByAttempt.set(attemptId, windowId);
+    committingAttempts.add(attemptId);
+    reconcileSessions();
+    const live = orchestratorSessions.get(windowId);
+    if (!live) throw new Error("remote attach window is not available");
+    if (visit) {
+      preferredPredecessor = editor.activeWindow();
+      if (
+        preferredPredecessor !== windowId &&
+        (!editor.setActiveWindow(windowId) ||
+          !(await waitForActiveWindow(windowId)))
+      ) {
+        throw new Error("could not activate the remote workspace");
+      }
+      requireActive();
+    }
+    if (!(await clearPendingAttempt(id, attemptId))) {
+      throw new Error("could not durably retire the remote workspace");
+    }
+    requireActive();
+    editor.setWindowStateTo(windowId, "create_attempt", null);
+    live.remote = { ...spec.facet, state: "running" };
+    orchestratorSessions.delete(id);
+    createWindowsByAttempt.delete(attemptId);
+    if (spec.persistCmd) {
+      editor.setGlobalState("orchestrator.last_cmd", spec.persistCmd);
+    }
+    finishPendingAttempt(attemptId);
+    committingAttempts.delete(attemptId);
+    settleCreateOutcome(id, {
+      ok: true,
+      windowId,
+      workspaceId: live.stableId,
+      root: live.root,
+    });
+    if (visit && openPanel && dockMode) {
+      dockBlurred = true;
+      editor.floatingPanelControl(openPanel.id(), "blur", 0);
+      editor.setEditorMode(null);
+    }
+    if (openPanel) {
+      refreshOpenDialog();
+      syncDockSelectionToActive();
+    }
+  } catch (error) {
+    committingAttempts.delete(attemptId);
+    let ownsAttempt = false;
+    try {
+      assertPendingAttemptOwned(attemptId);
+      ownsAttempt = true;
+    } catch {
+      // A successor owns any marked effect and decides whether to adopt it.
+    }
+    let cleanupOk = true;
+    if (ownsAttempt && createdWindowId !== undefined) {
+      cleanupOk = await closeCreatedWindow(
+        createdWindowId,
+        preferredPredecessor,
+      );
+      let effect: CreatedWorkspaceEffect | null = null;
+      if (cleanupOk) {
+        try {
+          effect = await findCreatedWorkspaceByAttempt(attemptId);
+        } catch {
+          cleanupOk = false;
+        }
+      }
+      if (effect) {
+        cleanupOk = await deleteCreatedWorkspacePersistence(
+          effect.root,
+          effect.workspaceId,
+        );
+      }
+      if (cleanupOk) createWindowsByAttempt.delete(attemptId);
+    }
+    if (
+      ownsAttempt &&
+      orchestratorSessions.get(id)?.pending?.attemptId === attemptId
+    ) {
+      const reason = remoteAttachErrorText(error);
+      await failPending(
+        id,
+        cleanupOk ? reason : `${reason}; workspace cleanup is incomplete`,
+      );
+    }
+  } finally {
+    if (remoteAttachRequests.get(attemptId) === request) {
+      remoteAttachRequests.delete(attemptId);
+    }
+  }
 }
 
-// Start the next queued remote connect when none is in flight, skipping
-// placeholders that were dismissed or errored while waiting.
-function pumpRemoteQueue(): void {
-  if (remoteAttachBusy) return;
-  let next: number | undefined;
-  for (;;) {
-    next = remoteCreateQueue.shift();
-    if (next === undefined) return;
-    const s = orchestratorSessions.get(next);
-    if (s?.pending && s.pending.phase !== "error") break;
+function legacyPendingAttemptId(index: number, value: unknown): string {
+  const input = `${index}:${JSON.stringify(value)}`;
+  let hash = 0x811c9dc5;
+  for (let offset = 0; offset < input.length; offset++) {
+    hash = Math.imul(hash ^ input.charCodeAt(offset), 0x01000193) >>> 0;
   }
-  remoteAttachBusy = true;
-  remoteInFlightId = next;
-  void runRemoteCreate(next).finally(() => {
-    remoteAttachBusy = false;
-    remoteInFlightId = null;
-    pumpRemoteQueue();
+  return `legacy-${index.toString(36)}-${hash.toString(36)}`;
+}
+
+async function migrateLegacyPendingRecords(): Promise<boolean> {
+  const state = readPersistedPluginState();
+  const legacy = state[LEGACY_PENDING_KEY];
+  if (!Array.isArray(legacy) || legacy.length === 0) return true;
+  const lease = await acquireLease("legacy-pending-migration", 1000);
+  if (!lease) return false;
+  const heartbeat = startLeaseHeartbeat(
+    () => renewLease(lease),
+    (milliseconds) => editor.delay(milliseconds),
+    LEASE_TTL_MS,
+    "legacy pending migration",
+  );
+  try {
+    heartbeat.assertOwned();
+    const current = readPersistedPluginState()[LEGACY_PENDING_KEY];
+    if (!Array.isArray(current)) return true;
+    for (let index = 0; index < current.length; index++) {
+      heartbeat.assertOwned();
+      const value = current[index];
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
+      }
+      const entry = value as Record<string, unknown>;
+      const spec = entry.spec as CreateSpec | undefined;
+      if (
+        !spec ||
+        (spec.backend !== "local" && spec.backend !== "ssh" &&
+          spec.backend !== "kubernetes")
+      ) return false;
+      const attemptId = legacyPendingAttemptId(index, value);
+      const label = typeof entry.label === "string" && entry.label
+        ? entry.label
+        : spec.displayLabel;
+      const record: PendingRecord = {
+        version: 2,
+        attemptId,
+        label,
+        spec,
+        visit: false,
+        phase: "paused",
+        message: editor.t("dock.pending_interrupted"),
+        updatedAt: 0,
+      };
+      if (!(await setDurableState(pendingStateKey(attemptId), record))) {
+        return false;
+      }
+      heartbeat.assertOwned();
+    }
+    if (!(await setDurableState(LEGACY_PENDING_KEY, null))) return false;
+    heartbeat.assertOwned();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    heartbeat.stop();
+    releaseLease(lease);
+  }
+}
+
+function scheduleRecoveryRetry(): void {
+  if (recoveryRetryScheduled) return;
+  recoveryRetryScheduled = true;
+  void editor.delay(LEASE_TTL_MS + 100).then(() => {
+    recoveryRetryScheduled = false;
+    void recoverPendingWorkspaces();
   });
 }
 
-// Background worker for a remote (SSH / Kubernetes) placeholder. The connect
-// may take seconds and can fail (unreachable host, bad pod); until it
-// resolves the row sits in its "Connecting…" state, switchable-away-from like
-// any other. `attachRemoteAgent` resolves only once the authority AND the
-// born-attached window exist, so the placeholder is dropped only when the
-// session is truly real.
-async function runRemoteCreate(id: number): Promise<void> {
-  const s = orchestratorSessions.get(id);
-  if (
-    !s || !s.pending ||
-    (s.pending.spec.backend !== "ssh" && s.pending.spec.backend !== "kubernetes")
-  ) {
+// Claim each persisted attempt before surfacing it. Another editor process may
+// own the same global state file; the lease ensures exactly one process offers
+// Resume/Dismiss for an attempt at a time.
+async function recoverPendingWorkspaces(): Promise<void> {
+  if (!(await migrateLegacyPendingRecords())) {
+    scheduleRecoveryRetry();
     return;
   }
-  const spec = s.pending.spec;
-  s.pending.phase = "creating";
-  s.pending.message = editor.t("dock.pending_connecting");
-  if (s.remote) s.remote.state = "starting";
-  const visit = s.pending.visit;
-  // The born window adopts this facet via the `window_created` hook.
-  pendingRemoteFacet = { ...spec.facet };
-  if (openPanel) refreshOpenDialog();
-  try {
-    // Capture the user's *current* window right before the attach dives into
-    // the born one, so a "stay put" create returns focus to where they are now.
-    // The connect can run — or wait queued behind another attach — for seconds
-    // while the user navigates elsewhere, so the submit-time window is stale;
-    // mirror the local worker, which recaptures fresh here too.
-    const restoreTo = editor.activeWindow();
-    await editor.attachRemoteAgent(spec.spec);
-    // Success: the born-attached window is live and already tracked (the
-    // hook adopted the facet). Drop the placeholder.
-    orchestratorSessions.delete(id);
-    savePendingSpecs();
-    if (spec.persistCmd) editor.setGlobalState("orchestrator.last_cmd", spec.persistCmd);
-    if (visit) {
-      // Create & Visit: the attach already made the born window active; hand
-      // it the keyboard so the user lands in the connected session.
-      if (openPanel && dockMode) {
-        dockBlurred = true;
-        editor.floatingPanelControl(openPanel.id(), "blur", 0);
-        editor.setEditorMode(null);
-      }
-    } else {
-      // Stay put: the attach activated the born window — return to where the
-      // user was.
-      restoreActiveWindow(restoreTo);
-    }
-    if (openPanel) {
-      refreshOpenDialog();
-      syncDockSelectionToActive();
-    }
-  } catch (e) {
-    pendingRemoteFacet = null;
-    failPending(id, remoteAttachErrorText(e));
-  }
-}
-
-// ---------------------------------------------------------------------
-// Restart recovery — persist still-creating LOCAL placeholders so a quit +
-// relaunch re-surfaces them (paused) instead of silently losing an
-// in-progress workspace whose worktree may not have been created yet.
-//
-// Remote (SSH / Kubernetes) placeholders are deliberately NOT persisted
-// here: a born-attached remote session that actually connected is already
-// restored across restarts by the host's own dormant-session persistence
-// (it comes back as a reconnectable remote row), and re-surfacing a connect
-// that never completed would either duplicate that row or silently re-open a
-// network connection on launch. Local worktree creation has no such host-side
-// record, so it is the case this recovery exists for.
-// ---------------------------------------------------------------------
-
-const PENDING_KEY = "orchestrator.pending";
-
-// Persist every LOCAL placeholder that is still creating or paused (never the
-// errored ones — those are a completed, surfaced outcome; nor remote ones —
-// see the section note). Called on every mutation of the pending set.
-function savePendingSpecs(): void {
-  const out: { spec: CreateSpec; label: string }[] = [];
-  for (const s of orchestratorSessions.values()) {
-    if (s.pending && s.pending.phase !== "error" && s.pending.spec.backend === "local") {
-      out.push({ spec: s.pending.spec, label: s.label });
-    }
-  }
-  editor.setGlobalState(PENDING_KEY, out as unknown as object);
-}
-
-// Rehydrate persisted local placeholders on startup as paused rows the user
-// resumes (Enter) or dismisses. Nothing auto-runs — resuming is a deliberate
-// keystroke, never an automatic filesystem touch on launch.
-function recoverPendingWorkspaces(): void {
-  const raw = editor.getGlobalState(PENDING_KEY);
-  if (!Array.isArray(raw) || raw.length === 0) return;
+  const state = readPersistedPluginState();
   let restored = 0;
-  for (const e of raw) {
-    if (!e || typeof e !== "object") continue;
-    const spec = (e as Record<string, unknown>).spec as CreateSpec | undefined;
-    if (!spec || spec.backend !== "local") continue;
-    // Restore the name the row last showed (persisted by `savePendingSpecs`),
-    // not the generic capture-time default it would otherwise re-derive.
-    const savedLabel = (e as Record<string, unknown>).label;
-    const label = typeof savedLabel === "string" && savedLabel ? savedLabel : undefined;
-    startPendingWorkspace(spec, { restored: true, label });
-    restored++;
+  let blocked = false;
+  for (const [key, value] of Object.entries(state)) {
+    if (
+      !key.startsWith(PENDING_PREFIX) || !value || typeof value !== "object" ||
+      Array.isArray(value)
+    ) continue;
+    const record = value as PendingRecord;
+    const backend = record.spec?.backend;
+    if (
+      record.version !== 2 ||
+      (backend !== "local" && backend !== "ssh" && backend !== "kubernetes") ||
+      typeof record.attemptId !== "string" ||
+      pendingIdsByAttempt.has(record.attemptId)
+    ) continue;
+    const lease = await acquireLease(`create-attempt:${record.attemptId}`, 0);
+    if (!lease) {
+      blocked = true;
+      continue;
+    }
+    pendingLeases.set(record.attemptId, lease);
+    startPendingLeaseHeartbeat();
+    const journal = loadCreateJournal(record.attemptId);
+    let created: CreatedWorkspaceEffect | null;
+    try {
+      created = journal
+        ? await findCreatedWorkspace(journal)
+        : await findCreatedWorkspaceByAttempt(record.attemptId);
+    } catch (error) {
+      const restoredId = startPendingWorkspace(record.spec, {
+        restored: true,
+        visit: false,
+        label: record.label,
+        attemptId: record.attemptId,
+        lease,
+      });
+      const restoredPending = orchestratorSessions.get(restoredId)?.pending;
+      if (restoredPending) {
+        const detail = error instanceof Error ? error.message : String(error);
+        restoredPending.message = `Workspace recovery is blocked: ${detail}`;
+      }
+      restored += 1;
+      continue;
+    }
+    if (created) {
+      let retired = true;
+      if (journal) {
+        journal.phase = "committed";
+        journal.workspaceId = created.workspaceId;
+        retired = await saveCreateJournal(journal);
+      }
+      if (retired) retired = await clearPendingAttempt(-1, record.attemptId);
+      if (retired) {
+        try {
+          assertPendingAttemptOwned(record.attemptId);
+          if (created.windowId !== undefined) {
+            editor.setWindowStateTo(created.windowId, "create_attempt", null);
+          }
+        } catch {
+          retired = false;
+        }
+      }
+      releasePendingLease(record.attemptId);
+      if (!retired) blocked = true;
+      continue;
+    }
+    startPendingWorkspace(record.spec, {
+      restored: true,
+      visit: false,
+      label: record.label,
+      attemptId: record.attemptId,
+      lease,
+    });
+    restored += 1;
   }
   if (restored > 0) showDockUnfocused();
+  if (blocked) scheduleRecoveryRetry();
 }
 
 // `visit`: "Create & Visit" — focus follows into the workspace once it's real.
@@ -9325,22 +13255,46 @@ async function submitForm(visit: boolean): Promise<void> {
       teachFreshCli: !!agent?.systemPrompt && form.teachFreshCli,
     };
     const cmd = form.cmd.value;
+    let target: CapturedWorkspace;
+    try {
+      // QuickJS reports an immediately rejected async call as unhandled before
+      // an outer await can observe it. Validate the pure argv plan while the
+      // form is still open, so user-input errors stay synchronous and visible.
+      resolveAgentLaunch(splitAgentCmd(cmd.trim()), {
+        auto: opts.auto,
+        prompt: opts.prompt,
+        systemPrompt: opts.teachFreshCli && agent?.systemPrompt?.via === "flag"
+          ? FRESH_CLI_SYSTEM_PROMPT
+          : undefined,
+      });
+      target = captureWorkspace(editor.activeWindow());
+    } catch (e) {
+      form.lastError = e instanceof Error ? e.message : String(e);
+      renderForm();
+      return;
+    }
     closeForm();
     restoreDockAfterForm();
-    void launchAgentInCurrentWorkspace(cmd, opts);
+    try {
+      await launchAgentInWorkspace(target, cmd, opts);
+    } catch (e) {
+      editor.setStatus(editor.t("status.prefix", {
+        msg: e instanceof Error ? e.message : String(e),
+      }));
+    }
     return;
   }
   // Resolve the form's inputs into a self-contained spec. A validation
   // failure (bad ssh host, missing pod) keeps the form open with the error;
   // otherwise the form closes and the create runs in the background.
   const captured = captureCreateSpec(form);
-  if (!captured.ok) {
+  if (captured.ok === false) {
     form.lastError = captured.error;
     editor.setStatus(editor.t("status.prefix", { msg: captured.error }));
     renderForm();
     return;
   }
-  startPendingWorkspace(captured.spec, { visit });
+  startPendingWorkspace(captured.spec, { visit, submittedFromForm: true });
 }
 
 /// Open a session in an existing worktree without creating one —
@@ -9351,79 +13305,177 @@ async function submitForm(visit: boolean): Promise<void> {
 /// canonical project + `shared_worktree = false` so Archive / Delete
 /// manage it as the real worktree it is, then drops the discovered
 /// placeholder (the live window supersedes it).
+async function activateWindowConfirmed(
+  windowId: number,
+  intent: WorktreeActivationIntent,
+): Promise<boolean> {
+  if (!worktreeIntentStillSelected(intent)) return false;
+  const current = editor.activeWindow();
+  if (current === windowId) return true;
+  // A focus change outside this intent supersedes it even when no dock select
+  // event fired (for example, a command or mouse click in another workspace).
+  if (current !== intent.activeWindow) return false;
+  const activated = await editor.activateWindow(windowId);
+  return activated && worktreeIntentStillSelected(intent);
+}
+
+function finishWorktreeActivation(intent: WorktreeActivationIntent): void {
+  if (!worktreeIntentStillSelected(intent) || !dockMode || !openPanel) return;
+  refreshOpenDialog();
+  if (intent.dive) {
+    dockDiveBlur = true;
+    dockBlurred = true;
+    editor.floatingPanelControl(openPanel.id(), "blur", 0);
+    editor.setEditorMode(null);
+    return;
+  }
+  syncDockSelectionToActive();
+}
+
 async function attachToWorktree(opts: {
   root: string;
   projectPath: string;
   label: string;
   branch?: string;
   discoveredId?: number;
-  /**
-   * Whether to hand keyboard focus to the new window (blur the dock) once
-   * attached. `true` for the "dive in" gestures (Enter, Visit) — mirrors
-   * the dock's live-session Enter, which blurs to the editor. `false`
-   * (default) for the "activate / live-switch" gestures (arrow-nav, a
-   * row click), which open the worktree as the active session but keep
-   * the dock focused so you can keep navigating — mirrors the dock's
-   * live-session arrow/click switch, which never blurs. No-op in the
-   * modal picker (it closes `openPanel` before calling here).
-   */
-  dive?: boolean;
-}): Promise<void> {
-  try {
-    const result = await editor.createWindowWithTerminal({
-      root: opts.root,
-      label: opts.label,
-      cwd: opts.root,
-      // Always mint the workspace's capability token (see runLocalCreate).
-      allowScript: FRESH_CLI_ALLOW_SCRIPT,
-    });
-    const id = result.windowId;
-    editor.setWindowState("project_path", opts.projectPath);
-    editor.setWindowState("shared_worktree", false);
-    if (opts.discoveredId !== undefined) {
-      orchestratorSessions.delete(opts.discoveredId);
-      discoveredIdByPath.delete(opts.root);
+  activation: WorktreeActivationIntent;
+}): Promise<boolean> {
+  const key = normRoot(opts.root);
+  const live = [...orchestratorSessions.values()].find((session) =>
+    session.id > 0 && !session.pending && normRoot(session.root) === key
+  );
+  let flight: WorktreeAttachFlight | undefined;
+  let windowId: number;
+  if (live) {
+    windowId = live.id;
+  } else {
+    flight = worktreeAttachFlights.get(key);
+    if (flight) {
+      if (opts.discoveredId !== undefined) {
+        flight.discoveredIds.add(opts.discoveredId);
+      }
+    } else {
+      flight = {
+        root: opts.root,
+        projectPath: opts.projectPath,
+        label: opts.label,
+        branch: opts.branch,
+        discoveredIds: new Set(
+          opts.discoveredId === undefined ? [] : [opts.discoveredId],
+        ),
+        promise: Promise.resolve(0),
+        completed: false,
+      };
+      flight.promise = runWorktreeAttach(flight);
+      worktreeAttachFlights.set(key, flight);
     }
-    orchestratorSessions.set(id, {
-      id,
+    windowId = await flight.promise;
+  }
+  if (flight) completeWorktreeAttach(flight);
+  if (!(await activateWindowConfirmed(windowId, opts.activation))) return false;
+  finishWorktreeActivation(opts.activation);
+  return true;
+}
+function completeWorktreeAttach(flight: WorktreeAttachFlight): void {
+  if (flight.completed) return;
+  flight.completed = true;
+  for (const discoveredId of flight.discoveredIds) {
+    orchestratorSessions.delete(discoveredId);
+  }
+  discoveredIdByPath.delete(flight.root);
+  if (flight.session) publishLiveSession(flight.session);
+  const key = normRoot(flight.root);
+  if (worktreeAttachFlights.get(key) === flight) {
+    worktreeAttachFlights.delete(key);
+  }
+}
+
+async function runWorktreeAttach(
+  flight: WorktreeAttachFlight,
+): Promise<number> {
+  const key = normRoot(flight.root);
+  const lease = await acquireLease(`workspace-target:${key}`, 10_000);
+  if (!lease) {
+    const error = new Error("worktree is busy");
+    editor.setStatus(
+      editor.t("status.attach_failed", { error: error.message }),
+    );
+    if (worktreeAttachFlights.get(key) === flight) {
+      worktreeAttachFlights.delete(key);
+    }
+    throw error;
+  }
+  const heartbeat = startLeaseHeartbeat(
+    () => renewLease(lease),
+    (milliseconds) => editor.delay(milliseconds),
+    LEASE_TTL_MS,
+    "worktree attach transaction",
+  );
+  createTargetReservations.add(key);
+  let created: { windowId: number; stableId: string } | null = null;
+  try {
+    heartbeat.assertOwned();
+    const listed = await listLinkedWorktrees(flight.projectPath);
+    heartbeat.assertOwned();
+    const worktree = listed?.worktrees.find((entry) =>
+      normRoot(entry.path) === key
+    );
+    if (!worktree || worktree.locked || worktree.prunable) {
+      throw new Error("worktree is locked, prunable, or no longer attached");
+    }
+    const result = await editor.createWindowWithTerminal({
+      root: flight.root,
+      label: flight.label,
+      cwd: flight.root,
+      allowScript: FRESH_CLI_ALLOW_SCRIPT,
+      selectedAgent: true,
+      activate: false,
+      initialState: {
+        project_path: flight.projectPath,
+        shared_worktree: false,
+      },
+    });
+    created = { windowId: result.windowId, stableId: result.stableId };
+    heartbeat.assertOwned();
+    flight.session = {
+      id: result.windowId,
       stableId: result.stableId || undefined,
-      label: customNameFor(result.stableId || undefined, opts.root) ?? opts.label,
-      hostLabel: opts.label,
-      root: opts.root,
-      projectPath: opts.projectPath,
+      label: customNameFor(result.stableId || undefined, flight.root) ??
+        flight.label,
+      hostLabel: flight.label,
+      root: flight.root,
+      projectPath: flight.projectPath,
       sharedWorktree: false,
       terminalId: result.terminalId,
-      state: "running",
+      lastOutputAt: null,
       createdAt: Date.now(),
-      branch: opts.branch,
-    });
-    // The new window is now the active session. For a "dive in" gesture
-    // (Enter / Visit) the dock is still focused, so its keys would be
-    // swallowed and the new session's terminal couldn't receive input —
-    // mirror the dock's live-session Enter path and blur it so the new
-    // window gets the keyboard. The "activate / live-switch" gestures
-    // (arrow-nav, row click) deliberately keep the dock focused, exactly
-    // like switching to a live session does.
-    if (opts.dive && dockMode && openPanel) {
-      // A dive out of the dock keeps the search filter (see `dockDiveBlur`).
-      dockDiveBlur = true;
-      dockBlurred = true;
-      editor.floatingPanelControl(openPanel.id(), "blur", 0);
-      editor.setEditorMode(null);
-    } else if (dockMode && openPanel) {
-      // Live-switch: keep the dock focused, but rebuild the list (the
-      // `· on-disk` row's synthetic id is gone, replaced by the new live
-      // window's) and move the highlight onto the now-active session so
-      // the user stays put on the row they just opened.
-      refreshOpenDialog();
-      syncDockSelectionToActive();
+      branch: flight.branch,
+    };
+    return result.windowId;
+  } catch (error) {
+    let cleanupOk = true;
+    if (created) {
+      cleanupOk = await closeCreatedWindow(created.windowId);
+      if (cleanupOk) {
+        cleanupOk = await deleteCreatedWorkspacePersistence(
+          flight.root,
+          created.stableId,
+        );
+      }
     }
-  } catch (e) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const message = cleanupOk ? detail : `${detail}; workspace cleanup is incomplete`;
     editor.setStatus(
-      editor.t("status.attach_failed", {
-        error: e instanceof Error ? e.message : String(e),
-      }),
+      editor.t("status.attach_failed", { error: message }),
     );
+    if (worktreeAttachFlights.get(key) === flight) {
+      worktreeAttachFlights.delete(key);
+    }
+    throw cleanupOk ? error : new Error(message);
+  } finally {
+    heartbeat.stop();
+    createTargetReservations.delete(key);
+    releaseLease(lease);
   }
 }
 
@@ -9449,54 +13501,104 @@ interface RunAgentLaunchOpts {
   teachFreshCli: boolean;
 }
 
-// Launch `cmd` as a terminal in the CURRENT window — no new worktree, no new
-// window. Reuses `resolveAgentLaunch` for the argv (session-id pin, auto
-// flags, flag-style system prompt) and mints the same capability token the
-// dialogue does via the extended `createTerminal`, so the agent can drive the
-// editor exactly like a dialogue-launched one. File-style system prompts
-// (codex/opencode `AGENTS.md`) are written into the current cwd.
-async function launchAgentInCurrentWorkspace(
+interface CapturedWorkspace {
+  windowId: number;
+  workspaceId: string;
+  root: string;
+  projectPath: string;
+  remote: "local" | "connected" | "dormant";
+}
+
+function captureWorkspace(windowId: number): CapturedWorkspace {
+  if (!Number.isInteger(windowId) || windowId <= 0) {
+    throw new Error("a valid windowId is required");
+  }
+  const info = editor.listWindows().find((window) => window.id === windowId);
+  if (!info) throw new Error(`window does not exist: ${windowId}`);
+  return {
+    windowId,
+    workspaceId: info.stable_id,
+    root: info.root,
+    projectPath: info.project_path || info.root,
+    remote: !info.remote
+      ? "local"
+      : info.remote.connected
+      ? "connected"
+      : "dormant",
+  };
+}
+
+// Launch `cmd` into the workspace captured synchronously by the caller. Every
+// path, identity, and result comes from `target`; mutable focus is never read
+// after terminal creation begins.
+async function launchAgentInWorkspace(
+  target: CapturedWorkspace,
   cmd: string,
   opts: RunAgentLaunchOpts,
-): Promise<void> {
+): Promise<AgentLaunchResult> {
+  if (target.remote === "dormant") {
+    throw new Error(
+      "cannot launch an agent until the remote workspace reconnects",
+    );
+  }
   const trimmedCmd = cmd.trim();
-  const cwd = editor.getCwd();
   const entry = agentEntryForCmd(trimmedCmd);
-  // "Teach Fresh CLI": inject the CLI system prompt (via flag on launch, or by
-  // writing AGENTS.md for file-style agents). The capability token is minted
-  // regardless (see `allowScript` below) — `teach` only gates the prompt.
-  const teach = opts.teachFreshCli && entry?.systemPrompt ? entry.systemPrompt : null;
+  const teach = opts.teachFreshCli && entry?.systemPrompt
+    ? entry.systemPrompt
+    : null;
+  let promptPath = "";
+  let promptOriginal: string | null = null;
+  let promptWritten: string | null = null;
   if (teach?.via === "file") {
-    writeFreshCliPromptFile(editor.pathJoin(cwd, teach.path));
+    promptPath = editor.pathJoin(target.root, teach.path);
+    const authorityPath = editor.windowPath(target.windowId, promptPath);
+    promptOriginal = editor.readFile(authorityPath);
+    if (!writeFreshCliPromptFile(authorityPath)) {
+      throw new Error(`could not write ${promptPath}`);
+    }
+    promptWritten = editor.readFile(authorityPath);
   }
   const argv = splitAgentCmd(trimmedCmd);
-  // Keep the resume argv: it is what lets a finished agent be picked back up
-  // (status-bar "Resume claude", or a workspace restore) instead of relaunching
-  // as a brand-new conversation. Dropping it here was why an agent started in
-  // the current workspace restarted as a bare shell.
-  const { launch, resume } = resolveAgentLaunch(argv, {
+  const { launch, resume, relaunch, companion } = resolveAgentLaunch(argv, {
     auto: opts.auto,
     prompt: opts.prompt,
     systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
   });
-  if (trimmedCmd) editor.setGlobalState("orchestrator.last_cmd", trimmedCmd);
   try {
-    await editor.createTerminal({
-      cwd,
+    const result = await editor.createTerminal({
+      windowId: target.windowId,
+      cwd: target.root,
       command: launch.length > 0 ? launch : undefined,
       resume,
-      title: launch.length > 0 ? editor.pathBasename(launch[0]) || launch[0] : undefined,
-      // Always mint the capability token bound to THIS window + allowlist, so
-      // `fresh --cmd ...` from inside the terminal is authorised — matching the
-      // dialogue, where the token is always present and only the prompt is
-      // gated by "Teach Fresh CLI".
+      relaunch,
+      companion,
+      title: companion === "omp"
+        ? undefined
+        : launch.length > 0
+        ? editor.pathBasename(launch[0]) || launch[0]
+        : undefined,
       allowScript: FRESH_CLI_ALLOW_SCRIPT,
+      selectedAgent: true,
       focus: true,
     });
-  } catch (e) {
-    editor.setStatus(
-      editor.t("status.prefix", { msg: e instanceof Error ? e.message : String(e) }),
-    );
+    if (trimmedCmd) editor.setGlobalState("orchestrator.last_cmd", trimmedCmd);
+    const session = orchestratorSessions.get(target.windowId);
+    if (session) ompCompanion.rebindTerminal(session, result.terminalId);
+    return {
+      workspaceId: target.workspaceId,
+      windowId: target.windowId,
+      root: target.root,
+    };
+  } catch (error) {
+    if (promptPath && promptWritten !== null) {
+      const authorityPath = editor.windowPath(target.windowId, promptPath);
+      if (editor.readFile(authorityPath) === promptWritten) {
+        if (promptOriginal === null) {
+          editor.removeFileTo(target.windowId, promptPath);
+        } else editor.writeFile(authorityPath, promptOriginal);
+      }
+    }
+    throw error;
   }
 }
 
@@ -9505,10 +13607,9 @@ async function launchAgentInCurrentWorkspace(
 //
 // The two dialogs above are how a *human* launches an agent. An agent driving
 // the editor from its shell has no way to fill in a form, so each dialog gets a
-// programmatic twin taking the same parameters and submitting through the very
-// same path (`launchAgentInCurrentWorkspace` / `captureCreateSpec` +
-// `startPendingWorkspace`). One launch pipeline, two front doors — a fix or a
-// new agent flag reaches both without being implemented twice.
+// programmatic twin taking the same parameters and submitting through the same
+// create/launch workers. One launch pipeline, two front doors — a fix or a new
+// agent flag reaches both without being implemented twice.
 //
 // Published through `editor.exportPluginApi`, so a script reaches it the way
 // any plugin reaches another's surface:
@@ -9530,39 +13631,44 @@ export type AgentLaunchResult = {
   root: string;
 };
 
-/// Options shared by both launch verbs. Every field is optional; an omitted one
-/// takes the dialog's own default, so `runAgent({})` is the dialog's defaults
-/// with no agent.
-export type RunAgentOptions = {
+/// Options shared by both launch verbs.
+export type AgentLaunchOptions = {
   /** Agent command line, e.g. `claude` or `claude --model opus`. A bare
    *  terminal when empty or omitted. */
   agent?: string;
   /** Initial prompt handed to the agent at launch (agents that accept one). */
   prompt?: string;
-  /** Run the agent in its reduced-approval mode. Default false. Ignored for an
-   *  agent whose registry entry has no such mode. */
+  /** Run the agent in its reduced-approval mode. Default false. */
   auto?: boolean;
   /** Inject the Fresh system prompt so the agent knows it can drive the editor.
    *  Default true. */
   teach?: boolean;
+  /** Non-empty caller-generated key. Reusing the same key with identical
+   *  options in the same caller window returns the original in-flight or
+   *  settled result without repeating the mutation. */
+  idempotencyKey?: string;
 };
 
-export type NewWorkspaceOptions = RunAgentOptions & {
-  /** Project directory the workspace roots at. Default: this workspace's
-   *  project. Must exist. */
+export type RunAgentOptions = AgentLaunchOptions & {
+  /** Explicit for plugins; host-filled for a window-bound agent script. */
+  windowId?: number;
+};
+
+export type NewWorkspaceOptions = AgentLaunchOptions & {
+  /** Caller workspace. Required for direct plugin calls; host-filled for a
+   *  window-bound agent script. */
+  windowId?: number;
+  /** Explicit local project path; overrides the caller's project. */
   path?: string;
   /** Workspace name. Default: the next auto-generated `<project>-N`. */
   name?: string;
-  /** Existing branch to check out in the new worktree. Default: the repo's
-   *  default branch. */
+  /** Existing branch to check out in the new worktree. */
   branch?: string;
   /** Create the worktree on a new branch of this name, cut from `branch`. */
   newBranch?: string;
-  /** Create a git worktree for the workspace. Default true; ignored for a
-   *  non-git path. */
+  /** Create a git worktree. Default true; ignored for a non-git path. */
   worktree?: boolean;
-  /** Move focus into the new workspace once it is up. Default false — an agent
-   *  asking for a workspace should not yank the human's focus into it. */
+  /** Move focus into the new workspace once it is up. Default false. */
   visit?: boolean;
 };
 
@@ -9596,21 +13702,13 @@ export type WorkspaceSummary = {
 /// Public surface of the bundled `orchestrator` plugin, reachable through
 /// `editor.getPluginApi("orchestrator")`.
 export type OrchestratorApi = {
-  /** Launch a coding agent in THIS workspace — the headless twin of the
-   *  "Run Agent…" dialog. Resolves once the agent's terminal is up. */
-  runAgent(options?: RunAgentOptions): Promise<AgentLaunchResult>;
-  /** Create a workspace (a git worktree by default) and launch a coding agent
-   *  in it — the headless twin of the "New Workspace" dialog.
-   *
-   *  Unlike the dialog, which returns to the user immediately and reports
-   *  progress on the dock, this waits for the create to finish: a caller has no
-   *  dock to watch, the durable workspace id does not exist until the window is
-   *  born, and waiting is what lets a failed create reject rather than
-   *  silently do nothing. */
-  newWorkspace(options?: NewWorkspaceOptions): Promise<AgentLaunchResult>;
-  /** Every workspace the dock is tracking, in dock order — what a caller
-   *  needs to find the one it made earlier, or to report on all of them.
-   *  Reads the live model, so it reflects creations made moments ago. */
+  /** Launch an agent in the explicitly named workspace. Resolves only after
+   *  the terminal exists; terminal creation failures reject. */
+  runAgent(options: RunAgentOptions): Promise<AgentLaunchResult>;
+  /** Create a workspace for an explicit caller window, optionally overriding
+   *  its project path. The caller identity is captured before any await. */
+  newWorkspace(options: NewWorkspaceOptions): Promise<AgentLaunchResult>;
+  /** Every workspace the dock is tracking, in dock order. */
   listWorkspaces(): WorkspaceSummary[];
   /** Focus a workspace by its durable `workspaceId` (or its `windowId`) —
    *  what `listWorkspaces()` reports.
@@ -9633,87 +13731,210 @@ declare global {
   }
 }
 
-// The active workspace's ids, for a launch that ran in place.
-function currentWorkspaceIds(): AgentLaunchResult {
-  const id = editor.activeWindow();
-  const info = editor.listWindows().find((w) => w.id === id);
-  return {
-    workspaceId: info?.stable_id ?? "",
-    windowId: id,
-    root: info?.root ?? editor.getCwd(),
-  };
-}
-
 function trimmed(value: string | undefined): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-async function runAgent(options: RunAgentOptions = {}): Promise<AgentLaunchResult> {
+type ExportedMutationKind = "runAgent" | "newWorkspace";
+interface ExportedMutationReservation {
+  kind: ExportedMutationKind;
+  fingerprint: string;
+  promise: Promise<AgentLaunchResult>;
+  settled: boolean;
+}
+
+const EXPORTED_MUTATION_CACHE_LIMIT = 256;
+const exportedMutationReservations = new Map<
+  number,
+  Map<string, ExportedMutationReservation>
+>();
+const exportedMutationOrder: {
+  windowId: number;
+  key: string;
+  reservation: ExportedMutationReservation;
+}[] = [];
+
+function reserveExportedMutation(
+  windowId: number,
+  kind: ExportedMutationKind,
+  rawKey: string | undefined,
+  fingerprint: string,
+  operation: () => Promise<AgentLaunchResult>,
+): Promise<AgentLaunchResult> {
+  if (rawKey === undefined) return operation();
+  const key = rawKey.trim();
+  if (!key || key.length > 256) {
+    throw new Error(
+      "idempotencyKey must contain 1 to 256 non-whitespace characters",
+    );
+  }
+  let perWindow = exportedMutationReservations.get(windowId);
+  if (!perWindow) {
+    perWindow = new Map();
+    exportedMutationReservations.set(windowId, perWindow);
+  }
+  const existing = perWindow.get(key);
+  if (existing) {
+    if (existing.kind !== kind || existing.fingerprint !== fingerprint) {
+      throw new Error(
+        `idempotencyKey ${
+          JSON.stringify(key)
+        } is reserved for another mutation`,
+      );
+    }
+    return existing.promise;
+  }
+
+  const promise = Promise.resolve().then(operation);
+  const reservation: ExportedMutationReservation = {
+    kind,
+    fingerprint,
+    promise,
+    settled: false,
+  };
+  perWindow.set(key, reservation);
+  exportedMutationOrder.push({ windowId, key, reservation });
+  const settle = (): void => {
+    reservation.settled = true;
+    while (exportedMutationOrder.length > EXPORTED_MUTATION_CACHE_LIMIT) {
+      const index = exportedMutationOrder.findIndex((entry) =>
+        entry.reservation.settled
+      );
+      if (index < 0) break;
+      const [expired] = exportedMutationOrder.splice(index, 1);
+      const windowReservations = exportedMutationReservations.get(
+        expired.windowId,
+      );
+      if (windowReservations?.get(expired.key) === expired.reservation) {
+        windowReservations.delete(expired.key);
+        if (windowReservations.size === 0) {
+          exportedMutationReservations.delete(expired.windowId);
+        }
+      }
+    }
+  };
+  void promise.then(settle, settle);
+  return promise;
+}
+
+async function runAgent(
+  options: RunAgentOptions,
+  boundWindowId?: number,
+): Promise<AgentLaunchResult> {
+  if (!options) throw new Error("runAgent requires options");
+  if (
+    boundWindowId !== undefined && options.windowId !== undefined &&
+    options.windowId !== boundWindowId
+  ) {
+    throw new Error("runAgent cannot target another window");
+  }
+  const windowId = boundWindowId ?? options.windowId;
+  if (windowId === undefined) {
+    throw new Error("runAgent requires an explicit windowId");
+  }
   const cmd = trimmed(options.agent);
   const entry = agentEntryForCmd(cmd);
-  // Mirror `submitForm`'s current-workspace branch: the per-agent options are
-  // only honoured for an agent whose registry entry supports each, so a bare
-  // terminal never gets stray flags appended.
-  await launchAgentInCurrentWorkspace(cmd, {
+  const launch = {
     auto: !!entry?.auto && (options.auto ?? false),
     prompt: entry?.prompt ? trimmed(options.prompt) : "",
     teachFreshCli: !!entry?.systemPrompt && (options.teach ?? true),
-  });
-  // The agent runs in the workspace the caller is already in; returning its ids
-  // means a caller never has to correlate "which workspace did that land in".
-  return currentWorkspaceIds();
+  };
+  const fingerprint = JSON.stringify({ cmd, ...launch });
+  return await reserveExportedMutation(
+    windowId,
+    "runAgent",
+    options.idempotencyKey,
+    fingerprint,
+    async () => {
+      const target = captureWorkspace(windowId);
+      return await launchAgentInWorkspace(target, cmd, launch);
+    },
+  );
 }
 
 async function newWorkspace(
-  options: NewWorkspaceOptions = {},
+  options: NewWorkspaceOptions,
+  boundWindowId?: number,
 ): Promise<AgentLaunchResult> {
-  const cmd = trimmed(options.agent);
-  const entry = agentEntryForCmd(cmd);
+  if (!options) {
+    throw new Error("newWorkspace requires options");
+  }
+  if (
+    boundWindowId !== undefined && options.windowId !== undefined &&
+    options.windowId !== boundWindowId
+  ) {
+    throw new Error("newWorkspace cannot use another caller window");
+  }
+  const callerWindowId = boundWindowId ?? options.windowId;
+  if (callerWindowId === undefined) {
+    throw new Error("newWorkspace requires an explicit windowId");
+  }
   const requestedPath = trimmed(options.path);
-  const projectPath = requestedPath || localProjectDefault();
+  const cmd = trimmed(options.agent);
   const name = trimmed(options.name);
-  // A path the caller passed has to exist. The dialog's field completes against
-  // the filesystem, so a human sees a wrong path immediately; a caller passing
-  // `path` by hand does not, and the create would otherwise "succeed" into a
-  // workspace rooted at a directory that isn't there.
-  if (requestedPath && !editor.fileExists(editor.localPath(requestedPath))) {
-    throw new Error(`project path does not exist: ${requestedPath}`);
-  }
-  // Local backend only: ssh/kubernetes workspaces need connection details that
-  // deserve their own verb (and their own validation), and a caller asking for
-  // a sibling workspace wants the local case.
-  const spec: CreateSpec = {
-    backend: "local",
-    projectPath,
-    // "" ⇒ `runLocalCreate` allocates the next `<project>-N` name, the same
-    // default the dialog's placeholder shows.
-    name,
+  const branch = trimmed(options.branch);
+  const newBranch = trimmed(options.newBranch);
+  const fingerprint = JSON.stringify({
+    requestedPath,
     cmd,
-    auto: !!entry?.auto && (options.auto ?? false),
-    startPrompt: entry?.prompt ? trimmed(options.prompt) : "",
-    teachFreshCli: !!entry?.systemPrompt && (options.teach ?? true),
-    branch: trimmed(options.branch),
-    newBranch: trimmed(options.newBranch),
-    // Worktree by default (the dialog's default too); `runLocalCreate` demotes
-    // it to false on its own when the path isn't a git tree.
-    createWorktree: options.worktree ?? true,
-    displayLabel: name || editor.pathBasename(projectPath) ||
-      editor.t("dock.pending_default_name"),
-    displayProject: projectPath,
-  };
-  const pendingId = startPendingWorkspace(spec, { visit: options.visit ?? false });
-  const outcome = await awaitCreateOutcome(pendingId);
-  if (!outcome.ok) {
-    // Thrown, not returned: a failed create must reject the caller's promise
-    // (and so fail its script), not hand it a result object it might mistake
-    // for a workspace. The dock keeps the row for a human to retry or dismiss.
-    throw new Error(outcome.error || "workspace creation failed");
-  }
-  return {
-    workspaceId: outcome.workspaceId ?? "",
-    windowId: outcome.windowId ?? 0,
-    root: outcome.root ?? "",
-  };
+    prompt: trimmed(options.prompt),
+    auto: options.auto ?? false,
+    teach: options.teach ?? true,
+    name,
+    branch,
+    newBranch,
+    worktree: options.worktree ?? true,
+    visit: options.visit ?? false,
+  });
+  return await reserveExportedMutation(
+    callerWindowId,
+    "newWorkspace",
+    options.idempotencyKey,
+    fingerprint,
+    async () => {
+      const caller = captureWorkspace(callerWindowId);
+      if (!requestedPath && caller.remote !== "local") {
+        throw new Error(
+          "a local path is required when creating from a remote workspace",
+        );
+      }
+      const projectPath = requestedPath || caller.projectPath;
+      if (!editor.fileExists(editor.localPath(projectPath))) {
+        throw new Error(`project path does not exist: ${projectPath}`);
+      }
+      const entry = agentEntryForCmd(cmd);
+      const spec: CreateSpec = {
+        backend: "local",
+        projectPath,
+        name,
+        cmd,
+        auto: !!entry?.auto && (options.auto ?? false),
+        startPrompt: entry?.prompt ? trimmed(options.prompt) : "",
+        teachFreshCli: !!entry?.systemPrompt && (options.teach ?? true),
+        branch,
+        newBranch,
+        createWorktree: options.worktree ?? true,
+        displayLabel: name || editor.pathBasename(projectPath) ||
+          editor.t("dock.pending_default_name"),
+        displayProject: projectPath,
+      };
+      const pendingId = startPendingWorkspace(spec, {
+        visit: options.visit ?? false,
+        launch: false,
+      });
+      const outcomePromise = awaitCreateOutcome(pendingId);
+      launchPendingCreate(pendingId);
+      const outcome = await outcomePromise;
+      if (!outcome.ok) {
+        throw new Error(outcome.error || "workspace creation failed");
+      }
+      return {
+        workspaceId: outcome.workspaceId ?? "",
+        windowId: outcome.windowId ?? 0,
+        root: outcome.root ?? "",
+      };
+    },
+  );
 }
 
 function listWorkspaces(): WorkspaceSummary[] {
@@ -9732,7 +13953,7 @@ function listWorkspaces(): WorkspaceSummary[] {
       root: session.root,
       projectPath: session.projectPath,
       branch: session.branch ?? git?.branch,
-      agentState: session.state,
+      agentState: ompCompanion.activityState(session, IDLE_AFTER_MS),
       title: session.terminalTitle ?? "",
       git: git
         ? {
@@ -9760,33 +13981,29 @@ function listWorkspaces(): WorkspaceSummary[] {
 async function focusWorkspace(target: string | number): Promise<boolean> {
   reconcileSessions();
   const windows = editor.listWindows();
-
-  // Match on either identity. `workspaceId` (the host's `stable_id`) is the
-  // one worth recording; `windowId` is accepted because it is right there in
-  // the same summary and a caller reaching for it is not wrong to.
   const match = [...orchestratorSessions.values()].find((session) => {
     if (typeof target === "number") return session.id === target;
-    const stable = windows.find((w) => w.id === session.id)?.stable_id;
+    const stable = windows.find((window) => window.id === session.id)
+      ?.stable_id;
     return !!target && stable === target;
   });
   if (!match) return false;
 
+  const activation = beginWorktreeActivation(true);
   if (match.discovered) {
-    // No window yet — attach a session at the worktree, which activates it.
-    await attachToWorktree({
+    // Attach failures reject; success is reported only after the new window is
+    // confirmed active, never merely because window creation returned.
+    return await attachToWorktree({
       root: match.root,
       projectPath: match.projectPath ?? match.root,
       label: match.label,
       branch: match.branch,
       discoveredId: match.id,
-      dive: true,
+      activation,
     });
-    return true;
   }
-
   if (match.id <= 0) return false;
-  if (match.id !== editor.activeWindow()) editor.setActiveWindow(match.id);
-  return true;
+  return await activateWindowConfirmed(match.id, activation);
 }
 
 editor.exportPluginApi("orchestrator", {
@@ -9840,7 +14057,6 @@ const FOLDER_DIALOG_MODE_BINDINGS: [string, string][] = [
   ["C-Enter", "orchestrator_folder_submit"],
 ];
 editor.defineMode(CREATE_FOLDER_MODE, FOLDER_DIALOG_MODE_BINDINGS, true, true);
-
 
 registerHandler("orchestrator_folder_submit", () => {
   if (!createFolderDialog) return;
@@ -9911,11 +14127,9 @@ registerHandler("orchestrator_form_key_enter", () => {
     dispatchFormKey("Enter");
     return;
   }
-  // Popup closed: Enter must NOT advance focus (Tab / Shift-Tab are the only
-  // field movers). Activate the focused control instead — `activate()` fires
-  // a Button's "activate" event (Create / Cancel / Advanced / the type tabs)
-  // or a Toggle's "toggle", and is a no-op on text inputs and the dropdown.
-  formPanel.command(activate());
+  // With neither popup open, preserve the focused widget's standard Enter
+  // semantics: controls activate and a single-line text field advances focus.
+  dispatchFormKey("Enter");
 });
 registerHandler(
   "orchestrator_form_key_shift_tab",
@@ -9952,7 +14166,10 @@ registerHandler(
   "orchestrator_form_key_backspace",
   () => dispatchFormKey("Backspace"),
 );
-registerHandler("orchestrator_form_key_delete", () => dispatchFormKey("Delete"));
+registerHandler(
+  "orchestrator_form_key_delete",
+  () => dispatchFormKey("Delete"),
+);
 registerHandler("orchestrator_form_key_home", () => dispatchFormKey("Home"));
 registerHandler("orchestrator_form_key_end", () => dispatchFormKey("End"));
 // When a "Run in:" type tab is focused, ←/→ moves between tabs (switching the
@@ -9961,7 +14178,8 @@ function switchTabIfFocused(delta: 1 | -1): boolean {
   if (!form) return false;
   const idx = SESSION_BACKENDS.findIndex((b) => b.key === formFocusedKey());
   if (idx < 0) return false;
-  const next = (idx + delta + SESSION_BACKENDS.length) % SESSION_BACKENDS.length;
+  const next = (idx + delta + SESSION_BACKENDS.length) %
+    SESSION_BACKENDS.length;
   selectBackend(SESSION_BACKENDS[next].id);
   return true;
 }
@@ -10064,12 +14282,11 @@ function enterConfirm(action: "stop" | "archive" | "delete"): void {
   if (!openDialog || !openPanel) return;
   const id = openDialog.filteredIds[openDialog.selectedIndex];
   if (typeof id !== "number" || id <= 0) return;
-  // Every live session can be stopped/archived/deleted now: Archive
-  // records a launch/in-place session at its own root (no worktree to
-  // move) and worktree sessions move to the graveyard; closing the last
-  // live window opens a replacement first (see `ensureReplacementWindow`
-  // in `archiveOne` / `deleteOne`). So no eligibility refusal here — just
-  // confirm and run.
+  if (!bulkEligible(action, id)) {
+    setDialogError(editor.t("err.nothing_eligible", { action }));
+    refreshOpenDialog();
+    return;
+  }
   openDialog.pendingConfirm = { action, ids: [id] };
   openPanel.update(buildOpenSpec());
   openPanel.setFocusKey("confirm-cancel");
@@ -10105,7 +14322,10 @@ editor.on("widget_event", (e) => {
   // ---------------------------------------------------------------------
   // "New Folder" dialog: name field, organize checkbox, Cancel / Create.
   // ---------------------------------------------------------------------
-  if (createFolderPanel && createFolderDialog && e.panel_id === createFolderPanel.id()) {
+  if (
+    createFolderPanel && createFolderDialog &&
+    e.panel_id === createFolderPanel.id()
+  ) {
     const d = createFolderDialog;
     if (e.event_type === "cancel") {
       // Esc / click-outside: the host already unmounted the panel, so
@@ -10133,7 +14353,9 @@ editor.on("widget_event", (e) => {
     if (e.event_type === "change" && e.widget_key === "folder-name") {
       const payload = (e.payload ?? {}) as Record<string, unknown>;
       if (typeof payload.value === "string") d.name.value = payload.value;
-      if (typeof payload.cursorByte === "number") d.name.cursor = payload.cursorByte;
+      if (typeof payload.cursorByte === "number") {
+        d.name.cursor = payload.cursorByte;
+      }
       // Typing lands in the name field even if focus drifted; the host
       // routes printable chars to the focused TextInput only, so a
       // change event implies the field is focused again.
@@ -10142,7 +14364,9 @@ editor.on("widget_event", (e) => {
     }
     if (e.event_type === "toggle" && e.widget_key === "folder-organize") {
       const checked = (e.payload as { checked?: unknown })?.checked;
-      d.organizeCurrent = typeof checked === "boolean" ? checked : !d.organizeCurrent;
+      d.organizeCurrent = typeof checked === "boolean"
+        ? checked
+        : !d.organizeCurrent;
       createFolderPanel.update(buildCreateFolderSpec());
       return;
     }
@@ -10151,7 +14375,7 @@ editor.on("widget_event", (e) => {
       return;
     }
     if (e.event_type === "activate" && e.widget_key === "folder-create") {
-      submitCreateFolder();
+      void submitCreateFolder();
       return;
     }
     return;
@@ -10160,6 +14384,7 @@ editor.on("widget_event", (e) => {
   // "Run Agent…" dialog: agent picker, target picker, Auto toggle,
   // Start-prompt field, Cancel / Run.
   // ---------------------------------------------------------------------
+
   // ---------------------------------------------------------------------
   // Dock session context menu (right-click): Visit / Archive / Delete.
   // ---------------------------------------------------------------------
@@ -10197,8 +14422,11 @@ editor.on("widget_event", (e) => {
           return;
         }
         if (e.widget_key === "ctx-delete-folder") {
-          deleteFolder(target.id);
+          const folderId = target.id;
           closeDockContextMenuAndRestoreDock();
+          void deleteFolder(folderId).then(() => refreshOpenDialog()).catch(
+            reportDockModelFailure,
+          );
           return;
         }
         return;
@@ -10259,8 +14487,12 @@ editor.on("widget_event", (e) => {
         anchorDockMenu();
         return;
       }
-      if (e.widget_key === "confirm-archive" || e.widget_key === "confirm-delete") {
-        const action = e.widget_key === "confirm-archive" ? "archive" : "delete";
+      if (
+        e.widget_key === "confirm-archive" || e.widget_key === "confirm-delete"
+      ) {
+        const action = e.widget_key === "confirm-archive"
+          ? "archive"
+          : "delete";
         closeDockContextMenuAndRestoreDock();
         void runConfirmedAction(action, [id]);
         return;
@@ -10347,8 +14579,6 @@ editor.on("widget_event", (e) => {
         ? form.newBranch
         : field === "ssh_host"
         ? form.sshHost
-        : field === "ssh_path"
-        ? form.sshPath
         : field === "ssh_identity"
         ? form.sshIdentity
         : field === "ssh_options"
@@ -10392,12 +14622,6 @@ editor.on("widget_event", (e) => {
         // context/namespace/pod/workspace inputs are shown, so a change
         // here re-lays-out the body and the Tab cycle.
         if (field === "k8s_target") {
-          rebuildFormFocusCycle();
-          renderForm();
-        }
-        // Editing the command changes which agent it resolves to, and thus
-        // whether the Auto mode / Start prompt controls appear — re-lay-out.
-        if (field === "cmd") {
           rebuildFormFocusCycle();
           renderForm();
         }
@@ -10504,12 +14728,6 @@ editor.on("widget_event", (e) => {
       // mirror our own state and (if reached from the picker)
       // bounce back to the picker so Esc is "back", not "out".
       const wasFromPicker = !!form?.fromPicker;
-      // Esc while connecting aborts the in-flight remote attach, same as the
-      // Cancel button: reject the promise and discard the late result host-side.
-      if (form?.submitting) {
-        pendingRemoteFacet = null;
-        editor.cancelRemoteAgent();
-      }
       form = null;
       formPanel = null;
       editor.setEditorMode(null);
@@ -10625,7 +14843,9 @@ editor.on("widget_event", (e) => {
         return;
       }
       const id = dockSelectedSessionId();
-      const sel = typeof id === "number" ? orchestratorSessions.get(id) : undefined;
+      const sel = typeof id === "number"
+        ? orchestratorSessions.get(id)
+        : undefined;
       // Enter on a being-created placeholder: resume a paused/failed one
       // (retry), or do nothing while it is still creating (there is no
       // window to dive into). Never blur to the editor — that would drop
@@ -10635,14 +14855,18 @@ editor.on("widget_event", (e) => {
         return;
       }
       if (sel && sel.discovered) {
+        const activation = beginWorktreeActivation(
+          true,
+          openDialog.dockSelKey ?? undefined,
+        );
         void attachToWorktree({
           root: sel.root,
           projectPath: sel.projectPath ?? sel.root,
           label: sel.label,
           branch: sel.branch,
           discoveredId: sel.id,
-          dive: true,
-        });
+          activation,
+        }).catch(() => {});
         return;
       }
       // Enter is the deliberate dive: if the highlighted session isn't the
@@ -10795,6 +15019,7 @@ editor.on("widget_event", (e) => {
             : (openDialog.dockKeys[idx] ?? null);
           const prevKey = openDialog.dockSelKey;
           const prevIdx = prevKey ? openDialog.dockKeys.indexOf(prevKey) : -1;
+          invalidateWorktreeActivation();
           openDialog.dockSelKey = key;
           openPanel.update(buildDockSpec());
           openPanel.setSelectedIndex("sessions", idx);
@@ -10805,7 +15030,11 @@ editor.on("widget_event", (e) => {
             if (payload.via === "click") toggleDockFolderExpansion(key!);
             return;
           }
-          const fromEdge = idx > prevIdx ? "bottom" : idx < prevIdx ? "top" : null;
+          const fromEdge = idx > prevIdx
+            ? "bottom"
+            : idx < prevIdx
+            ? "top"
+            : null;
           if (payload.via === "click") diveDockSelectionFromClick(fromEdge);
           else scheduleDockSwitch(fromEdge);
           return;
@@ -10829,26 +15058,30 @@ editor.on("widget_event", (e) => {
             : undefined;
           if (clicked && clicked.discovered) {
             closeOpenDialog();
+            const activation = beginWorktreeActivation(true);
             void attachToWorktree({
               root: clicked.root,
               projectPath: clicked.projectPath ?? clicked.root,
               label: clicked.label,
               branch: clicked.branch,
               discoveredId: clicked.id,
-            });
+              activation,
+            }).catch(() => {});
             return;
           }
         }
         // Up/Down on a focused action button (Stop / Archive /
         // Delete / Details / +New Session) routes to the sessions
         // list via the host's smart-key dispatch but leaves focus
-        // on the button. Snap focus back to Visit so the user can
-        // press Enter to open the newly-highlighted session — the
-        // dialog's whole reason for being. Idempotent when focus
-        // is already on Visit. Skipped in bulk mode and during a
-        // confirm, where "visit" isn't in the spec.
+        // on the button. Keep Enter routed through Visit, while
+        // giving Space back to the sessions list so the highlighted
+        // row can be checkbox-selected for bulk actions. Skipped in
+        // bulk mode and during a confirm, where "visit" isn't in the
+        // spec.
         if (selectedSessions().length < 2 && !openDialog.pendingConfirm) {
-          openPanel.setFocusKey("visit");
+          const focusKey = selectedPreviewPrimaryKey();
+          openPanel.setFocusKey(focusKey);
+          pickerFocusKey = "sessions";
         }
       }
       return;
@@ -10858,18 +15091,20 @@ editor.on("widget_event", (e) => {
       (e.widget_key === "sessions" || e.widget_key === "visit")
     ) {
       const id = openDialog.filteredIds[openDialog.selectedIndex];
-      const sel = typeof id === "number" ? orchestratorSessions.get(id) : undefined;
+      const sel = typeof id === "number"
+        ? orchestratorSessions.get(id)
+        : undefined;
       if (sel && sel.discovered) {
-        // Discovered worktree: there's no window to switch to —
-        // open one by attaching a fresh session to the worktree.
         closeOpenDialog();
+        const activation = beginWorktreeActivation(true);
         void attachToWorktree({
           root: sel.root,
           projectPath: sel.projectPath ?? sel.root,
           label: sel.label,
           branch: sel.branch,
           discoveredId: sel.id,
-        });
+          activation,
+        }).catch(() => {});
         return;
       }
       if (sel && sel.pending) {
@@ -10884,7 +15119,7 @@ editor.on("widget_event", (e) => {
       if (dockMode && openPanel) {
         // Dock stays visible; Enter just hands keyboard focus to the
         // editor (the session is already active via live-switch).
-        editor.floatingPanelControl(openPanel.id(), "blur");
+        editor.floatingPanelControl(openPanel.id(), "blur", 0);
         dockBlurred = true;
         editor.setEditorMode(null);
         return;
@@ -10935,14 +15170,9 @@ editor.on("widget_event", (e) => {
       const key = payload.key;
       const expanded = payload.expanded;
       if (typeof key === "string" && key.startsWith(FOLDER_NODE_PREFIX)) {
-        const set = loadExpanded();
-        if (expanded === true) set.add(key);
-        else set.delete(key);
-        saveExpanded();
-        // A fold changes how many rows the tree occupies; re-render so
-        // the blank padding between the tree and the bottom hint bar
-        // re-balances and the hints stay pinned to the dock's bottom.
-        if (dockMode && openPanel) openPanel.update(buildDockSpec());
+        void setDockFolderExpansion(key, expanded === true).catch(
+          reportDockModelFailure,
+        );
       }
       return;
     }
@@ -11006,6 +15236,35 @@ editor.on("widget_event", (e) => {
       toggleHideTrivial();
       return;
     }
+    const companionSelectedId =
+      openDialog.filteredIds[openDialog.selectedIndex];
+    if (
+      ompCompanion.handleWidgetEvent(
+        e,
+        typeof companionSelectedId === "number"
+          ? orchestratorSessions.get(companionSelectedId)
+          : undefined,
+      )
+    ) return;
+
+    if (e.event_type === "activate" && e.widget_key === "pending-retry") {
+      const id = openDialog.filteredIds[openDialog.selectedIndex];
+      if (typeof id === "number") {
+        const session = orchestratorSessions.get(id);
+        if (session?.pending && pendingActionable(session.pending)) {
+          retryPending(id);
+        }
+      }
+      return;
+    }
+    if (e.event_type === "activate" && e.widget_key === "pending-dismiss") {
+      const id = openDialog.filteredIds[openDialog.selectedIndex];
+      if (typeof id === "number" && orchestratorSessions.get(id)?.pending) {
+        dismissPending(id);
+      }
+      return;
+    }
+
     if (e.event_type === "activate" && e.widget_key === "stop") {
       enterConfirm("stop");
       return;
@@ -11035,7 +15294,9 @@ editor.on("widget_event", (e) => {
     if (e.event_type === "activate" && e.widget_key === "bulk-clear") {
       openDialog.selectedIds.clear();
       refreshOpenDialog();
-      openPanel.setFocusKey("visit");
+      const focusKey = selectedPreviewPrimaryKey();
+      openPanel.setFocusKey(focusKey);
+      pickerFocusKey = focusKey;
       return;
     }
     if (e.event_type === "activate" && e.widget_key === "confirm-cancel") {
@@ -11083,42 +15344,6 @@ editor.on("widget_event", (e) => {
   }
 });
 
-// Legacy kill helper retained for the `Orchestrator: Kill Selected`
-// command-palette command. In the widget-based picker (Phase 1)
-// the open dialog has no kill action — Phase 3-5 will replace
-// this with Stop / Archive / Delete. When invoked while the
-// open dialog is up, it targets that dialog's selection; when
-// invoked from the palette outside the dialog, it status-bars
-// with guidance.
-function killSelected(): void {
-  if (!openDialog) {
-    editor.setStatus(editor.t("status.kill_open_list_first"));
-    return;
-  }
-  const ids = openDialog.filteredIds;
-  if (ids.length === 0) {
-    editor.setStatus(editor.t("status.kill_no_selected"));
-    return;
-  }
-  const id = ids[Math.max(0, Math.min(openDialog.selectedIndex, ids.length - 1))];
-  if (id <= 0) {
-    editor.setStatus(editor.t("status.kill_select_row"));
-    return;
-  }
-  if (id === editor.activeWindow()) {
-    editor.setStatus(editor.t("status.kill_dive_elsewhere"));
-    return;
-  }
-  const s = orchestratorSessions.get(id);
-  if (s && s.terminalId !== null) {
-    editor.closeTerminal(s.terminalId);
-  }
-  // Tombstone so reconcile drops the row immediately instead of resurrecting
-  // it from the stale window snapshot until the deferred close lands.
-  closingWindowIds.add(id);
-  editor.closeWindow(id);
-}
-
 // =============================================================================
 // Lifecycle hook handlers
 // =============================================================================
@@ -11134,26 +15359,24 @@ editor.on("window_created", () => {
 });
 
 editor.on("window_closed", (e) => {
-  // The host has confirmed this window is gone, so drop any tombstone for
-  // it (reconcile won't re-add it now that it's out of `listWindows()` —
-  // this just keeps the set from growing).
-  if (e && typeof e.id === "number") closingWindowIds.delete(e.id);
+  if (e && typeof e.id === "number") {
+    closingWindowIds.delete(e.id);
+    ompCompanion.handleWindowClosed(e.id);
+  }
   refreshOpenDialog();
 });
 
-// Startup: re-surface any workspaces that were still being created when the
-// editor last quit. They come back as paused placeholder rows the user
-// resumes (Enter) or dismisses — nothing auto-runs (§ recoverPendingWorkspaces).
+// Startup first repairs interrupted archive/delete effects, then re-surfaces
+// create attempts as paused rows. Nothing destructive auto-runs on recovery.
 editor.on("ready", () => {
-  recoverPendingWorkspaces();
-  // Auto-open the dock when the user asked for it in Settings (Plugin:
-  // orchestrator → autoOpenDock). Runs after the recovery pass, which
-  // may already have shown the dock for a restored placeholder —
-  // `showDockUnfocused` is a no-op on an open panel, so the two can't
-  // fight. Like the pending-workspace case, the dock comes up *blurred*:
-  // it's a switcher, not something to type into, so the keyboard stays
-  // with whatever the editor restored.
-  if (dockSettings().autoOpenDock === true) showDockUnfocused();
+  void (async () => {
+    await recoverLifecycleIntents();
+    await recoverPendingWorkspaces();
+    // Auto-open after recovery so a restored placeholder is present before the
+    // first dock render. The dock stays blurred; keyboard focus remains with
+    // the editor workspace the host restored.
+    if (dockSettings().autoOpenDock === true) showDockUnfocused();
+  })();
 });
 
 // Grace window after a session becomes active during which terminal
@@ -11166,16 +15389,11 @@ editor.on("active_window_changed", () => {
   const s = orchestratorSessions.get(editor.activeWindow());
   if (s) {
     s.activatedAt = Date.now();
-    // Switching into a workspace counts as activity for the dock's recency
-    // order (persisted at day granularity).
     markSessionActiveToday(s);
   }
   refreshOpenDialog();
-  // A passive (blurred) dock mirrors the active window, so keep its
-  // highlighted row in sync when focus moves to another window from
-  // outside the dock. While the dock holds focus the user drives ↑/↓
-  // selection (and the debounced live-switch already aligns the two), so
-  // re-selecting here would fight the scroll — hence the blurred guard.
+  // A passive (blurred) dock mirrors the active window. While the dock holds
+  // focus the user drives selection, so re-selecting here would fight it.
   if (dockBlurred) syncDockSelectionToActive();
 });
 
@@ -11198,112 +15416,106 @@ editor.on("resize", () => {
     // lets a user-dragged width win. buildOpenSpec/buildDockSpec also
     // refit `listVisibleRows` + content width on the refresh below.
     if (dockMode) {
-      editor.floatingPanelControl(openPanel.id(), "dock_width", dockDefaultWidth());
+      if (editor.getScreenSize().width < DOCK_MIN_WIDTH_COLS + 20) {
+        dockBlurred = true;
+        editor.floatingPanelControl(openPanel.id(), "blur", 0);
+        editor.setEditorMode(null);
+      } else {
+        editor.floatingPanelControl(
+          openPanel.id(),
+          "dock_width",
+          dockDefaultWidth(),
+        );
+      }
     }
     refreshOpenDialog();
   }
 });
 
+trustedOrchestratorHost.on("omp_companion_snapshot", (payload) => {
+  ompCompanion.handleSnapshot(payload);
+});
 // =============================================================================
-// Agent activity tracking from terminal output / exit
+// Outside a live structured companion snapshot, we only claim what terminal
+// signals can prove: a session is "working" while its command is marked active
+// or it is printing, and "idle" once it goes quiet. The output signal is the
+// timestamp of the last output; the companion controller buckets it against
+// IDLE_AFTER_MS when no live structured/OSC state is available. We don't poll
+// the process, so this tracks *output*, not liveness — a wedged agent reads
+// idle, same as a finished one, which is the honest limit of what we can see
+// from here.
 //
-// We only claim what the terminal can prove: a session is "working" while
-// it's actively printing, "idle" once it goes quiet. The signal is the
-// timestamp of the last output; `sessionState` buckets it against
-// IDLE_AFTER_MS at render time. We don't poll the process, so this tracks
-// *output*, not liveness — a wedged agent reads idle, same as a finished
-// one, which is the honest limit of what we can see from here.
-//
-// Keyed by `window_id`, not the one terminal id Orchestrator spawned: a
-// session is its editor window (its id == the session id), so output from
-// ANY terminal in that window counts — a second shell the user opened, an
-// agent that re-execs, etc. The host fires `terminal_output` on every PTY
-// read, so this also lights up for in-place redraws and carriage-return
-// progress bars, not just newline-terminated lines.
+// Activity is retained per terminal within the session window. Output from any
+// terminal may provide a conservative working fallback, while OSC state and
+// titles remain bound to the host-selected agent terminal. Keeping the
+// fallback keyed by terminal also lets an unrelated exit discard only its own
+// evidence instead of clearing the selected terminal's UI. The host fires
+// `terminal_output` on every PTY read, including in-place redraws and
+// carriage-return progress bars rather than only newline-terminated lines.
 // =============================================================================
 
-// `sessionState` buckets `working`/`idle` from `lastOutputAt` at render
-// time, but a re-render only happens on *new* output. So when a session
-// goes quiet nothing repaints it, and the row freezes on `working` until
-// some unrelated event forces a redraw. This schedules one refresh just
-// past the idle window so the working→idle flip happens on its own. The
-// token collapses back-to-back outputs into a single pending sweep, and
-// because it covers the *most recent* output across all sessions, the
-// sweep recomputes (and idles) every quiet session at once.
-let idleSweepToken = 0;
+let idleSweepRunning = false;
+let idleSweepDeadline = 0;
 function scheduleIdleSweep(): void {
-  const token = ++idleSweepToken;
-  void editor.delay(IDLE_AFTER_MS + 100).then(() => {
-    if (idleSweepToken !== token) return;
-    refreshOpenDialog();
-  });
+  idleSweepDeadline = Date.now() + IDLE_AFTER_MS + 100;
+  if (idleSweepRunning) return;
+  idleSweepRunning = true;
+  void (async () => {
+    for (;;) {
+      const wait = Math.max(0, idleSweepDeadline - Date.now());
+      if (wait > 0) await editor.delay(wait);
+      if (Date.now() < idleSweepDeadline) continue;
+      idleSweepRunning = false;
+      refreshOpenDialog();
+      return;
+    }
+  })();
 }
 
 editor.on("terminal_output", (payload) => {
   const s = orchestratorSessions.get(payload.window_id);
-  if (s) {
-    // Ignore the redraw burst a terminal emits right after its window
-    // becomes active — that's not the agent working, and counting it
-    // would flash the card to `working` on every selection.
-    if (s.activatedAt !== undefined && Date.now() - s.activatedAt < ACTIVATION_GRACE_MS) {
-      return;
-    }
-    // Stamp the moment of output. `sessionState` turns this into
-    // working/idle; the cached `state` is updated so persistence and
-    // any non-render reader see a fresh value too.
-    s.lastOutputAt = Date.now();
-    s.state = "working";
-    // Terminal output is activity — feed the dock's day-granularity recency
-    // order (persists at most once per session per day).
-    markSessionActiveToday(s);
-    // Adopt any explicit OSC activity signal (OSC 133 / OSC 9;4) from the
-    // session's own terminal — authoritative for the working/idle dot. Only
-    // the session's agent terminal (when it has one), so a second shell in
-    // the same window can't drive the indicator. `null`/`undefined` leaves
-    // the previous state (a program that emits markers, then a batch without
-    // one, is still considered running/idle per the last marker).
-    if (
-      (s.terminalId === null || s.terminalId === payload.terminal_id) &&
-      (payload.osc_activity === true || payload.osc_activity === false)
-    ) {
-      s.oscRunning = payload.osc_activity;
-    }
-    // Track the terminal's tab title so an un-renamed workspace names itself
-    // after whatever it's running. Only adopt the session's own agent
-    // terminal (when it has one) so a second shell the user opened in the
-    // same window can't hijack the workspace name.
-    const title = (payload.terminal_title ?? "").trim();
-    if (
-      title &&
-      (s.terminalId === null || s.terminalId === payload.terminal_id) &&
-      s.terminalTitle !== title
-    ) {
-      s.terminalTitle = title;
+  if (!s) return;
+  const now = Date.now();
+
+  const terminal: WindowTerminalId = {
+    windowId: payload.window_id,
+    terminalId: payload.terminal_id,
+  };
+  const ownsAgentTerminal = s.terminalId?.windowId === terminal.windowId &&
+    s.terminalId.terminalId === terminal.terminalId;
+  // OSC activity and terminal title are authoritative signals from the owned
+  // terminal. Activation grace suppresses only the synthetic output fallback.
+  if (
+    ownsAgentTerminal &&
+    (payload.osc_activity === true || payload.osc_activity === false)
+  ) {
+    ompCompanion.recordOscActivity(s, terminal, payload.osc_activity, now);
+  }
+  if (ownsAgentTerminal) {
+    const activityTitle = splitOmpLoaderTitle(payload.terminal_title ?? "");
+    s.terminalSpinner = activityTitle.spinner;
+    if (activityTitle.title && s.terminalTitle !== activityTitle.title) {
+      s.terminalTitle = activityTitle.title;
       applyResolvedLabel(s);
     }
-    refreshOpenDialog();
-    // Ensure the row flips back to idle once output stops, even if no
-    // further event arrives to trigger a render.
+  }
+
+  const inActivationGrace = s.activatedAt !== undefined &&
+    now - s.activatedAt < ACTIVATION_GRACE_MS;
+  if (!inActivationGrace) {
+    ompCompanion.recordTerminalOutput(s, terminal, now);
+    markSessionActiveToday(s);
     scheduleIdleSweep();
   }
+  refreshOpenDialog();
 });
 
 editor.on("terminal_exit", (payload) => {
-  const s = orchestratorSessions.get(payload.window_id);
-  if (s) {
-    // A terminal in this session ended — it can't be the source of work
-    // anymore. Drop to idle and clear the timestamp so the row reads idle
-    // immediately rather than riding out the IDLE_AFTER_MS tail. If another
-    // terminal in the same window is still printing, the next
-    // `terminal_output` re-marks it working within the debounce window.
-    s.lastOutputAt = null;
-    s.state = "idle";
-    // The terminal is gone, so any running OSC marker is stale — clear it so
-    // a command that never emitted its "done" marker (killed, detached)
-    // doesn't leave the row stuck "working".
-    s.oscRunning = null;
-    refreshOpenDialog();
-  }
+  ompCompanion.handleTerminalExit(payload);
+  // The controller already reconciled the host snapshot before reducing the
+  // exit. Refresh only the UI so one hook cannot reconcile the same snapshot
+  // twice and reorder modal state between those passes.
+  refreshOpenDialog(false);
 });
 
 // =============================================================================
@@ -11312,7 +15524,6 @@ editor.on("terminal_exit", (payload) => {
 
 registerHandler("orchestrator_open", openControlRoom);
 registerHandler("orchestrator_new", startNewSession);
-registerHandler("orchestrator_kill", killSelected);
 
 // `terminalBypass: true` keeps these commands reachable from a
 // keyboard-focused terminal pane — a user with `Ctrl+O` bound to
@@ -11332,13 +15543,6 @@ editor.registerCommand(
   "%cmd.new",
   "%cmd.new_desc",
   "orchestrator_new",
-  null,
-  { terminalBypass: true },
-);
-editor.registerCommand(
-  "%cmd.kill",
-  "%cmd.kill_desc",
-  "orchestrator_kill",
   null,
   { terminalBypass: true },
 );
@@ -11366,7 +15570,10 @@ editor.registerCommand(
 // which way its "Launch in" switch starts. One form, one submit path — the two
 // used to be separate dialogs, and the current-workspace one silently dropped
 // the agent-resume argv.
-registerHandler("orchestrator_run_agent", () => openForm({ target: "current" }));
+registerHandler(
+  "orchestrator_run_agent",
+  () => openForm({ target: "current" }),
+);
 editor.registerCommand(
   "%cmd.run_agent",
   "%cmd.run_agent_desc",

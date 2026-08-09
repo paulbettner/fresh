@@ -27,6 +27,7 @@
 #![cfg(feature = "plugins")]
 
 use crate::common::harness::EditorTestHarness;
+use fresh::workspace::Workspace;
 use fresh_core::api::PluginCommand;
 use portable_pty::{native_pty_system, PtySize};
 
@@ -98,16 +99,19 @@ fn new_session_renders_terminal_output_without_keypress() {
             ratio: None,
             focus: Some(false),
             persistent: false,
-            window_id: Some(new_window),
+            window_id: new_window,
             command: Some(vec![
                 "sh".into(),
                 "-c".into(),
                 format!("printf {}; sleep 60", MARKER),
             ]),
+            relaunch: None,
             title: Some("agent".into()),
             resume: None,
             env: None,
+            companion: None,
             allow_script: false,
+            selected_agent: true,
             request_id: 0,
         })
         .unwrap();
@@ -183,6 +187,8 @@ fn new_session_atomic_api_seeds_terminal_as_only_tab() {
     fresh::i18n::set_locale("en");
     let mut harness = EditorTestHarness::with_temp_project(160, 50).unwrap();
     harness.tick_and_render().unwrap();
+    let original_root = harness.editor().active_window().root.clone();
+    let original_stable_id = harness.editor().active_window().stable_id.clone();
 
     let project_root = harness.project_dir().unwrap().canonicalize().unwrap();
 
@@ -198,13 +204,25 @@ fn new_session_atomic_api_seeds_terminal_as_only_tab() {
                 "-c".into(),
                 format!("printf {}; sleep 60", MARKER),
             ]),
+            None,
             Some("agent".into()),
             born_authority,
             None,
             None,
             false,
+            None,
+            true,
+            true,
+            None,
         )
         .expect("create_window_with_terminal should succeed");
+    Workspace::load_by_id_in(
+        harness.editor().dir_context(),
+        &original_root,
+        &original_stable_id,
+    )
+    .unwrap()
+    .expect("activating an atomic session must checkpoint the outgoing workspace");
 
     harness.tick_and_render().unwrap();
 

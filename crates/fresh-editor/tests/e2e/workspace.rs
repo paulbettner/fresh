@@ -7,13 +7,14 @@ use crate::common::harness::{EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
-use fresh::workspace::get_workspace_path;
+use fresh::workspace::encode_path_for_filename;
 use tempfile::TempDir;
 
 /// Test that session saves and restores open files
 #[test]
 fn test_session_saves_and_restores_open_files() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -24,11 +25,12 @@ fn test_session_saves_and_restores_open_files() {
 
     // First session: open files and save
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -43,15 +45,14 @@ fn test_session_saves_and_restores_open_files() {
 
     // Second session: restore and verify
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
-
-        // Before restore, should be empty buffer
         harness.assert_buffer_content("");
 
         // Restore session
@@ -72,6 +73,7 @@ fn test_session_saves_and_restores_open_files() {
 fn test_session_restores_cursor_line() {
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     std::fs::create_dir(&project_dir).unwrap();
 
     // Create file with numbered lines for easy verification
@@ -83,11 +85,12 @@ fn test_session_restores_cursor_line() {
 
     // First session: move cursor to line 5
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -108,11 +111,12 @@ fn test_session_restores_cursor_line() {
 
     // Second session: restore and verify cursor position is restored
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -133,6 +137,7 @@ fn test_session_restores_cursor_line() {
 fn test_session_handles_missing_files() {
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     std::fs::create_dir(&project_dir).unwrap();
 
     let file1 = project_dir.join("k.txt");
@@ -142,11 +147,12 @@ fn test_session_handles_missing_files() {
 
     // First session: open both files
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -166,11 +172,12 @@ fn test_session_handles_missing_files() {
 
     // Second session: should restore without error
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -191,6 +198,7 @@ fn test_session_handles_missing_files() {
 #[test]
 fn test_no_session_flag_behavior() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -199,11 +207,12 @@ fn test_no_session_flag_behavior() {
 
     // First: save a session with the file
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -217,11 +226,12 @@ fn test_no_session_flag_behavior() {
     // Second: create new editor WITHOUT restoring
     // This simulates --no-session flag behavior
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -239,6 +249,7 @@ fn test_no_session_flag_behavior() {
 #[test]
 fn test_restore_previous_session_config_disabled() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -248,11 +259,12 @@ fn test_restore_previous_session_config_disabled() {
     // First session: open the file and save the workspace so there is
     // something to restore.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -269,9 +281,14 @@ fn test_restore_previous_session_config_disabled() {
     let mut config = Config::default();
     config.editor.restore_previous_session = false;
     {
-        let mut harness =
-            EditorTestHarness::with_config_and_working_dir(80, 24, config, project_dir.clone())
-                .unwrap();
+        let mut harness = EditorTestHarness::with_shared_dir_context(
+            80,
+            24,
+            config,
+            project_dir.clone(),
+            dir_context.clone(),
+        )
+        .unwrap();
 
         let restored = harness.startup(true, &[]).unwrap();
         assert!(
@@ -288,11 +305,12 @@ fn test_restore_previous_session_config_disabled() {
     // workspace file was still on disk and is now picked up.  This guards
     // against accidentally skipping the save side when restore is disabled.
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -311,6 +329,7 @@ fn test_restore_previous_session_config_disabled() {
 #[test]
 fn test_session_restores_multiple_files() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -325,11 +344,12 @@ fn test_session_restores_multiple_files() {
 
     // First session: open all files
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -339,17 +359,16 @@ fn test_session_restores_multiple_files() {
 
         // Last opened file should be active
         harness.assert_buffer_content("Unique content for file number 4");
-
-        harness.editor_mut().save_workspace().unwrap();
     }
 
     // Second session: verify all restored
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -363,31 +382,22 @@ fn test_session_restores_multiple_files() {
     }
 }
 
-/// Test that session file is created in the correct XDG location
+/// Test that the session file is created in the explicit context workspace directory
 #[test]
 fn test_session_file_location() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("my_project");
     std::fs::create_dir(&project_dir).unwrap();
 
-    // Get expected session path
-    let session_path = get_workspace_path(&project_dir).unwrap();
+    // The workspace path is rooted in this test's explicit context.
+    let session_path = dir_context
+        .workspaces_dir()
+        .join(format!("{}.json", encode_path_for_filename(&project_dir)));
 
-    // Verify XDG location
-    let data_dir = dirs::data_dir().unwrap();
     assert!(
-        session_path.starts_with(&data_dir),
-        "Session should be in XDG data directory: {:?}",
-        session_path
-    );
-    assert!(
-        session_path.to_string_lossy().contains("fresh"),
-        "Session should be in 'fresh' subdirectory: {:?}",
-        session_path
-    );
-    assert!(
-        session_path.to_string_lossy().contains("workspaces"),
-        "Session should be in 'workspaces' subdirectory: {:?}",
+        session_path.starts_with(dir_context.workspaces_dir()),
+        "Session should be in the context workspace directory: {:?}",
         session_path
     );
     assert!(
@@ -458,6 +468,7 @@ fn test_session_data_integrity() {
 #[test]
 fn test_session_restores_scroll_position() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -470,11 +481,12 @@ fn test_session_restores_scroll_position() {
 
     // First session: scroll down significantly
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -497,11 +509,12 @@ fn test_session_restores_scroll_position() {
 
     // Second session: verify scroll position restored
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -517,6 +530,7 @@ fn test_session_restores_scroll_position() {
 #[test]
 fn test_session_preserves_active_tab() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -527,11 +541,12 @@ fn test_session_preserves_active_tab() {
 
     // First session: open both files, switch to first
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -551,11 +566,12 @@ fn test_session_preserves_active_tab() {
 
     // Second session: should restore with first file active
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -596,6 +612,7 @@ fn prev_split(harness: &mut EditorTestHarness) {
 #[test]
 fn test_session_restores_cursor_in_splits() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -612,11 +629,12 @@ fn test_session_restores_cursor_in_splits() {
 
     // First session: create splits and move cursors
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -646,11 +664,12 @@ fn test_session_restores_cursor_in_splits() {
 
     // Second session: restore and verify cursor positions
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -681,6 +700,7 @@ fn test_session_restores_cursor_in_splits() {
 #[test]
 fn test_session_restores_scroll_in_splits() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -696,11 +716,12 @@ fn test_session_restores_scroll_in_splits() {
 
     // First session: create splits and scroll both
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -728,11 +749,12 @@ fn test_session_restores_scroll_in_splits() {
 
     // Second session: restore and verify scroll positions
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -756,6 +778,7 @@ fn test_session_restores_scroll_in_splits() {
 #[test]
 fn test_session_cursor_visible_after_restore() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -768,11 +791,12 @@ fn test_session_cursor_visible_after_restore() {
 
     // First session: move cursor to middle of file (cursor visible, scroll follows)
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -805,11 +829,12 @@ fn test_session_cursor_visible_after_restore() {
 
     // Second session: restore and verify cursor is STILL visible
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -837,6 +862,7 @@ fn test_session_cursor_visible_after_restore() {
 #[test]
 fn test_session_cursor_visible_in_splits_after_restore() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -853,11 +879,12 @@ fn test_session_cursor_visible_in_splits_after_restore() {
     // First session: create split and move cursor to line 150
     // Using user's terminal size: 158 columns x 42 lines
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             158,
             42,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -909,11 +936,12 @@ fn test_session_cursor_visible_in_splits_after_restore() {
 
     // Second session: restore and verify cursor is visible in active split
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             158,
             42,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1031,6 +1059,7 @@ fn test_session_cursor_visible_in_splits_after_restore() {
 #[test]
 fn test_session_restores_files_when_plugin_buffer_was_active() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -1039,11 +1068,12 @@ fn test_session_restores_files_when_plugin_buffer_was_active() {
 
     // First session: open a real file, then create a scratch buffer (simulates plugin buffer)
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1081,11 +1111,12 @@ fn test_session_restores_files_when_plugin_buffer_was_active() {
 
     // Second session: restore and verify the real file is restored
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1106,6 +1137,7 @@ fn test_session_restores_files_when_plugin_buffer_was_active() {
 #[test]
 fn test_session_restores_splits() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -1116,11 +1148,12 @@ fn test_session_restores_splits() {
 
     // First session: create two splits with different files
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1150,11 +1183,12 @@ fn test_session_restores_splits() {
 
     // Second session: restore and verify splits are recreated
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1183,6 +1217,7 @@ fn test_session_restores_splits() {
 #[test]
 fn test_session_restores_external_files() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     let external_dir = temp_dir.path().join("external");
     std::fs::create_dir(&project_dir).unwrap();
@@ -1196,11 +1231,12 @@ fn test_session_restores_external_files() {
 
     // First session: open both files and save
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1232,11 +1268,12 @@ fn test_session_restores_external_files() {
 
     // Second session: restore and verify both files are available
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1261,9 +1298,6 @@ fn test_session_restores_external_files() {
 /// Reproduces issue #569: UI preferences not persisting across sessions
 #[test]
 fn test_session_restores_file_explorer_hidden_and_gitignored_settings() {
-    use crate::common::harness::HarnessOptions;
-    use fresh::config_io::DirectoryContext;
-
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
@@ -1369,6 +1403,7 @@ fn test_session_restores_file_explorer_hidden_and_gitignored_settings() {
 #[test]
 fn test_session_restores_buffer_to_split_mapping() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -1379,11 +1414,12 @@ fn test_session_restores_buffer_to_split_mapping() {
 
     // First session: create two splits, each with a different file
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             100,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1412,11 +1448,12 @@ fn test_session_restores_buffer_to_split_mapping() {
 
     // Second session: restore and verify each split shows ONLY its own file
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             100,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1451,6 +1488,7 @@ fn test_session_restores_buffer_to_split_mapping() {
 #[test]
 fn test_session_restores_tabs_per_split() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -1463,11 +1501,12 @@ fn test_session_restores_tabs_per_split() {
 
     // First session: left split has 2 tabs (a, b), right split has 1 tab (c)
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1496,11 +1535,12 @@ fn test_session_restores_tabs_per_split() {
 
     // Second session: restore and verify tab assignment
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1548,6 +1588,7 @@ fn test_session_restores_split_labels() {
     use fresh::services::plugins::api::PluginCommand;
 
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
 
@@ -1558,11 +1599,12 @@ fn test_session_restores_split_labels() {
 
     // First session: create labeled split, save workspace
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             100,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1587,11 +1629,12 @@ fn test_session_restores_split_labels() {
 
     // Second session: restore and verify the label is present
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             100,
             24,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -1614,9 +1657,6 @@ fn test_session_restores_split_labels() {
 /// an extra unnamed buffer. Reproduces issue #1231.
 #[test]
 fn test_reopen_without_args_restores_session_no_extra_buffer() {
-    use crate::common::harness::HarnessOptions;
-    use fresh::config_io::DirectoryContext;
-
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
@@ -1697,9 +1737,6 @@ fn test_reopen_without_args_restores_session_no_extra_buffer() {
 /// the new file (focused). Reproduces issue #1232.
 #[test]
 fn test_reopen_with_file_arg_restores_session_and_opens_new_file() {
-    use crate::common::harness::HarnessOptions;
-    use fresh::config_io::DirectoryContext;
-
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
@@ -1783,8 +1820,7 @@ fn test_reopen_with_file_arg_restores_session_and_opens_new_file() {
 /// Reproduces issue #1234.
 #[test]
 fn test_tab_order_preserved_across_restore() {
-    use crate::common::harness::{layout, HarnessOptions};
-    use fresh::config_io::DirectoryContext;
+    use crate::common::harness::layout;
 
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
@@ -1904,6 +1940,7 @@ fn test_plugin_ephemeral_terminal_excluded_from_workspace() {
     let mut harness =
         EditorTestHarness::with_config_and_working_dir(80, 24, Config::default(), project_dir)
             .unwrap();
+    let window_id = harness.editor().active_window_id();
 
     // Create a plugin-initiated terminal with persistent = false. Using
     // request_id = 0 is fine here: no one is waiting on the callback, and
@@ -1917,12 +1954,15 @@ fn test_plugin_ephemeral_terminal_excluded_from_workspace() {
             ratio: None,
             focus: Some(false),
             persistent: false,
-            window_id: None,
+            window_id,
             command: None,
+            relaunch: None,
             title: None,
             resume: None,
             env: None,
+            companion: None,
             allow_script: false,
+            selected_agent: false,
             request_id: 0,
         })
         .unwrap();
@@ -1957,6 +1997,7 @@ fn test_plugin_persistent_terminal_included_in_workspace() {
     let mut harness =
         EditorTestHarness::with_config_and_working_dir(80, 24, Config::default(), project_dir)
             .unwrap();
+    let window_id = harness.editor().active_window_id();
 
     harness
         .editor_mut()
@@ -1966,12 +2007,15 @@ fn test_plugin_persistent_terminal_included_in_workspace() {
             ratio: None,
             focus: Some(false),
             persistent: true,
-            window_id: None,
+            window_id,
             command: None,
+            relaunch: None,
             title: None,
             resume: None,
             env: None,
+            companion: None,
             allow_script: false,
+            selected_agent: false,
             request_id: 0,
         })
         .unwrap();
@@ -2012,6 +2056,7 @@ fn test_plugin_split_terminal_not_duplicated_in_active_split() {
         EditorTestHarness::with_config_and_working_dir(100, 24, Config::default(), project_dir)
             .unwrap();
     harness.open_file(&file1).unwrap();
+    let window_id = harness.editor().active_window_id();
 
     harness
         .editor_mut()
@@ -2021,12 +2066,15 @@ fn test_plugin_split_terminal_not_duplicated_in_active_split() {
             ratio: Some(0.5),
             focus: Some(false),
             persistent: true,
-            window_id: None,
+            window_id,
             command: None,
+            relaunch: None,
             title: None,
             resume: None,
             env: None,
+            companion: None,
             allow_script: false,
+            selected_agent: false,
             request_id: 0,
         })
         .unwrap();
@@ -2374,6 +2422,7 @@ fn test_restore_flag_overrides_disabled_config() {
 #[test]
 fn test_hidden_from_tabs_external_files_not_persisted() {
     let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
     let project_dir = temp_dir.path().join("project");
     let external_dir = temp_dir.path().join("external");
     std::fs::create_dir(&project_dir).unwrap();
@@ -2384,11 +2433,12 @@ fn test_hidden_from_tabs_external_files_not_persisted() {
     std::fs::write(&normal_external, "user-opened external").unwrap();
     std::fs::write(&transient_external, "plugin-managed transient").unwrap();
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    let mut harness = EditorTestHarness::with_shared_dir_context(
         80,
         24,
         Config::default(),
         project_dir.clone(),
+        dir_context.clone(),
     )
     .unwrap();
 
@@ -2428,9 +2478,10 @@ fn test_hidden_from_tabs_external_files_not_persisted() {
     // Inspect the on-disk workspace directly: only the normal external
     // should land in `external_files`, never the hidden one. Likewise
     // the open-tabs list must not reference the hidden buffer.
-    let workspace_path = fresh::workspace::find_workspace_file_by_root(&project_dir)
-        .unwrap()
-        .expect("workspace file exists after save");
+    let workspace_path =
+        fresh::workspace::find_workspace_file_by_root_in(&dir_context, &project_dir)
+            .unwrap()
+            .expect("workspace file exists after save");
     let raw = std::fs::read_to_string(&workspace_path).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let externals = parsed["external_files"].as_array().unwrap();

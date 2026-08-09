@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::services::authority::RemoteTenantIdentity;
 use crate::services::process_hidden::HideWindow;
 use crate::services::remote::channel::AgentChannel;
 use crate::services::remote::protocol::AgentResponse;
@@ -181,6 +182,39 @@ pub enum TransportError {
 
     #[error("protocol version mismatch: expected {expected}, got {got}")]
     VersionMismatch { expected: u32, got: u32 },
+
+    #[error("remote tenant identity mismatch: {0}")]
+    IdentityMismatch(String),
+}
+
+/// Kills a carrier if bootstrap exits or is cancelled before ownership is
+/// transferred to a live connection. A successful bootstrap disarms the guard
+/// before returning the raw child, preserving reconnect's existing transport
+/// ownership semantics.
+struct BootstrapChild(Option<Child>);
+
+impl BootstrapChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0
+            .as_mut()
+            .expect("bootstrap child already transferred")
+    }
+
+    fn disarm(mut self) -> Child {
+        self.0.take().expect("bootstrap child already transferred")
+    }
+}
+
+impl Drop for BootstrapChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            if let Ok(()) = child.start_kill() {}
+        }
+    }
 }
 
 /// Spawn the carrier, stream the agent in, and wait for `ready`.
@@ -193,13 +227,15 @@ pub async fn bootstrap_agent(
     stderr: StderrMode,
 ) -> Result<(BufReader<ChildStdout>, ChildStdin, Child), TransportError> {
     let mut cmd = transport.build_command(stderr);
-    let mut child = cmd.spawn()?;
+    let mut child = BootstrapChild::new(cmd.spawn()?);
 
     let mut stdin = child
+        .child_mut()
         .stdin
         .take()
         .ok_or_else(|| TransportError::AgentStartFailed("failed to get stdin".to_string()))?;
     let stdout = child
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| TransportError::AgentStartFailed("failed to get stdout".to_string()))?;
@@ -244,7 +280,7 @@ pub async fn bootstrap_agent(
         });
     }
 
-    Ok((reader, stdin, child))
+    Ok((reader, stdin, child.disarm()))
 }
 
 /// Active agent connection over a [`RemoteTransport`].
@@ -304,23 +340,35 @@ impl KubeConnection {
 /// [`spawn_reconnect_task`](super::spawn_reconnect_task), reusing the generic
 /// [`spawn_reconnect_task_with`](super::spawn_reconnect_task_with).
 ///
-/// Reconnects to the *same* `target`. A pod reschedule / eviction changes the
-/// pod name, which this does not yet re-resolve — the plugin "resolve current
-/// pod" callback (`AUTHORITY_DESIGN.md` open question 3) layers on later. A
-/// same-name reconnect still covers transient stream drops (the common idle /
-/// network-blip case).
+/// Reconnects to the *same* `target`, but does not trust a stable pod name as
+/// proof of identity: the fresh agent must reproduce the verified tenant
+/// anchor and canonical workspace root before its transport can be published.
 pub fn spawn_kube_reconnect_task(
     channel: &Arc<AgentChannel>,
     target: KubeTarget,
+    expected_identity: RemoteTenantIdentity,
 ) -> tokio::task::JoinHandle<()> {
     let connect_fn = move || {
         let target = target.clone();
+        let expected_identity = expected_identity.clone();
         async move {
             let transport = KubectlExecTransport::new(target);
             // Non-interactive on reconnect (no terminal to prompt on).
-            let (reader, writer, _child) = bootstrap_agent(&transport, StderrMode::Null)
+            let (mut reader, mut writer, mut child) = bootstrap_agent(&transport, StderrMode::Null)
                 .await
                 .map_err(|e| crate::services::remote::SshError::AgentStartFailed(e.to_string()))?;
+            if let Err(error) = super::connection::verify_reconnect_identity(
+                &mut reader,
+                &mut writer,
+                &expected_identity,
+            )
+            .await
+            {
+                if let Ok(()) = child.start_kill() {}
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = child.wait().await;
+                return Err(error);
+            }
             let reader: Box<dyn AsyncBufRead + Unpin + Send> = Box::new(reader);
             let writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(writer);
             Ok::<_, crate::services::remote::SshError>((reader, writer))
@@ -348,6 +396,73 @@ impl Drop for KubeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct ScriptTransport {
+        pid_file: std::path::PathBuf,
+        ready: bool,
+    }
+
+    #[cfg(unix)]
+    impl RemoteTransport for ScriptTransport {
+        fn build_command(&self, _stderr: StderrMode) -> Command {
+            let ready = if self.ready {
+                format!(
+                    "printf '%s\\n' '{{\"id\":0,\"ok\":true,\"v\":{}}}';",
+                    crate::services::remote::protocol::PROTOCOL_VERSION
+                )
+            } else {
+                String::new()
+            };
+            let script = format!(
+                "printf '%s\\n' \"$$\" > \"$1\"; \
+                 dd bs=1 count={} of=/dev/null 2>/dev/null; \
+                 {ready} exec cat >/dev/null",
+                AGENT_SOURCE.len()
+            );
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(script)
+                .arg("bootstrap-test")
+                .arg(&self.pid_file)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            command
+        }
+
+        fn display(&self) -> String {
+            "bootstrap-test".to_string()
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid(path: &std::path::Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(pid) = std::fs::read_to_string(path) {
+                return pid.trim().parse().expect("valid child pid");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("carrier did not publish its pid");
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: u32) {
+        for _ in 0..100 {
+            if !process_is_running(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("carrier process {pid} survived bootstrap cancellation");
+    }
 
     fn target() -> KubeTarget {
         KubeTarget {
@@ -413,6 +528,45 @@ mod tests {
         assert!(!code.contains('\''));
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_bootstrap_future_kills_carrier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transport = Arc::new(ScriptTransport {
+            pid_file: temp.path().join("cancelled.pid"),
+            ready: false,
+        });
+        let task_transport = Arc::clone(&transport);
+        let connect = tokio::spawn(async move {
+            bootstrap_agent(task_transport.as_ref(), StderrMode::Null).await
+        });
+        let pid = wait_for_pid(&transport.pid_file).await;
+
+        connect.abort();
+        let joined = connect.await;
+        assert!(matches!(joined, Err(error) if error.is_cancelled()));
+        wait_for_process_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_bootstrap_transfers_live_carrier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transport = ScriptTransport {
+            pid_file: temp.path().join("connected.pid"),
+            ready: true,
+        };
+
+        let (_reader, _writer, mut child) = bootstrap_agent(&transport, StderrMode::Null)
+            .await
+            .expect("bootstrap succeeds");
+        let pid = wait_for_pid(&transport.pid_file).await;
+        assert!(process_is_running(pid), "successful carrier remains owned");
+
+        child.start_kill().expect("kill test carrier");
+        child.wait().await.expect("reap test carrier");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kube_reconnect_task_spawns_and_aborts_cleanly() {
         // We can't run a real `kubectl exec` here, but we can verify the
@@ -424,7 +578,16 @@ mod tests {
         let channel = crate::services::remote::spawn_local_agent()
             .await
             .expect("spawn local agent");
-        let handle = spawn_kube_reconnect_task(&channel, target());
+        let handle = spawn_kube_reconnect_task(
+            &channel,
+            target(),
+            RemoteTenantIdentity {
+                anchor: crate::services::authority::RemoteTenantAnchor {
+                    digest: "a".repeat(64),
+                },
+                canonical_root: std::path::PathBuf::from("/workspace"),
+            },
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(channel.is_connected(), "channel healthy; reconnect idles");
         handle.abort();

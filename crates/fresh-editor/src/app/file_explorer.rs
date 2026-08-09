@@ -1620,6 +1620,8 @@ impl crate::app::window::Window {
         };
         let fs_manager = Arc::clone(&self.resources.fs_manager);
         let sender = self.bridge.sender();
+        let filesystem_id =
+            crate::services::async_bridge::filesystem_identity(&self.authority().filesystem);
         // Tag the result with *this* window so it lands here even if another
         // window is active by the time the async build finishes.
         let window_id = self.id;
@@ -1643,6 +1645,7 @@ impl crate::app::window::Window {
                     #[allow(clippy::let_underscore_must_use)]
                     let _ = sender.send(AsyncMessage::FileExplorerInitialized {
                         window: window_id,
+                        filesystem_id,
                         view,
                     });
                 }
@@ -1652,7 +1655,10 @@ impl crate::app::window::Window {
                     // forever on a build failure (mid-build connection drop,
                     // vanished dir). Narrow recovery: only this failure path.
                     #[allow(clippy::let_underscore_must_use)]
-                    let _ = sender.send(AsyncMessage::FileExplorerInitFailed { window: window_id });
+                    let _ = sender.send(AsyncMessage::FileExplorerInitFailed {
+                        window: window_id,
+                        filesystem_id,
+                    });
                 }
             }
         });
@@ -2009,6 +2015,8 @@ impl crate::app::window::Window {
             .map(|r| r.handle().clone());
         let sender = self.resources.async_bridge.as_ref().map(|b| b.sender());
         let window_id = self.id;
+        let filesystem_id =
+            crate::services::async_bridge::filesystem_identity(&self.authority().filesystem);
         if let (Some(runtime), Some(sender)) = (runtime_handle, sender) {
             // Mark sync as in progress so render knows to keep the layout
             self.file_explorer_sync_in_progress = true;
@@ -2020,6 +2028,7 @@ impl crate::app::window::Window {
                 let _ = sender.send(
                     crate::services::async_bridge::AsyncMessage::FileExplorerExpandedToPath {
                         window: window_id,
+                        filesystem_id,
                         view,
                     },
                 );

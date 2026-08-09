@@ -29,6 +29,13 @@ struct CloseReplacement {
     return_to_group: Option<LeafId>,
 }
 
+pub(crate) struct TerminalArtifactCleanup {
+    backing: Option<std::path::PathBuf>,
+    history_file: Option<std::path::PathBuf>,
+    log_file: Option<std::path::PathBuf>,
+    checkpoint_fence: crate::app::terminal::TerminalCheckpointFence,
+}
+
 impl Editor {
     /// Close the given buffer
     pub fn close_buffer(&mut self, id: BufferId) -> anyhow::Result<()> {
@@ -110,9 +117,44 @@ impl Editor {
         }
 
         // If closing a terminal buffer, tear down its terminal-side state.
-        // Removing the entry drops the buffer's remembered mode with it.
-        if let Some(tb) = self.active_window_mut().terminal_buffers.remove(&id) {
-            self.cleanup_closed_terminal(id, tb.terminal_id);
+        // Destructive artifact cleanup is authorized only by a durable final
+        // checkpoint; any failure leaves history and raw log as recovery input.
+        let terminal_close = if let Some(terminal_id) = self.active_window().get_terminal_id(id) {
+            let checkpoint_fence = match self.active_window_mut().try_sync_terminal_to_buffer(id) {
+                Ok(fence) => Some(fence),
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to durably checkpoint terminal {:?} on close: {error}",
+                        terminal_id
+                    );
+                    None
+                }
+            };
+            self.active_window_mut()
+                .terminal_buffers
+                .remove(&id)
+                .map(|binding| (binding.terminal_id, checkpoint_fence))
+        } else {
+            self.active_window_mut()
+                .exited_terminals
+                .remove(&id)
+                .map(|exited| {
+                    let checkpoint_fence = exited.checkpoint_generation.as_ref().and_then(|_| {
+                        let history_len = exited.backing_history_end?;
+                        let log_len = match exited.log_path.as_ref() {
+                            Some(path) => Some(std::fs::metadata(path).ok()?.len()),
+                            None => None,
+                        };
+                        Some(crate::app::terminal::TerminalCheckpointFence {
+                            history_len,
+                            log_len,
+                        })
+                    });
+                    (exited.terminal_id, checkpoint_fence)
+                })
+        };
+        if let Some((terminal_id, checkpoint_fence)) = terminal_close {
+            self.cleanup_closed_terminal(id, terminal_id, checkpoint_fence);
         }
 
         // Capture before resolving the replacement: the last-resort
@@ -218,15 +260,39 @@ impl Editor {
 
     /// Tear down the terminal-side state for a closing terminal buffer:
     /// stop the process, drop its title / foreground-name caches, retain the
-    /// searchable backing log while removing the raw one, and leave terminal
-    /// mode if this was the focused terminal.
+    /// searchable checkpoint, remove append-only history and raw log after the
+    /// reader drains, and leave terminal mode if this was the focused terminal.
     fn cleanup_closed_terminal(
         &mut self,
         id: BufferId,
         terminal_id: crate::services::terminal::TerminalId,
+        checkpoint_fence: Option<crate::app::terminal::TerminalCheckpointFence>,
     ) {
-        // Close the terminal process
+        let terminal = fresh_core::WindowTerminalId::new(self.active_window, terminal_id);
+        self.purge_omp_companion_terminal(terminal);
+        if self.active_window().tracked_agent_terminal == Some(terminal_id) {
+            self.active_window_mut().tracked_agent_terminal = None;
+        }
+
+        self.active_window_mut()
+            .terminal_companions
+            .remove(&terminal_id);
+        self.active_window_mut()
+            .revoke_terminal_script_token(terminal_id, false);
+        self.active_window_mut()
+            .terminal_commands
+            .remove(&terminal_id);
+        self.active_window_mut()
+            .terminal_resume_commands
+            .remove(&terminal_id);
+        self.active_window_mut()
+            .ephemeral_terminals
+            .remove(&terminal_id);
         self.active_window_mut().terminal_manager.close(terminal_id);
+        if self.self_update_terminal == Some(terminal) {
+            self.finish_self_update(None);
+            self.self_update_terminal = None;
+        }
         // Drop any explicit-title marker / cached foreground name so the
         // id can't carry stale auto-naming state if a future buffer
         // reuses it.
@@ -235,38 +301,28 @@ impl Editor {
             .remove(&id);
         self.active_window_mut().terminal_fg_cache.remove(&id);
 
-        // Retain the rendered backing file so its scrollback stays
-        // searchable after close (Universal Search "Terminals" scope).
-        // Rename rather than leave in place: backing files are named
-        // by terminal id, which restarts per session, so a future
-        // same-id terminal would otherwise clobber this log.
-        //
-        // The rename, the raw-log delete, and above all the retained-file
-        // GC (a directory scan plus up to hundreds of deletes) are disk
-        // I/O — run on the runtime, not inside a close that may run
-        // mid-frame. Only the map removals need this thread.
+        // Retain the searchable checkpoint only after the PTY reader has
+        // drained. History and raw log remain writer-owned until that fence.
         let backing_file = self
             .active_window_mut()
             .terminal_backing_files
+            .remove(&terminal_id);
+        let history_file = self
+            .active_window_mut()
+            .terminal_history_files
             .remove(&terminal_id);
         let log_file = self
             .active_window_mut()
             .terminal_log_files
             .remove(&terminal_id);
-        if backing_file.is_some() || log_file.is_some() {
-            let backing = backing_file.clone();
-            self.spawn_off_loop_effect("terminal_backing_cleanup", move || {
-                if let Some(ref path) = backing {
-                    Self::retain_closed_terminal_backing(path);
-                }
-                if let Some(log_file) = log_file {
-                    if backing.as_ref() != Some(&log_file) {
-                        // Best-effort cleanup of temporary terminal files.
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = crate::app::terminal::terminal_backing_fs().remove_file(&log_file);
-                    }
-                }
-            });
+        if let Some(cleanup) = Self::durable_terminal_artifact_cleanup(
+            checkpoint_fence,
+            backing_file,
+            history_file,
+            log_file,
+        ) {
+            self.pending_terminal_artifact_cleanup
+                .insert(terminal, cleanup);
         }
 
         // The buffer's remembered mode was dropped when its `terminal_buffers`
@@ -277,6 +333,24 @@ impl Editor {
         if self.active_window().key_context == crate::input::keybindings::KeyContext::Terminal {
             self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Normal;
         }
+    }
+
+    fn durable_terminal_artifact_cleanup(
+        checkpoint_fence: Option<crate::app::terminal::TerminalCheckpointFence>,
+        backing: Option<std::path::PathBuf>,
+        history_file: Option<std::path::PathBuf>,
+        log_file: Option<std::path::PathBuf>,
+    ) -> Option<TerminalArtifactCleanup> {
+        let checkpoint_fence = checkpoint_fence?;
+        if backing.is_none() && history_file.is_none() && log_file.is_none() {
+            return None;
+        }
+        Some(TerminalArtifactCleanup {
+            backing,
+            history_file,
+            log_file,
+            checkpoint_fence,
+        })
     }
 
     /// Choose which buffer the host split should show after `id` is closed.
@@ -1337,27 +1411,117 @@ impl Editor {
         self.active_window_mut().in_navigation = false;
     }
 
+    pub(crate) fn schedule_terminal_artifact_cleanup(&self, cleanup: TerminalArtifactCleanup) {
+        self.spawn_off_loop_effect("terminal_backing_cleanup", move || {
+            Self::cleanup_terminal_artifacts(cleanup);
+        });
+    }
+
+    /// Retain/delete one closed terminal only while owning every artifact path.
+    /// A contender may have rebound the stable names after the old reader
+    /// drained; nonblocking failure therefore preserves everything.
+    fn cleanup_terminal_artifacts(cleanup: TerminalArtifactCleanup) {
+        let TerminalArtifactCleanup {
+            backing,
+            history_file,
+            log_file,
+            checkpoint_fence,
+        } = cleanup;
+        let Some(backing) = backing else {
+            return;
+        };
+        let mut locks = Vec::new();
+        let mut locked_paths: Vec<&std::path::Path> = Vec::new();
+        for artifact in [Some(&backing), history_file.as_ref(), log_file.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if locked_paths.iter().any(|path| *path == artifact) {
+                continue;
+            }
+            match crate::services::terminal::manager::try_lock_terminal_artifact(artifact) {
+                Ok(Some(lock)) => {
+                    locks.push(lock);
+                    locked_paths.push(artifact);
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to reserve closed terminal artifact {:?}: {error}",
+                        artifact
+                    );
+                    return;
+                }
+            }
+        }
+
+        for (label, path, expected_len) in [
+            (
+                "history",
+                history_file.as_deref(),
+                Some(checkpoint_fence.history_len),
+            ),
+            ("log", log_file.as_deref(), checkpoint_fence.log_len),
+        ] {
+            let Some(expected_len) = expected_len else {
+                continue;
+            };
+            let Some(path) = path else {
+                tracing::warn!("Closed terminal {label} disappeared after checkpoint");
+                return;
+            };
+            match std::fs::metadata(path) {
+                Ok(metadata) if metadata.len() == expected_len => {}
+                Ok(metadata) => {
+                    tracing::warn!(
+                        "Closed terminal {label} changed after checkpoint: expected {expected_len} bytes, found {}",
+                        metadata.len()
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to verify closed terminal {label}: {error}");
+                    return;
+                }
+            }
+        }
+
+        if !Self::retain_closed_terminal_backing(&backing) {
+            return;
+        }
+        for artifact in [history_file, log_file].into_iter().flatten() {
+            if artifact != backing {
+                let _ = crate::app::terminal::terminal_backing_fs().remove_file(&artifact);
+            }
+        }
+    }
+
     /// Retain a closed terminal's rendered backing file so its scrollback
     /// stays searchable (Universal Search "Terminals" scope). Renames it to
     /// a unique `<stem>-closed-<epoch_ms>.txt` so a future terminal that
     /// reuses the same id can't clobber it, then bounds the retained set.
-    /// Best-effort throughout — a failure just means that log isn't kept.
-    fn retain_closed_terminal_backing(path: &std::path::Path) {
+    /// Cleanup stops on any retention failure.
+    /// Returns `true` only after the retained checkpoint name is durably
+    /// published. Failure preserves the history and raw log recovery sources.
+    fn retain_closed_terminal_backing(path: &std::path::Path) -> bool {
         use std::time::{SystemTime, UNIX_EPOCH};
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            return;
+            return false;
         };
         let Some(parent) = path.parent() else {
-            return;
+            return false;
         };
         let epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let retained = parent.join(format!("{stem}-closed-{epoch_ms}.txt"));
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = crate::app::terminal::terminal_backing_fs().rename(path, &retained);
+        if let Err(error) = crate::workspace::durable_rename(path, &retained) {
+            tracing::warn!("Failed to retain closed terminal checkpoint: {error}");
+            return false;
+        }
         Self::gc_retained_terminal_backings(parent);
+        true
     }
 
     /// Prune the oldest retained (`-closed-`) terminal backing files in a
@@ -1387,5 +1551,163 @@ impl Editor {
             #[allow(clippy::let_underscore_must_use)]
             let _ = crate::app::terminal::terminal_backing_fs().remove_file(&p);
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_artifact_cleanup_tests {
+    use super::{Editor, TerminalArtifactCleanup};
+    use crate::app::terminal::TerminalCheckpointFence;
+    use std::io::Write;
+
+    fn cleanup_record(
+        backing: std::path::PathBuf,
+        history: std::path::PathBuf,
+        log: std::path::PathBuf,
+    ) -> TerminalArtifactCleanup {
+        let fence = TerminalCheckpointFence {
+            history_len: std::fs::metadata(&history).unwrap().len(),
+            log_len: Some(std::fs::metadata(&log).unwrap().len()),
+        };
+        Editor::durable_terminal_artifact_cleanup(
+            Some(fence),
+            Some(backing),
+            Some(history),
+            Some(log),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_final_checkpoint_does_not_schedule_artifact_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cleanup = Editor::durable_terminal_artifact_cleanup(
+            None,
+            Some(dir.path().join("terminal.txt")),
+            Some(dir.path().join("terminal.history.txt")),
+            Some(dir.path().join("terminal.log")),
+        );
+
+        assert!(cleanup.is_none());
+    }
+
+    #[test]
+    fn missing_checkpoint_file_preserves_history_and_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_backing = dir.path().join("missing-terminal.txt");
+        let history = dir.path().join("terminal.history.txt");
+        let log = dir.path().join("terminal.log");
+        std::fs::write(&history, b"recovery-history").unwrap();
+        std::fs::write(&log, b"recovery-log").unwrap();
+        let cleanup = cleanup_record(missing_backing, history.clone(), log.clone());
+
+        Editor::cleanup_terminal_artifacts(cleanup);
+
+        assert_eq!(std::fs::read(history).unwrap(), b"recovery-history");
+        assert_eq!(std::fs::read(log).unwrap(), b"recovery-log");
+    }
+
+    #[test]
+    fn durable_checkpoint_is_retained_before_recovery_sources_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("terminal.txt");
+        let history = dir.path().join("terminal.history.txt");
+        let log = dir.path().join("terminal.log");
+        std::fs::write(&backing, b"checkpoint").unwrap();
+        std::fs::write(&history, b"history").unwrap();
+        std::fs::write(&log, b"log").unwrap();
+        let cleanup = cleanup_record(backing.clone(), history.clone(), log.clone());
+
+        Editor::cleanup_terminal_artifacts(cleanup);
+
+        assert!(!backing.exists());
+        assert!(!history.exists());
+        assert!(!log.exists());
+        let retained: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("terminal-closed-") && name.ends_with(".txt")
+                    })
+            })
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(std::fs::read(&retained[0]).unwrap(), b"checkpoint");
+    }
+
+    #[test]
+    fn post_checkpoint_log_growth_preserves_every_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("terminal.txt");
+        let history = dir.path().join("terminal.history.txt");
+        let log = dir.path().join("terminal.log");
+        std::fs::write(&backing, b"checkpoint").unwrap();
+        std::fs::write(&history, b"history").unwrap();
+        std::fs::write(&log, b"log-at-checkpoint").unwrap();
+        let cleanup = cleanup_record(backing.clone(), history.clone(), log.clone());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"late-output")
+            .unwrap();
+
+        Editor::cleanup_terminal_artifacts(cleanup);
+
+        assert_eq!(std::fs::read(backing).unwrap(), b"checkpoint");
+        assert_eq!(std::fs::read(history).unwrap(), b"history");
+        assert_eq!(std::fs::read(log).unwrap(), b"log-at-checkpointlate-output");
+    }
+
+    #[test]
+    fn post_checkpoint_history_growth_preserves_every_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("terminal.txt");
+        let history = dir.path().join("terminal.history.txt");
+        let log = dir.path().join("terminal.log");
+        std::fs::write(&backing, b"checkpoint").unwrap();
+        std::fs::write(&history, b"history-at-checkpoint").unwrap();
+        std::fs::write(&log, b"log").unwrap();
+        let cleanup = cleanup_record(backing.clone(), history.clone(), log.clone());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history)
+            .unwrap()
+            .write_all(b"late-history")
+            .unwrap();
+
+        Editor::cleanup_terminal_artifacts(cleanup);
+
+        assert_eq!(std::fs::read(backing).unwrap(), b"checkpoint");
+        assert_eq!(
+            std::fs::read(history).unwrap(),
+            b"history-at-checkpointlate-history"
+        );
+        assert_eq!(std::fs::read(log).unwrap(), b"log");
+    }
+
+    #[test]
+    fn cleanup_contention_preserves_every_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("terminal.txt");
+        let history = dir.path().join("terminal.history.txt");
+        let log = dir.path().join("terminal.log");
+        std::fs::write(&backing, b"checkpoint").unwrap();
+        std::fs::write(&history, b"history").unwrap();
+        std::fs::write(&log, b"log").unwrap();
+        let cleanup = cleanup_record(backing.clone(), history.clone(), log.clone());
+        let _new_owner = crate::services::terminal::manager::try_lock_terminal_artifact(&history)
+            .unwrap()
+            .unwrap();
+
+        Editor::cleanup_terminal_artifacts(cleanup);
+
+        assert_eq!(std::fs::read(backing).unwrap(), b"checkpoint");
+        assert_eq!(std::fs::read(history).unwrap(), b"history");
+        assert_eq!(std::fs::read(log).unwrap(), b"log");
     }
 }

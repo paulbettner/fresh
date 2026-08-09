@@ -88,6 +88,44 @@ pub fn grapheme_byte_at_visual_column(s: &str, visual_col: usize) -> usize {
     byte
 }
 
+/// Return the largest byte prefix that fits in `max_cols` terminal cells
+/// without splitting an extended grapheme cluster.
+#[inline]
+pub fn grapheme_prefix_len_at_width(s: &str, max_cols: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut bytes = 0;
+    let mut cols = 0;
+    for cluster in s.graphemes(true) {
+        let width = str_width(cluster);
+        if cols + width > max_cols {
+            break;
+        }
+        cols += width;
+        bytes += cluster.len();
+    }
+    bytes
+}
+
+/// Return the byte offset of the longest suffix that fits in `max_cols`
+/// terminal cells without splitting an extended grapheme cluster.
+#[inline]
+pub fn grapheme_suffix_start_at_width(s: &str, max_cols: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut start = s.len();
+    let mut cols = 0;
+    for (byte, cluster) in s.grapheme_indices(true).rev() {
+        let width = str_width(cluster);
+        if cols + width > max_cols {
+            break;
+        }
+        cols += width;
+        start = byte;
+    }
+    start
+}
+
 /// Visual column of a byte offset in its line, wide-char aware.
 ///
 /// Returns `None` when the offset's line can't be resolved. The offset may
@@ -162,6 +200,14 @@ mod tests {
 
         // Zero-width space
         assert_eq!(char_width('\u{200B}'), 0);
+    }
+    #[test]
+    fn grapheme_width_cuts_never_split_combining_or_zwj_clusters() {
+        let text = "e\u{301}👩\u{200d}👩\u{200d}👧\u{200d}👦中";
+        let prefix = grapheme_prefix_len_at_width(text, 1);
+        assert_eq!(&text[..prefix], "e\u{301}");
+        let suffix = grapheme_suffix_start_at_width(text, 2);
+        assert_eq!(&text[suffix..], "中");
     }
 
     #[test]

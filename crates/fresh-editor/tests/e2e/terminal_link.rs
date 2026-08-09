@@ -106,6 +106,8 @@ fn open_terminal_with_output(
             command: Some(vec!["sleep".into(), "30".into()]),
             title: None,
             env: std::collections::HashMap::new(),
+            companion: None,
+            script_capability: None,
         })
         .expect("spawn sleep terminal");
     harness.editor_mut().enter_terminal_mode();

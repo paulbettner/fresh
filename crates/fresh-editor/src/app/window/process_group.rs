@@ -101,6 +101,9 @@ impl Signaller for LocalSignaller {
 pub struct ProcessGroupEntry {
     pub leader_pid: u32,
     pub label: String,
+    /// Monotonic identity for this registration. A reused pid receives a new
+    /// incarnation, fencing delayed signals captured for the previous process.
+    pub incarnation: u64,
 }
 
 /// Per-window aggregation of process groups. Spawning code
@@ -112,6 +115,7 @@ pub struct ProcessGroupEntry {
 pub struct ProcessGroups {
     signaller: Arc<dyn Signaller>,
     entries: Vec<ProcessGroupEntry>,
+    next_incarnation: u64,
 }
 
 impl ProcessGroups {
@@ -122,19 +126,39 @@ impl ProcessGroups {
         Self {
             signaller,
             entries: Vec::new(),
+            next_incarnation: 1,
         }
     }
 
-    /// Track a new process group leader. Idempotent: calling
-    /// with the same `leader_pid` twice replaces the label
-    /// rather than duplicating the entry.
+    /// Track a new process group leader. Re-registering the same pid for the
+    /// same owner is idempotent; a different owner receives a new incarnation
+    /// so a delayed signal captured for the retired owner cannot hit it.
     pub fn register(&mut self, leader_pid: u32, label: impl Into<String>) {
         let label = label.into();
-        if let Some(e) = self.entries.iter_mut().find(|e| e.leader_pid == leader_pid) {
-            e.label = label;
-        } else {
-            self.entries.push(ProcessGroupEntry { leader_pid, label });
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.leader_pid == leader_pid)
+        {
+            if self.entries[index].label == label {
+                return;
+            }
+            let incarnation = self.next_incarnation;
+            self.next_incarnation = self.next_incarnation.saturating_add(1);
+            self.entries[index] = ProcessGroupEntry {
+                leader_pid,
+                label,
+                incarnation,
+            };
+            return;
         }
+        let incarnation = self.next_incarnation;
+        self.next_incarnation = self.next_incarnation.saturating_add(1);
+        self.entries.push(ProcessGroupEntry {
+            leader_pid,
+            label,
+            incarnation,
+        });
     }
 
     /// Drop tracking for `leader_pid`. Doesn't signal — call
@@ -144,25 +168,47 @@ impl ProcessGroups {
         self.entries.retain(|e| e.leader_pid != leader_pid);
     }
 
-    /// Send `signal_name` to every registered process group.
-    /// Returns one result per entry — caller decides how to
-    /// surface aggregate failures. Entries whose `signal` says
-    /// "already exited" (`Ok(false)`) are forgotten in place so
-    /// a follow-up signal cycle stays small.
+    /// Retire only the registration owned by this exact pid/label pair. A
+    /// delayed exit for an older terminal must not forget a pid-reused owner.
+    pub fn forget_registration(&mut self, leader_pid: u32, label: &str) {
+        self.entries
+            .retain(|entry| entry.leader_pid != leader_pid || entry.label != label);
+    }
+
+    /// Send `signal_name` to every process group registered at call time.
     pub fn signal_all(
         &mut self,
         signal_name: &str,
     ) -> Vec<(ProcessGroupEntry, Result<bool, String>)> {
-        let mut out = Vec::with_capacity(self.entries.len());
-        let mut dead: Vec<u32> = Vec::new();
-        for e in &self.entries {
-            let r = self.signaller.signal(e.leader_pid, signal_name);
-            if matches!(r, Ok(false)) {
-                dead.push(e.leader_pid);
+        let targets = self.entries.clone();
+        self.signal_targets(signal_name, &targets)
+    }
+
+    /// Signal only registrations whose pid *and incarnation* still match the
+    /// supplied snapshot. This is the delayed-escalation fence: if a process
+    /// exits and its pid is reused before SIGKILL, the replacement is skipped.
+    pub fn signal_targets(
+        &mut self,
+        signal_name: &str,
+        targets: &[ProcessGroupEntry],
+    ) -> Vec<(ProcessGroupEntry, Result<bool, String>)> {
+        let mut out = Vec::with_capacity(targets.len());
+        for target in targets {
+            let current = self.entries.iter().any(|entry| {
+                entry.leader_pid == target.leader_pid && entry.incarnation == target.incarnation
+            });
+            if !current {
+                out.push((target.clone(), Ok(false)));
+                continue;
             }
-            out.push((e.clone(), r));
+            let result = self.signaller.signal(target.leader_pid, signal_name);
+            if matches!(result, Ok(false)) {
+                self.entries.retain(|entry| {
+                    entry.leader_pid != target.leader_pid || entry.incarnation != target.incarnation
+                });
+            }
+            out.push((target.clone(), result));
         }
-        self.entries.retain(|e| !dead.contains(&e.leader_pid));
         out
     }
 
@@ -181,5 +227,43 @@ impl ProcessGroups {
 impl Default for ProcessGroups {
     fn default() -> Self {
         Self::new(Arc::new(LocalSignaller))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcessGroups, Signaller};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct RecordingSignaller {
+        calls: Mutex<Vec<(u32, String)>>,
+    }
+
+    impl Signaller for RecordingSignaller {
+        fn signal(&self, leader_pid: u32, signal_name: &str) -> Result<bool, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((leader_pid, signal_name.to_string()));
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn delayed_signal_and_exit_skip_reused_pid_incarnation() {
+        let signaller = Arc::new(RecordingSignaller::default());
+        let mut groups = ProcessGroups::new(signaller.clone());
+        groups.register(42, "terminal #1");
+        let target = groups.entries().to_vec();
+
+        groups.register(42, "terminal #2");
+        groups.forget_registration(42, "terminal #1");
+        let result = groups.signal_targets("SIGKILL", &target);
+
+        assert!(matches!(result.as_slice(), [(_, Ok(false))]));
+        assert!(signaller.calls.lock().unwrap().is_empty());
+        assert_eq!(groups.entries()[0].label, "terminal #2");
+        assert_ne!(groups.entries()[0].incarnation, target[0].incarnation);
     }
 }

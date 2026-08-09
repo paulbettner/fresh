@@ -25,7 +25,9 @@ use crate::common::harness::EditorTestHarness;
 ///
 #[test]
 fn test_mid_render_start_prompt_async_keeps_prompt_visible() {
-    use fresh_core::api::{JsCallbackId, PluginCommand};
+    use fresh_core::api::{
+        JsCallbackId, PluginCommand, PluginCommandContext, PluginCommandEnvelope, PluginInstanceId,
+    };
 
     // Match the user-reported environment (200x50 tmux pane, default
     // auto-hide prompt line).
@@ -58,14 +60,23 @@ fn test_mid_render_start_prompt_async_keeps_prompt_visible() {
     // audit_mode plugin's `editor.prompt(label, initial)` call sends.
     // The command will be picked up by `Editor::render`'s mid-render
     // `process_commands()` call.
+    let source_window = harness.editor().active_window_id();
     harness
         .editor_mut()
         .plugin_manager_mut()
-        .test_inject_command(PluginCommand::StartPromptAsync {
-            label: "Base ref to compare against (default: master): ".to_string(),
-            initial_value: "master".to_string(),
-            callback_id: JsCallbackId(1),
-        });
+        .test_inject_command(PluginCommandEnvelope::new(
+            PluginCommand::StartPromptAsync {
+                label: "Base ref to compare against (default: master): ".to_string(),
+                initial_value: "master".to_string(),
+                callback_id: JsCallbackId(1),
+            },
+            PluginCommandContext {
+                plugin_name: "test-injected-command".into(),
+                plugin_instance_id: PluginInstanceId::fresh(),
+                source_window: Some(source_window),
+                ..PluginCommandContext::default()
+            },
+        ));
 
     // Render once. The render must produce a frame where:
     //   - the AsyncPrompt's label is on the bottom row, and

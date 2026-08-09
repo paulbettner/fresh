@@ -92,6 +92,8 @@ pub fn dead_ssh_spec(remote_path: &Path) -> SessionAuthoritySpec {
             remote_path: Some(remote_path.to_string_lossy().into_owned()),
             extra_args: Vec::new(),
         },
+        verified_anchor: None,
+        canonical_root: None,
         base_env: Vec::new(),
         window: true,
         label: Some("ssh-dead".to_string()),

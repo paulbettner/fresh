@@ -488,7 +488,7 @@ impl Editor {
             .map(|(uri, diags)| (uri.clone(), diags.clone()))
             .collect();
         for (uri, diagnostics) in entries {
-            if let Some(buffer_id) = self.find_buffer_by_uri(&uri) {
+            if let Some(buffer_id) = self.find_buffer_by_uri(self.active_window, &uri) {
                 if let Some(state) = self
                     .windows
                     .get_mut(&self.active_window)

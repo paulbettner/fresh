@@ -1,7 +1,6 @@
 /// <reference path="./lib/fresh.d.ts" />
 const editor = getEditor();
 
-
 /**
  * Git Gutter Plugin
  *
@@ -31,9 +30,9 @@ const PRIORITY = 10; // Lower than diagnostics
 
 // Colors (RGB)
 const COLORS = {
-  added: [80, 250, 123] as [number, number, number],    // Green
+  added: [80, 250, 123] as [number, number, number], // Green
   modified: [255, 184, 108] as [number, number, number], // Orange/Yellow
-  deleted: [255, 85, 85] as [number, number, number],    // Red
+  deleted: [255, 85, 85] as [number, number, number], // Red
 };
 
 // Symbols
@@ -76,7 +75,6 @@ interface BufferGitState {
 /** Git state per buffer */
 const bufferStates: Map<number, BufferGitState> = new Map();
 
-
 // =============================================================================
 // Hunk mapping (host-side diff)
 // =============================================================================
@@ -99,7 +97,11 @@ function hostHunksToGutterHunks(raw: LineDiffHunk[]): DiffHunk[] {
   for (const h of raw) {
     const paired = Math.min(h.oldCount, h.newCount);
     if (paired > 0) {
-      hunks.push({ type: "modified", startLine: h.newStart + 1, lineCount: paired });
+      hunks.push({
+        type: "modified",
+        startLine: h.newStart + 1,
+        lineCount: paired,
+      });
     }
     if (h.newCount > h.oldCount) {
       hunks.push({
@@ -127,7 +129,10 @@ function hostHunksToGutterHunks(raw: LineDiffHunk[]): DiffHunk[] {
  * false when the file has no HEAD version (untracked, no repo) — the
  * cases the old `git ls-files` probe reported.
  */
-async function ensureBaselines(bufferId: number, state: BufferGitState): Promise<boolean> {
+async function ensureBaselines(
+  bufferId: number,
+  state: BufferGitState,
+): Promise<boolean> {
   // HEAD first: registering it is the tracked-file probe (it fails for
   // untracked files and non-repos, like the old `git ls-files` check),
   // and it must run before the disk baseline so an untracked file never
@@ -135,14 +140,22 @@ async function ensureBaselines(bufferId: number, state: BufferGitState): Promise
   // that bounded I/O.
   if (state.headBaselineId === null) {
     try {
-      state.headBaselineId = await editor.registerDiffBaseline(bufferId, "gitRef", "HEAD");
+      state.headBaselineId = await editor.registerDiffBaseline(
+        bufferId,
+        "gitRef",
+        "HEAD",
+      );
     } catch (_e) {
       return false;
     }
   }
   if (state.diskBaselineId === null) {
     try {
-      state.diskBaselineId = await editor.registerDiffBaseline(bufferId, "disk", null);
+      state.diskBaselineId = await editor.registerDiffBaseline(
+        bufferId,
+        "disk",
+        null,
+      );
     } catch (_e) {
       return false;
     }
@@ -239,7 +252,7 @@ async function updateGitGutter(bufferId: number): Promise<void> {
           color[0],
           color[1],
           color[2],
-          PRIORITY
+          PRIORITY,
         );
         // The deleted lines are gone from the new side, so the mark sits on the
         // seam where they were — the same line the ▾ glyph points from.
@@ -257,7 +270,7 @@ async function updateGitGutter(bufferId: number): Promise<void> {
             color[0],
             color[1],
             color[2],
-            PRIORITY
+            PRIORITY,
           );
         }
         // `endLine` is inclusive, so a one-line hunk marks one row.
@@ -286,7 +299,6 @@ async function updateGitGutter(bufferId: number): Promise<void> {
   }
 }
 
-
 // =============================================================================
 // Event Handlers
 // =============================================================================
@@ -295,16 +307,13 @@ async function updateGitGutter(bufferId: number): Promise<void> {
  * Handle after file open - initialize git state and update indicators
  */
 
-
 /**
  * Handle buffer activation - update if we have state but indicators might be stale
  */
 
-
 /**
  * Handle after file save - refresh indicators
  */
-
 
 // Note: Git diff compares the file on disk, not the in-memory buffer.
 // Line indicators automatically track position changes via byte-position markers.
@@ -314,7 +323,6 @@ async function updateGitGutter(bufferId: number): Promise<void> {
  * Handle buffer closed - cleanup state
  */
 
-
 // =============================================================================
 // Commands
 // =============================================================================
@@ -322,7 +330,7 @@ async function updateGitGutter(bufferId: number): Promise<void> {
 /**
  * Manually refresh git gutter for the current buffer
  */
-function git_gutter_refresh() : void {
+function git_gutter_refresh(): void {
   const bufferId = editor.getActiveBufferId();
   const filePath = editor.getBufferPath(bufferId);
 
@@ -444,6 +452,8 @@ editor.on("after_file_revert", (args) => {
       filePath: args.path,
       hunks: [],
       updating: false,
+      diskBaselineId: null,
+      headBaselineId: null,
     });
   }
 
@@ -461,7 +471,7 @@ editor.registerCommand(
   "%cmd.refresh",
   "%cmd.refresh_desc",
   "git_gutter_refresh",
-  null
+  null,
 );
 
 // Initialize for the current buffer

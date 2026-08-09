@@ -1170,7 +1170,7 @@ fn split_rect_ext(
 }
 
 /// Manager for the split view system
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SplitManager {
     /// Root of the split tree
     root: SplitNode,

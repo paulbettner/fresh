@@ -40,10 +40,10 @@ use serde::{Deserialize, Serialize};
 use crate::model::filesystem::{FileSystem, StdFileSystem};
 use crate::services::remote::{
     build_kube_agent_terminal_args, build_kube_terminal_args, build_ssh_agent_terminal_args,
-    build_ssh_terminal_args, spawn_kube_reconnect_task, spawn_reconnect_task, ConnectionParams,
-    KubeConnection, KubeTarget, LocalLongRunningSpawner, LocalProcessSpawner, LongRunningSpawner,
-    ProcessSpawner, RemoteFileSystem, RemoteLongRunningSpawner, RemoteProcessSpawner,
-    SshConnection, SshError, TransportError,
+    build_ssh_terminal_args, is_remote_absolute_path, spawn_kube_reconnect_task,
+    spawn_reconnect_task, ConnectionParams, KubeConnection, KubeTarget, LocalLongRunningSpawner,
+    LocalProcessSpawner, LongRunningSpawner, ProcessSpawner, RemoteFileSystem,
+    RemoteLongRunningSpawner, RemoteProcessSpawner, SshConnection, SshError, TransportError,
 };
 use crate::services::workspace_trust::WorkspaceTrust;
 
@@ -319,6 +319,10 @@ pub struct Authority {
     /// backend and the agent-resume terminal command compose — see
     /// `docs/internal/PER_SESSION_BACKENDS_DESIGN.md`.
     pub command_wrap: CommandWrap,
+    /// Exact backend provenance captured by the constructor. Never inferred
+    /// from `command_wrap`: a plugin container and a local authority can both
+    /// use direct/prefix wrappers that are not an identity boundary.
+    session_spec: SessionAuthoritySpec,
 }
 
 /// How [`Authority::terminal_command`] composes an interactive argv with the
@@ -391,6 +395,27 @@ impl SessionScope {
             )),
         }
     }
+
+    /// Mint a scope for a remote transport. Remote roots are meaningful only
+    /// to that transport, so an undecided session always starts Restricted;
+    /// never auto-trust it by probing the host filesystem for marker files.
+    /// A recorded decision and env recipe still restore from `state_dir`.
+    pub fn for_remote(root: &Path, state_dir: &Path) -> Self {
+        let store = crate::services::workspace_trust::TrustStore::for_project_dir(state_dir);
+        let level = store.level();
+        let trust = Arc::new(WorkspaceTrust::new_remote_persistent(
+            Some(root.to_path_buf()),
+            level,
+            store,
+        ));
+        let trusted = level == crate::services::workspace_trust::TrustLevel::Trusted;
+        Self {
+            trust,
+            env: Arc::new(
+                crate::services::env_provider::EnvProvider::for_remote_session(state_dir, trusted),
+            ),
+        }
+    }
 }
 
 impl Authority {
@@ -402,53 +427,52 @@ impl Authority {
         Self::local(scope.trust, scope.env)
     }
 
-    /// The persistable backend descriptor for this *live* authority, derived
-    /// from its [`CommandWrap`]. This is the single source of truth a window's
-    /// `authority_spec` should reflect: it makes a plain `fresh ssh://…` launch
-    /// carry a real `RemoteAgent` spec (so persistence, the dormancy model, and
-    /// the manual-reconnect rebuild in `start_remote_reconnect` all work)
-    /// instead of the historical `Local` default that left those paths inert.
-    ///
-    /// `Direct` (local) and `Prefix` (container — its spec is owned by the
-    /// plugin that built it) map to `Local`; the SSH and Kube wraps reconstruct
-    /// their transport spec from the connection params they already hold.
+    /// The persistable backend descriptor for this live authority. This exact
+    /// provenance is captured by the constructor rather than reverse-engineered
+    /// from wrappers or spawners, so plugin/container identity survives restore.
     pub fn session_spec(&self) -> SessionAuthoritySpec {
-        match &self.command_wrap {
-            CommandWrap::Ssh { params, remote_dir } => {
-                SessionAuthoritySpec::RemoteAgent(RemoteAgentSpec {
-                    transport: RemoteTransportSpec::Ssh {
-                        user: params.user.clone(),
-                        host: params.host.clone(),
-                        port: params.port,
-                        identity_file: params
-                            .identity_file
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().into_owned()),
-                        remote_path: remote_dir.clone(),
-                        extra_args: params.extra_args.clone(),
-                    },
-                    base_env: Vec::new(),
-                    window: false,
-                    label: None,
-                    command: None,
-                })
+        self.session_spec.clone()
+    }
+    /// Host-only identity for fencing queued plugin work to this exact backend
+    /// incarnation. Remote channels contribute their stable id plus reconnect
+    /// generation; other backends use the owned filesystem allocation.
+    pub fn stamp(&self) -> fresh_core::api::AuthorityStamp {
+        fresh_core::api::AuthorityStamp {
+            id: self.filesystem.remote_channel_id().unwrap_or_else(|| {
+                std::sync::Arc::as_ptr(&self.filesystem) as *const () as usize as u64
+            }),
+            generation: self.filesystem.remote_reconnect_generation().unwrap_or(0),
+        }
+    }
+
+    /// Whether `spec` names this exact live backend. Remote activation-only
+    /// fields (`window`, label, seed command) are not backend identity; the
+    /// transport and captured environment are. Plugin payloads compare in full.
+    pub fn matches_session_spec(&self, spec: &SessionAuthoritySpec) -> bool {
+        match (&self.session_spec, spec) {
+            (SessionAuthoritySpec::RemoteAgent(live), SessionAuthoritySpec::RemoteAgent(saved)) => {
+                live.transport == saved.transport
+                    && live.base_env == saved.base_env
+                    && live.verified_anchor == saved.verified_anchor
+                    && live.canonical_root == saved.canonical_root
             }
-            CommandWrap::Kube { target, base_env } => {
-                SessionAuthoritySpec::RemoteAgent(RemoteAgentSpec {
-                    transport: RemoteTransportSpec::KubectlExec {
-                        context: target.context.clone(),
-                        namespace: target.namespace.clone(),
-                        pod: target.pod.clone(),
-                        container: target.container.clone(),
-                        workspace: target.workspace.clone(),
-                    },
-                    base_env: base_env.clone(),
-                    window: false,
-                    label: None,
-                    command: None,
-                })
-            }
-            CommandWrap::Direct | CommandWrap::Prefix(_) => SessionAuthoritySpec::Local,
+            (live, saved) => live == saved,
+        }
+    }
+
+    /// Publish the transport locator together with the immutable identity
+    /// proven by the connected remote agent. Remote authority constructors do
+    /// not receive plugin-only activation fields, so the connect boundary sets
+    /// the exact persisted descriptor after verification succeeds.
+    pub(crate) fn set_remote_session_spec(&mut self, spec: RemoteAgentSpec) {
+        self.session_spec = SessionAuthoritySpec::RemoteAgent(spec);
+    }
+
+    /// Bind the immutable tenant identity proven during remote bootstrap to
+    /// this authority's persisted session descriptor.
+    pub fn set_verified_remote_identity(&mut self, identity: &RemoteTenantIdentity) {
+        if let SessionAuthoritySpec::RemoteAgent(agent) = &mut self.session_spec {
+            agent.set_verified_identity(identity);
         }
     }
 
@@ -537,6 +561,7 @@ impl Authority {
             env_provider: env,
             // Local: commands run directly as the PTY child, no backend wrap.
             command_wrap: CommandWrap::Direct,
+            session_spec: SessionAuthoritySpec::Local,
         }
     }
 
@@ -580,6 +605,25 @@ impl Authority {
                 params: params.clone(),
                 remote_dir: remote_dir.map(str::to_string),
             },
+            session_spec: SessionAuthoritySpec::RemoteAgent(RemoteAgentSpec {
+                transport: RemoteTransportSpec::Ssh {
+                    user: params.user.clone(),
+                    host: params.host.clone(),
+                    port: params.port,
+                    identity_file: params
+                        .identity_file
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    remote_path: remote_dir.map(str::to_string),
+                    extra_args: params.extra_args.clone(),
+                },
+                base_env: Vec::new(),
+                window: false,
+                label: None,
+                command: None,
+                verified_anchor: None,
+                canonical_root: None,
+            }),
         }
     }
 
@@ -619,6 +663,21 @@ impl Authority {
                 target: target.clone(),
                 base_env: base_env.to_vec(),
             },
+            session_spec: SessionAuthoritySpec::RemoteAgent(RemoteAgentSpec {
+                transport: RemoteTransportSpec::KubectlExec {
+                    context: target.context.clone(),
+                    namespace: target.namespace.clone(),
+                    pod: target.pod.clone(),
+                    container: target.container.clone(),
+                    workspace: target.workspace.clone(),
+                },
+                base_env: base_env.to_vec(),
+                window: false,
+                label: None,
+                command: None,
+                verified_anchor: None,
+                canonical_root: None,
+            }),
         }
     }
 
@@ -637,16 +696,13 @@ impl Authority {
     /// `SshConnection`.
     pub fn kube_from_connection(
         connection: &KubeConnection,
+        filesystem: Arc<dyn FileSystem + Send + Sync>,
         target: KubeTarget,
         base_env: Vec<(String, String)>,
         trust: Arc<WorkspaceTrust>,
         env: Arc<crate::services::env_provider::EnvProvider>,
     ) -> Self {
         let channel = connection.channel();
-        let filesystem: Arc<dyn FileSystem + Send + Sync> = Arc::new(RemoteFileSystem::new(
-            channel.clone(),
-            connection.connection_string().to_string(),
-        ));
         let process_spawner: Arc<dyn ProcessSpawner> = Arc::new(RemoteProcessSpawner::new(
             channel,
             Arc::clone(&env),
@@ -678,6 +734,7 @@ impl Authority {
         trust: Arc<WorkspaceTrust>,
         env: Arc<crate::services::env_provider::EnvProvider>,
     ) -> Result<Self, AuthorityPayloadError> {
+        let session_spec = SessionAuthoritySpec::Plugin(payload.clone());
         let filesystem: Arc<dyn FileSystem + Send + Sync> = match payload.filesystem {
             FilesystemSpec::Local => Arc::new(StdFileSystem),
         };
@@ -770,6 +827,7 @@ impl Authority {
             workspace_trust: trust,
             env_provider: env,
             command_wrap,
+            session_spec,
         })
     }
 }
@@ -867,12 +925,30 @@ impl SessionAuthoritySpec {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteTenantAnchor {
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTenantIdentity {
+    pub anchor: RemoteTenantAnchor,
+    pub canonical_root: PathBuf,
+}
+
 /// Plugin payload for `editor.attachRemoteAgent(...)`. Names a transport
 /// that needs a live connection plus the captured in-pod env probe.
 /// Opaque JSON at the fresh-core boundary; parsed here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemoteAgentSpec {
     pub transport: RemoteTransportSpec,
+    /// Immutable remote tenant identity verified by the agent. A locator
+    /// (host/pod/path) is never sufficient to restore trust or environment.
+    #[serde(default)]
+    pub verified_anchor: Option<RemoteTenantAnchor>,
+    /// Exact remote canonical root paired with `verified_anchor`.
+    #[serde(default)]
+    pub canonical_root: Option<String>,
     /// Captured in-pod env (PATH/HOME/LANG/…) applied to LSP spawns and
     /// `command_exists`. Empty when no probe ran.
     #[serde(default)]
@@ -932,9 +1008,36 @@ pub enum RemoteTransportSpec {
 }
 
 impl RemoteAgentSpec {
+    pub fn identity_matches(&self, identity: &RemoteTenantIdentity) -> bool {
+        self.verified_identity().as_ref() == Some(identity)
+    }
+
+    /// Parsed persisted identity, only when both fields are present and valid.
+    /// Invalid or partial identity claims are never treated like a first-time
+    /// attach because they may carry state from an unverified prior tenant.
+    pub fn verified_identity(&self) -> Option<RemoteTenantIdentity> {
+        let anchor = self.verified_anchor.clone()?;
+        if anchor.digest.len() != 64 || !anchor.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let canonical_root = self.canonical_root.as_deref()?;
+        is_remote_absolute_path(canonical_root).then_some(RemoteTenantIdentity {
+            anchor,
+            canonical_root: PathBuf::from(canonical_root),
+        })
+    }
+
+    pub fn has_identity_claim(&self) -> bool {
+        self.verified_anchor.is_some() || self.canonical_root.is_some()
+    }
+
+    pub fn set_verified_identity(&mut self, identity: &RemoteTenantIdentity) {
+        self.verified_anchor = Some(identity.anchor.clone());
+        self.canonical_root = Some(identity.canonical_root.to_string_lossy().into_owned());
+    }
+
     /// Resolve a kubectl-exec spec into the pod target and the captured env.
-    /// Only valid for the `KubectlExec` transport (the caller dispatches on
-    /// `transport` first); panics otherwise.
     pub fn into_kube_target(self) -> (KubeTarget, Vec<(String, String)>) {
         match self.transport {
             RemoteTransportSpec::KubectlExec {
@@ -958,6 +1061,31 @@ impl RemoteAgentSpec {
             }
         }
     }
+}
+/// Mint a trust/environment scope only from identity data proven by the
+/// connected agent. The complete SHA-256 digest is retained in the state key;
+/// transport locators and truncated display hashes are not tenant boundaries.
+pub(crate) fn remote_session_scope_for_identity(
+    dir_context: &crate::config_io::DirectoryContext,
+    identity: &RemoteTenantIdentity,
+) -> SessionScope {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(identity.anchor.digest.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.canonical_root.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let mut state_key_hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut state_key_hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    let state_key = Path::new("/__fresh_remote__").join(state_key_hex);
+    SessionScope::for_remote(
+        &identity.canonical_root,
+        &dir_context.project_state_dir(&state_key),
+    )
 }
 
 /// Resources that must outlive a K8s [`Authority`]: the carrier
@@ -987,6 +1115,16 @@ impl Drop for KubeKeepalive {
     }
 }
 
+fn requested_remote_root(
+    requested: Option<&str>,
+    home: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    match requested.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => home(),
+    }
+}
+
 /// Connect to a K8s pod and assemble its [`Authority`] plus the
 /// [`KubeKeepalive`] that must be parked to keep it alive.
 ///
@@ -1006,13 +1144,15 @@ impl Drop for KubeKeepalive {
 pub async fn connect_kube_authority(
     target: KubeTarget,
     base_env: Vec<(String, String)>,
-    trust: Arc<WorkspaceTrust>,
-    env: Arc<crate::services::env_provider::EnvProvider>,
+    expected_identity: Option<RemoteTenantIdentity>,
+    dir_context: crate::config_io::DirectoryContext,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
-) -> Result<(Authority, KubeKeepalive), TransportError> {
+) -> Result<(Authority, KubeKeepalive, RemoteTenantIdentity), TransportError> {
     type Built = Result<
         (
             KubeConnection,
+            RemoteFileSystem,
+            RemoteTenantIdentity,
             tokio::task::JoinHandle<()>,
             tokio::runtime::Runtime,
         ),
@@ -1031,14 +1171,7 @@ pub async fn connect_kube_authority(
                     .enable_all()
                     .build()
                     .map_err(|e| TransportError::AgentStartFailed(format!("runtime: {e}")))?;
-                // `block_on` drives the bootstrap; the channel/heartbeat/reconnect
-                // tasks it spawns live on `runtime`'s worker threads, which keep
-                // running after `block_on` returns and after this helper thread
-                // exits — until the `runtime` (moved into the keepalive) drops.
-                let (connection, reconnect) = runtime.block_on(async {
-                    // Race the connect against the cancel signal so a slow/hung
-                    // kubectl bootstrap can be aborted; dropping the connect
-                    // future drops the in-flight child. No signal → await it.
+                let (connection, remote_fs, identity, reconnect) = runtime.block_on(async {
                     let connection = match cancel {
                         Some(cancel) => tokio::select! {
                             biased;
@@ -1051,22 +1184,84 @@ pub async fn connect_kube_authority(
                         },
                         None => KubeConnection::connect(bootstrap_target.clone()).await?,
                     };
-                    let reconnect =
-                        spawn_kube_reconnect_task(&connection.channel(), bootstrap_target.clone());
-                    Ok::<_, TransportError>((connection, reconnect))
+                    let remote_fs = RemoteFileSystem::new(
+                        connection.channel(),
+                        connection.connection_string().to_string(),
+                    );
+                    remote_fs.prime_sys_info().await.map_err(|e| {
+                        TransportError::AgentStartFailed(format!(
+                            "remote agent is not responding: {e}"
+                        ))
+                    })?;
+                    let anchor = remote_fs.tenant_anchor().ok_or_else(|| {
+                        TransportError::AgentStartFailed(
+                            "remote agent did not provide a tenant anchor".to_string(),
+                        )
+                    })?;
+                    let requested_root =
+                        requested_remote_root(bootstrap_target.workspace.as_deref(), || {
+                            remote_fs.home_dir()
+                        })
+                        .map_err(|e| {
+                            TransportError::AgentStartFailed(format!(
+                                "remote home directory could not be resolved: {e}"
+                            ))
+                        })?;
+                    let canonical_root = remote_fs
+                        .canonicalize_remote(&requested_root)
+                        .await
+                        .map_err(|e| {
+                            TransportError::AgentStartFailed(format!(
+                                "remote workspace could not be resolved: {e}"
+                            ))
+                        })?;
+                    let identity = RemoteTenantIdentity {
+                        anchor: RemoteTenantAnchor { digest: anchor },
+                        canonical_root,
+                    };
+                    let reconnect = spawn_kube_reconnect_task(
+                        &connection.channel(),
+                        bootstrap_target.clone(),
+                        identity.clone(),
+                    );
+                    Ok::<_, TransportError>((connection, remote_fs, identity, reconnect))
                 })?;
-                Ok((connection, reconnect, runtime))
+                Ok((connection, remote_fs, identity, reconnect, runtime))
             })();
             #[allow(clippy::let_underscore_must_use)]
             let _ = tx.send(built);
         })
         .map_err(|e| TransportError::AgentStartFailed(format!("connect thread: {e}")))?;
 
-    let (connection, reconnect, runtime) = rx
+    let (connection, remote_fs, identity, reconnect, runtime) = rx
         .await
         .map_err(|_| TransportError::AgentStartFailed("connect thread vanished".to_string()))??;
 
-    let authority = Authority::kube_from_connection(&connection, target, base_env, trust, env);
+    if let Some(expected) = expected_identity.as_ref() {
+        if expected != &identity {
+            return Err(TransportError::IdentityMismatch(format!(
+                "expected anchor {} at {}, got anchor {} at {}",
+                expected.anchor.digest,
+                expected.canonical_root.display(),
+                identity.anchor.digest,
+                identity.canonical_root.display()
+            )));
+        }
+    }
+
+    let scope = remote_session_scope_for_identity(&dir_context, &identity);
+    let mut canonical_target = target;
+    canonical_target.workspace = Some(identity.canonical_root.to_string_lossy().into_owned());
+    let filesystem: Arc<dyn FileSystem + Send + Sync> = Arc::new(remote_fs);
+    let mut authority = Authority::kube_from_connection(
+        &connection,
+        filesystem,
+        canonical_target,
+        base_env,
+        scope.trust,
+        scope.env,
+    );
+    authority.set_verified_remote_identity(&identity);
     Ok((
         authority,
         KubeKeepalive {
@@ -1074,6 +1269,7 @@ pub async fn connect_kube_authority(
             _connection: connection,
             _runtime: runtime,
         },
+        identity,
     ))
 }
 
@@ -1106,14 +1302,15 @@ impl Drop for SshKeepalive {
 pub async fn connect_ssh_authority(
     params: ConnectionParams,
     remote_dir: Option<String>,
-    trust: Arc<WorkspaceTrust>,
-    env: Arc<crate::services::env_provider::EnvProvider>,
+    expected_identity: Option<RemoteTenantIdentity>,
+    dir_context: crate::config_io::DirectoryContext,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
-) -> Result<(Authority, SshKeepalive), SshError> {
+) -> Result<(Authority, SshKeepalive, RemoteTenantIdentity), SshError> {
     type Built = Result<
         (
             SshConnection,
             RemoteFileSystem,
+            RemoteTenantIdentity,
             tokio::task::JoinHandle<()>,
             tokio::runtime::Runtime,
         ),
@@ -1122,6 +1319,7 @@ pub async fn connect_ssh_authority(
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Built>();
     let bootstrap_params = params.clone();
+    let bootstrap_remote_dir = remote_dir.clone();
     std::thread::Builder::new()
         .name("ssh-connect".to_string())
         .spawn(move || {
@@ -1132,14 +1330,7 @@ pub async fn connect_ssh_authority(
                     .enable_all()
                     .build()
                     .map_err(|e| SshError::AgentStartFailed(format!("runtime: {e}")))?;
-                // The channel/reconnect tasks spawned here live on `runtime`'s
-                // workers, surviving after this helper thread exits — until the
-                // `runtime` (moved into the keepalive) drops.
-                let (connection, remote_fs, reconnect) = runtime.block_on(async {
-                    // Race the connect against the cancel signal. On cancel the
-                    // connect future is dropped, which drops the in-flight ssh
-                    // child (spawned kill-on-drop) so a hung handshake leaves no
-                    // orphaned process. No cancel signal → just await connect.
+                let (connection, remote_fs, identity, reconnect) = runtime.block_on(async {
                     let connection = match cancel {
                         Some(cancel) => tokio::select! {
                             biased;
@@ -1150,18 +1341,6 @@ pub async fn connect_ssh_authority(
                         },
                         None => SshConnection::connect(bootstrap_params.clone()).await?,
                     };
-                    // Liveness gate + cache warm-up, on this connect worker (NOT
-                    // the editor thread). Prove the agent actually answers before
-                    // we hand back a live authority: a host that finished the SSH
-                    // handshake but then can't service requests (a stalled or
-                    // half-open link) would otherwise promote into a session whose
-                    // workspace restore — and every later file op — blocks the
-                    // single-threaded editor for the full request timeout. The
-                    // fetched $HOME/temp-dir is cached on the filesystem we build
-                    // here so the editor thread never has to ask for it later.
-                    // Doing this inside `runtime.block_on` (a sync context) also
-                    // means a failure drops `runtime` cleanly, rather than from an
-                    // async context (which tokio forbids).
                     let remote_fs = RemoteFileSystem::new(
                         connection.channel(),
                         connection.connection_string().to_string(),
@@ -1169,44 +1348,88 @@ pub async fn connect_ssh_authority(
                     remote_fs.prime_sys_info().await.map_err(|e| {
                         SshError::AgentStartFailed(format!("remote agent is not responding: {e}"))
                     })?;
-                    let reconnect =
-                        spawn_reconnect_task(connection.channel(), connection.params().clone());
-                    Ok::<_, SshError>((connection, remote_fs, reconnect))
+                    let anchor = remote_fs.tenant_anchor().ok_or_else(|| {
+                        SshError::AgentStartFailed(
+                            "remote agent did not provide a tenant anchor".to_string(),
+                        )
+                    })?;
+                    let requested_root =
+                        requested_remote_root(bootstrap_remote_dir.as_deref(), || {
+                            remote_fs.home_dir()
+                        })
+                        .map_err(|e| {
+                            SshError::AgentStartFailed(format!(
+                                "remote home directory could not be resolved: {e}"
+                            ))
+                        })?;
+                    let canonical_root = remote_fs
+                        .canonicalize_remote(&requested_root)
+                        .await
+                        .map_err(|e| {
+                            SshError::AgentStartFailed(format!(
+                                "remote workspace could not be resolved: {e}"
+                            ))
+                        })?;
+                    let identity = RemoteTenantIdentity {
+                        anchor: RemoteTenantAnchor { digest: anchor },
+                        canonical_root,
+                    };
+                    let reconnect = spawn_reconnect_task(
+                        connection.channel(),
+                        connection.params().clone(),
+                        identity.clone(),
+                    );
+                    Ok::<_, SshError>((connection, remote_fs, identity, reconnect))
                 })?;
-                Ok((connection, remote_fs, reconnect, runtime))
+                Ok((connection, remote_fs, identity, reconnect, runtime))
             })();
             #[allow(clippy::let_underscore_must_use)]
             let _ = tx.send(built);
         })
         .map_err(|e| SshError::AgentStartFailed(format!("connect thread: {e}")))?;
 
-    let (connection, remote_fs, reconnect, runtime) = rx
+    let (connection, remote_fs, identity, reconnect, runtime) = rx
         .await
         .map_err(|_| SshError::AgentStartFailed("connect thread vanished".to_string()))??;
 
+    if let Some(expected) = expected_identity.as_ref() {
+        if expected != &identity {
+            return Err(SshError::IdentityMismatch(format!(
+                "expected anchor {} at {}, got anchor {} at {}",
+                expected.anchor.digest,
+                expected.canonical_root.display(),
+                identity.anchor.digest,
+                identity.canonical_root.display()
+            )));
+        }
+    }
+
+    let scope = remote_session_scope_for_identity(&dir_context, &identity);
     let channel = connection.channel();
     let reconnect_params = connection.params().clone();
     let filesystem: Arc<dyn FileSystem + Send + Sync> = Arc::new(remote_fs);
     let process_spawner: Arc<dyn ProcessSpawner> = Arc::new(RemoteProcessSpawner::new(
-        channel.clone(),
-        Arc::clone(&env),
-        Arc::clone(&trust),
+        channel,
+        Arc::clone(&scope.env),
+        Arc::clone(&scope.trust),
     ));
     let long_running_spawner: Arc<dyn LongRunningSpawner> =
         Arc::new(RemoteLongRunningSpawner::new(
             reconnect_params.clone(),
-            Arc::clone(&env),
-            Arc::clone(&trust),
+            Arc::clone(&scope.env),
+            Arc::clone(&scope.trust),
         ));
-    let authority = Authority::ssh(
+    let canonical_root = identity.canonical_root.to_string_lossy().into_owned();
+    let mut authority = Authority::ssh(
         filesystem,
         process_spawner,
         long_running_spawner,
         &reconnect_params,
-        remote_dir.as_deref(),
-        trust,
-        env,
+        Some(&canonical_root),
+        scope.trust,
+        scope.env,
     );
+    authority.set_verified_remote_identity(&identity);
     Ok((
         authority,
         SshKeepalive {
@@ -1214,6 +1437,7 @@ pub async fn connect_ssh_authority(
             _connection: connection,
             _runtime: runtime,
         },
+        identity,
     ))
 }
 
@@ -1537,6 +1761,151 @@ mod tests {
         assert_eq!(auth.terminal_wrapper.command, "docker");
         assert!(auth.terminal_wrapper.manages_cwd);
         assert_eq!(auth.display_label, "Container:abc123");
+    }
+
+    #[test]
+    fn plugin_authority_matches_only_its_exact_persisted_payload() {
+        let payload = AuthorityPayload {
+            filesystem: FilesystemSpec::Local,
+            spawner: SpawnerSpec::DockerExec {
+                container_id: "container-a".into(),
+                user: Some("vscode".into()),
+                workspace: Some("/workspaces/proj".into()),
+                env: vec![("PATH".into(), "/usr/local/bin:/usr/bin".into())],
+            },
+            terminal_wrapper: TerminalWrapperSpec::HostShell,
+            display_label: "Container A".into(),
+            path_translation: None,
+        };
+        let authority = Authority::from_plugin_payload(
+            payload.clone(),
+            Arc::new(WorkspaceTrust::permissive()),
+            Arc::new(crate::services::env_provider::EnvProvider::inactive()),
+        )
+        .expect("plugin authority");
+
+        let expected = SessionAuthoritySpec::Plugin(payload.clone());
+        assert_eq!(authority.session_spec(), expected);
+        assert!(authority.matches_session_spec(&expected));
+        assert!(!authority.matches_session_spec(&SessionAuthoritySpec::Local));
+
+        let mut other = payload;
+        other.display_label = "Container B".into();
+        assert!(!authority.matches_session_spec(&SessionAuthoritySpec::Plugin(other)));
+    }
+
+    #[test]
+    fn remote_authority_identity_ignores_activation_only_fields() {
+        let target = KubeTarget {
+            context: Some("prod".into()),
+            namespace: "dev".into(),
+            pod: "pod-a".into(),
+            container: Some("app".into()),
+            workspace: Some("/workspace".into()),
+        };
+        let base_env = vec![("PATH".into(), "/opt/bin:/usr/bin".into())];
+        let trust = Arc::new(WorkspaceTrust::permissive());
+        let env = Arc::new(crate::services::env_provider::EnvProvider::inactive());
+        let authority = Authority::kube(
+            Arc::new(StdFileSystem),
+            Arc::new(LocalProcessSpawner::new(
+                Arc::clone(&env),
+                Arc::clone(&trust),
+            )),
+            Arc::new(LocalLongRunningSpawner::new(
+                Arc::clone(&env),
+                Arc::clone(&trust),
+            )),
+            &target,
+            &base_env,
+            trust,
+            env,
+        );
+
+        let mut saved = match authority.session_spec() {
+            SessionAuthoritySpec::RemoteAgent(spec) => spec,
+            other => panic!("expected remote authority, got {other:?}"),
+        };
+        saved.window = true;
+        saved.label = Some("renamed window".into());
+        saved.command = Some(vec!["omp".into(), "launch".into()]);
+        assert!(authority.matches_session_spec(&SessionAuthoritySpec::RemoteAgent(saved.clone())));
+
+        saved.base_env.push(("LANG".into(), "C.UTF-8".into()));
+        assert!(!authority.matches_session_spec(&SessionAuthoritySpec::RemoteAgent(saved.clone())));
+        saved.base_env.pop();
+        if let RemoteTransportSpec::KubectlExec { pod, .. } = &mut saved.transport {
+            *pod = "pod-b".into();
+        }
+        assert!(!authority.matches_session_spec(&SessionAuthoritySpec::RemoteAgent(saved)));
+    }
+
+    #[test]
+    fn persisted_remote_identity_requires_complete_valid_exact_claim() {
+        let identity = RemoteTenantIdentity {
+            anchor: RemoteTenantAnchor {
+                digest: "ab".repeat(32),
+            },
+            canonical_root: PathBuf::from("/srv/project"),
+        };
+        let mut spec = RemoteAgentSpec {
+            transport: RemoteTransportSpec::Ssh {
+                user: Some("dev".into()),
+                host: "remote.example".into(),
+                port: None,
+                identity_file: None,
+                remote_path: Some("/srv/project".into()),
+                extra_args: Vec::new(),
+            },
+            verified_anchor: None,
+            canonical_root: None,
+            base_env: Vec::new(),
+            window: true,
+            label: None,
+            command: None,
+        };
+
+        assert!(!spec.has_identity_claim());
+        assert!(!spec.identity_matches(&identity));
+        spec.set_verified_identity(&identity);
+        assert_eq!(spec.verified_identity(), Some(identity.clone()));
+        assert!(spec.identity_matches(&identity));
+
+        spec.canonical_root = Some("relative/project".into());
+        assert!(spec.has_identity_claim());
+        assert!(spec.verified_identity().is_none());
+        assert!(!spec.identity_matches(&identity));
+
+        spec.canonical_root = Some("/srv/project".into());
+        spec.verified_anchor = Some(RemoteTenantAnchor {
+            digest: "not-a-sha256".into(),
+        });
+        assert!(spec.verified_identity().is_none());
+        assert!(!spec.identity_matches(&identity));
+    }
+
+    #[test]
+    fn blank_remote_workspace_uses_remote_home() {
+        let home = PathBuf::from("/home/remote-user");
+        assert_eq!(
+            requested_remote_root(None, || Ok(home.clone())).unwrap(),
+            home
+        );
+        assert_eq!(
+            requested_remote_root(Some("   "), || Ok(home.clone())).unwrap(),
+            home
+        );
+    }
+
+    #[test]
+    fn explicit_remote_workspace_does_not_require_home() {
+        assert_eq!(
+            requested_remote_root(Some(" /srv/project "), || {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no home"))
+            })
+            .unwrap(),
+            PathBuf::from("/srv/project")
+        );
     }
 
     #[test]

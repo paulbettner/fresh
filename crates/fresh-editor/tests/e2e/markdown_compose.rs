@@ -1,4 +1,5 @@
 use crate::common::harness::EditorTestHarness;
+use fresh::config_io::DirectoryContext;
 use std::path::PathBuf;
 
 /// Regression test for compose mode typing flicker.
@@ -4201,6 +4202,7 @@ fn test_compose_mode_width_survives_session_restore() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let project_root = temp_dir.path().join("project");
     std::fs::create_dir(&project_root).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     let plugins_dir = project_root.join("plugins");
     std::fs::create_dir(&plugins_dir).unwrap();
@@ -4265,11 +4267,12 @@ fn test_compose_mode_width_survives_session_restore() {
 
     // --- Session 1: open both files, enable compose on md, set width to 40, save ---
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             25,
             Default::default(),
             project_root.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -4307,11 +4310,12 @@ fn test_compose_mode_width_survives_session_restore() {
 
     // --- Session 2: restore, verify both buffers, then change compose width ---
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             80,
             25,
             Default::default(),
             project_root.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 

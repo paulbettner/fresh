@@ -1247,6 +1247,54 @@ fn default_ssh_user() -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
+fn parse_ssh_host_port(authority: &str) -> Option<(String, Option<u16>)> {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']')?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        if host.is_empty() || host.contains(char::is_whitespace) {
+            return None;
+        }
+        let port = match suffix {
+            "" => None,
+            suffix => Some(
+                suffix
+                    .strip_prefix(':')?
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p > 0)?,
+            ),
+        };
+        return Some((host.to_string(), port));
+    }
+    if authority.matches(':').count() > 1 {
+        return None;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (
+            host,
+            Some(port.parse::<u16>().ok().filter(|port| *port > 0)?),
+        ),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || host.contains(char::is_whitespace)
+        || host.contains('[')
+        || host.contains(']')
+    {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
+fn ssh_url_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 /// Parse the part of an `ssh://` URL after the `ssh://` prefix.
 /// Returns `None` for any shape we don't recognise (missing `/path`,
 /// empty host, bad port, missing user with no `$USER` fallback).
@@ -1261,23 +1309,15 @@ fn parse_ssh_url_rest(rest: &str) -> Option<RemoteLocation> {
 
     // Optional `user@` prefix on the authority.
     let (user, host_and_port) = match authority.split_once('@') {
-        Some((u, rest)) if !u.is_empty() && !u.contains(' ') => (u.to_string(), rest),
-        Some(_) => return None, // empty or space-bearing user
+        Some((u, rest))
+            if !u.is_empty() && !u.contains(char::is_whitespace) && !rest.contains('@') =>
+        {
+            (u.to_string(), rest)
+        }
+        Some(_) => return None,
         None => (default_ssh_user()?, authority),
     };
-
-    // Optional `:port` on the host.
-    let (host, port) = match host_and_port.rsplit_once(':') {
-        Some((h, p)) => {
-            let parsed_port = p.parse::<u16>().ok()?;
-            (h, Some(parsed_port))
-        }
-        None => (host_and_port, None),
-    };
-
-    if host.is_empty() || host.contains(' ') {
-        return None;
-    }
+    let (host, port) = parse_ssh_host_port(host_and_port)?;
 
     let (path_tail, line, column) = parse_path_with_line_col(path_and_rest);
     // URL paths are always absolute (we consumed exactly one `/`
@@ -1287,7 +1327,7 @@ fn parse_ssh_url_rest(rest: &str) -> Option<RemoteLocation> {
 
     Some(RemoteLocation {
         user,
-        host: host.to_string(),
+        host,
         port,
         path,
         line,
@@ -1304,9 +1344,10 @@ fn remote_location_to_ssh_url(remote: &RemoteLocation) -> String {
     // gave us a relative one (scp-style allows this) preserve it by
     // dropping any leading `/` duplication.
     let path = remote.path.trim_start_matches('/');
+    let host = ssh_url_host(&remote.host);
     match remote.port {
-        Some(port) => format!("ssh://{}@{}:{}/{}", remote.user, remote.host, port, path),
-        None => format!("ssh://{}@{}/{}", remote.user, remote.host, path),
+        Some(port) => format!("ssh://{}@{}:{}/{}", remote.user, host, port, path),
+        None => format!("ssh://{}@{}/{}", remote.user, host, path),
     }
 }
 
@@ -1518,6 +1559,19 @@ fn connect_remote(
         channel.clone(),
         connection_string,
     ));
+    rt.block_on(filesystem.prime_sys_info())
+        .context("Remote agent did not answer its identity probe")?;
+    let anchor = filesystem
+        .tenant_anchor()
+        .context("Remote agent did not provide a tenant anchor")?;
+    let canonical_root = rt
+        .block_on(filesystem.canonicalize_remote(Path::new(&remote.path)))
+        .context("Remote workspace could not be canonicalized")?;
+    let identity = fresh::services::authority::RemoteTenantIdentity {
+        anchor: fresh::services::authority::RemoteTenantAnchor { digest: anchor },
+        canonical_root,
+    };
+    let canonical_root = identity.canonical_root.to_string_lossy().into_owned();
     let process_spawner = std::sync::Arc::new(remote::RemoteProcessSpawner::new(
         channel.clone(),
         env.clone(),
@@ -1538,23 +1592,25 @@ fn connect_remote(
     tracing::debug!("connect_remote: spawning background reconnect task");
     let reconnect_handle = {
         let _guard = rt.enter();
-        remote::spawn_reconnect_task(channel, reconnect_params.clone())
+        remote::spawn_reconnect_task(channel, reconnect_params.clone(), identity.clone())
     };
     tracing::debug!("connect_remote: remote authority assembled");
 
     // SSH authority: leave the display label empty so the status bar
     // falls back to `filesystem.remote_connection_info()`, which knows
     // how to annotate the disconnect state.
+    let mut authority = fresh::services::authority::Authority::ssh(
+        filesystem,
+        process_spawner,
+        long_running_spawner,
+        &reconnect_params,
+        Some(&canonical_root),
+        trust.clone(),
+        env.clone(),
+    );
+    authority.set_verified_remote_identity(&identity);
     Ok(StartupAuthority {
-        authority: fresh::services::authority::Authority::ssh(
-            filesystem,
-            process_spawner,
-            long_running_spawner,
-            &reconnect_params,
-            Some(remote.path.as_str()),
-            trust.clone(),
-            env.clone(),
-        ),
+        authority,
         remote_session: Some(RemoteSession {
             _connection: connection,
             _runtime: rt,
@@ -5328,7 +5384,7 @@ fn real_main() -> AnyhowResult<()> {
         #[cfg(target_os = "linux")]
         gpm_client,
         #[cfg(not(target_os = "linux"))]
-        gpm_client,
+            gpm_client: _gpm_client,
         mut terminal_modes,
         authority: startup_authority,
         _remote_session: remote_session,
@@ -5564,21 +5620,14 @@ fn real_main() -> AnyhowResult<()> {
         // iteration builds against the new backend.
         if let Some(new_authority) = editor.take_pending_authority() {
             tracing::info!("Authority transition queued; restarting editor");
+            // Replace the authority's keepalive as the same transaction. A
+            // connection-backed authority supplies a new bundle; local/docker
+            // supplies `None`, which deliberately drops the retired remote
+            // carrier before publishing the replacement authority.
+            let next_keepalive = editor.take_pending_keepalive();
+            let previous = std::mem::replace(&mut current_keepalive, next_keepalive);
+            drop(previous);
             current_authority = new_authority;
-            // A connection-backed authority (remote agent / K8s) queues
-            // its keepalive alongside the authority. Adopt it here so the
-            // live carrier + reconnect/heartbeat tasks survive into the
-            // next iteration; the previous keepalive drops (tearing down
-            // the old connection). A plain local/docker transition
-            // carries no keepalive, leaving the slot — and any current
-            // remote session — untouched.
-            if let Some(new_keepalive) = editor.take_pending_keepalive() {
-                // Swap in the new session and drop the previous one,
-                // explicitly tearing the old connection down before the
-                // next iteration builds against the new backend.
-                let previous = current_keepalive.replace(new_keepalive);
-                drop(previous);
-            }
         } else if restart_dir.is_some() {
             // Non-transition restart (e.g. change-working-dir, config reload):
             // carry the *active session's own backend* forward by moving it out
@@ -5849,46 +5898,26 @@ fn run_event_loop(
 }
 
 /// Read one terminal event, guarding against a panic inside crossterm's input
-/// parser.
-///
-/// A malformed or zero-coordinate SGR mouse sequence can trip an
-/// `attempt to subtract with overflow` inside crossterm's parse path. That
-/// panic would otherwise unwind straight through the event loop and abort the
-/// whole editor over a single bad byte sequence. We catch it and report "no
-/// event" so the loop carries on.
-///
-/// crossterm only clears its internal byte buffer when a parse returns `Err`,
-/// not when it *panics*, so the offending bytes can remain and panic again on
-/// the next read. To avoid spinning forever on a wedged parser we count
-/// consecutive recovered panics and, past a small threshold, surface an error
-/// so the caller shuts the loop down cleanly instead of busy-looping. Any
-/// successful read resets the counter.
-fn safe_event_read() -> std::io::Result<Option<CrosstermEvent>> {
+/// parser. The panic hook performs emergency terminal cleanup before unwind;
+/// continuing the editor after that cleanup would run against a terminal whose
+/// modes no longer match its state, so the first parser panic ends the loop.
+fn safe_event_read() -> std::io::Result<CrosstermEvent> {
+    safe_event_read_with(event_read)
+}
+
+fn safe_event_read_with<F>(read: F) -> std::io::Result<CrosstermEvent>
+where
+    F: FnOnce() -> std::io::Result<CrosstermEvent>,
+{
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    const MAX_CONSECUTIVE_PARSE_PANICS: u32 = 8;
-    static CONSECUTIVE_PANICS: AtomicU32 = AtomicU32::new(0);
-
-    match catch_unwind(AssertUnwindSafe(event_read)) {
-        Ok(res) => {
-            CONSECUTIVE_PANICS.store(0, Ordering::Relaxed);
-            res.map(Some)
-        }
+    match catch_unwind(AssertUnwindSafe(read)) {
+        Ok(result) => result,
         Err(_) => {
-            let n = CONSECUTIVE_PANICS.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
-                "crossterm event parser panicked on malformed input \
-                 (consecutive: {n}); dropping the event"
-            );
-            if n >= MAX_CONSECUTIVE_PARSE_PANICS {
-                CONSECUTIVE_PANICS.store(0, Ordering::Relaxed);
-                Err(std::io::Error::other(
-                    "crossterm input parser repeatedly panicked; aborting read loop",
-                ))
-            } else {
-                Ok(None)
-            }
+            tracing::error!("crossterm event parser panicked; aborting read loop");
+            Err(std::io::Error::other(
+                "crossterm input parser panicked; terminal modes were cleaned up",
+            ))
         }
     }
 }
@@ -6209,9 +6238,7 @@ fn coalesce_mouse_moves(
 
     let mut latest = event;
     while event_poll(Duration::ZERO)? {
-        let Some(next) = safe_event_read()? else {
-            continue;
-        };
+        let next = safe_event_read()?;
         if matches!(&next, CrosstermEvent::Mouse(m) if m.kind == MouseEventKind::Moved) {
             latest = next; // Newer move, skip the old one
         } else {
@@ -6224,6 +6251,14 @@ fn coalesce_mouse_moves(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parser_panic_aborts_instead_of_resuming_after_terminal_cleanup() {
+        let result = safe_event_read_with(|| -> std::io::Result<CrosstermEvent> {
+            panic!("malformed parser input")
+        });
+
+        assert!(result.is_err());
+    }
 
     /// The scripts the convenience verbs submit must parse, and must call
     /// only API members this build actually has.
@@ -6720,6 +6755,26 @@ mod tests {
             remote_location_to_ssh_url(&remote),
             "ssh://bob@server/home/bob"
         );
+    }
+
+    #[test]
+    fn test_parse_and_render_bracketed_ipv6_ssh_url() {
+        let remote = parse_ssh_url_arg("ssh://alice@[2001:db8::7]:2222/srv/project").unwrap();
+        assert_eq!(remote.user, "alice");
+        assert_eq!(remote.host, "2001:db8::7");
+        assert_eq!(remote.port, Some(2222));
+        assert_eq!(remote.path, "/srv/project");
+        assert_eq!(
+            remote_location_to_ssh_url(&remote),
+            "ssh://alice@[2001:db8::7]:2222/srv/project"
+        );
+    }
+
+    #[test]
+    fn test_ssh_url_rejects_unbracketed_ipv6_and_invalid_ports() {
+        assert!(parse_ssh_url_arg("ssh://alice@2001:db8::7/srv/project").is_err());
+        assert!(parse_ssh_url_arg("ssh://alice@[2001:db8::7]:0/srv/project").is_err());
+        assert!(parse_ssh_url_arg("ssh://alice@[2001:db8::7]extra/srv/project").is_err());
     }
 
     #[test]

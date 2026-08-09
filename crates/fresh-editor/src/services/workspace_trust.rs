@@ -132,6 +132,13 @@ impl WorkspaceTrust {
     pub fn new_persistent(root: Option<PathBuf>, level: TrustLevel, store: TrustStore) -> Self {
         Self::build(root, level, Some(store))
     }
+    pub fn new_remote_persistent(
+        root: Option<PathBuf>,
+        level: TrustLevel,
+        store: TrustStore,
+    ) -> Self {
+        Self::build_remote(root, level, Some(store))
+    }
 
     /// A permissive, in-memory trust with no workspace root — every spawn is
     /// allowed. Used as the placeholder authority before the real trust is
@@ -176,6 +183,14 @@ impl WorkspaceTrust {
             store: RwLock::new(store),
         }
     }
+    fn build_remote(root: Option<PathBuf>, level: TrustLevel, store: Option<TrustStore>) -> Self {
+        Self {
+            roots: RwLock::new(compute_remote_roots(root.clone())),
+            root: RwLock::new(root),
+            level: AtomicU8::new(level.as_u8()),
+            store: RwLock::new(store),
+        }
+    }
 
     /// Current trust level.
     pub fn level(&self) -> TrustLevel {
@@ -213,6 +228,14 @@ impl WorkspaceTrust {
     pub fn set_root(&self, root: Option<PathBuf>) {
         if let Ok(mut guard) = self.roots.write() {
             *guard = compute_roots(root.clone());
+        }
+        if let Ok(mut guard) = self.root.write() {
+            *guard = root;
+        }
+    }
+    pub fn set_remote_root(&self, root: Option<PathBuf>) {
+        if let Ok(mut guard) = self.roots.write() {
+            *guard = compute_remote_roots(root.clone());
         }
         if let Ok(mut guard) = self.root.write() {
             *guard = root;
@@ -291,6 +314,10 @@ fn compute_roots(root: Option<PathBuf>) -> Vec<PathBuf> {
         }
     }
     roots
+}
+fn compute_remote_roots(root: Option<PathBuf>) -> Vec<PathBuf> {
+    root.map(|path| vec![lexical_normalize(&path)])
+        .unwrap_or_default()
 }
 
 /// Whether `command` names a path (vs. a bare name resolved via `$PATH`).
@@ -736,6 +763,34 @@ mod tests {
         assert_eq!(t.decide(cmd, None), SpawnDecision::Allow);
         t.set_root(Some(PathBuf::from("/home/u/other")));
         assert!(matches!(t.decide(cmd, None), SpawnDecision::Deny(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_root_never_resolves_through_host_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let host_real = temp.path().join("host-real");
+        let remote_spelling = temp.path().join("remote-spelling");
+        std::fs::create_dir_all(&host_real).unwrap();
+        symlink(&host_real, &remote_spelling).unwrap();
+        let store = TrustStore::for_project_dir(&temp.path().join("state"));
+        let trust = WorkspaceTrust::new_remote_persistent(
+            Some(remote_spelling.clone()),
+            TrustLevel::Restricted,
+            store,
+        );
+
+        assert!(matches!(
+            trust.decide(&remote_spelling.join("bin/tool").to_string_lossy(), None),
+            SpawnDecision::Deny(_)
+        ));
+        assert_eq!(
+            trust.decide(&host_real.join("bin/tool").to_string_lossy(), None),
+            SpawnDecision::Allow,
+            "host canonical aliases must not redefine a remote trust boundary"
+        );
     }
 
     #[test]

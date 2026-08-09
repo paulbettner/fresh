@@ -118,7 +118,7 @@ fn load_startup_plugins(
     if !plugin_manager.read().unwrap().is_active() {
         return;
     }
-    let mut plugin_dirs: Vec<std::path::PathBuf> = vec![];
+    let mut plugin_dirs: Vec<(std::path::PathBuf, bool)> = vec![];
 
     // Embedded plugins. `enable_embedded_plugins` lets tests opt out so
     // they get exactly the plugin set they pre-populated under
@@ -127,15 +127,15 @@ fn load_startup_plugins(
     if enable_embedded_plugins && plugin_dirs.is_empty() {
         if let Some(embedded_dir) = crate::services::plugins::embedded::get_embedded_plugins_dir() {
             tracing::info!("Using embedded plugins from: {:?}", embedded_dir);
-            plugin_dirs.push(embedded_dir.clone());
+            plugin_dirs.push((embedded_dir.clone(), true));
         }
     }
 
     // Always check user config plugins directory (~/.config/fresh/plugins)
     let user_plugins_dir = dir_context.config_dir.join("plugins");
-    if user_plugins_dir.exists() && !plugin_dirs.contains(&user_plugins_dir) {
+    if user_plugins_dir.exists() && !plugin_dirs.iter().any(|(dir, _)| dir == &user_plugins_dir) {
         tracing::info!("Found user plugins directory: {:?}", user_plugins_dir);
-        plugin_dirs.push(user_plugins_dir.clone());
+        plugin_dirs.push((user_plugins_dir.clone(), false));
     }
 
     // Check for package manager installed plugins (~/.config/fresh/plugins/packages/*)
@@ -149,7 +149,7 @@ fn load_startup_plugins(
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if !name.starts_with('.') {
                             tracing::info!("Found package manager plugin: {:?}", path);
-                            plugin_dirs.push(path);
+                            plugin_dirs.push((path, false));
                         }
                     }
                 }
@@ -160,7 +160,7 @@ fn load_startup_plugins(
     // Add bundle plugin directories from package scan
     for dir in bundle_plugin_dirs {
         tracing::info!("Found bundle plugin directory: {:?}", dir);
-        plugin_dirs.push(dir.clone());
+        plugin_dirs.push((dir.clone(), false));
     }
 
     if plugin_dirs.is_empty() {
@@ -190,15 +190,33 @@ fn load_startup_plugins(
                     fresh_plugin_runtime::thread::PluginsDirLoadResult,
                 >,
             )> = Vec::with_capacity(plugin_dirs.len());
-            for plugin_dir in &plugin_dirs {
+            for (plugin_dir, bundled) in &plugin_dirs {
                 tracing::info!(
                     "Submitting async TypeScript plugin load for: {:?}",
                     plugin_dir
                 );
+                let kind = if *bundled {
+                    #[cfg(feature = "embed-plugins")]
+                    {
+                        fresh_plugin_runtime::runtime::PluginLoadKind::bundled(
+                            crate::services::plugins::embedded::trusted_builtin_manifest(
+                                plugin_dir,
+                            ),
+                        )
+                    }
+                    #[cfg(not(feature = "embed-plugins"))]
+                    unreachable!("bundled plugin directory without embed-plugins feature")
+                } else {
+                    fresh_plugin_runtime::runtime::PluginLoadKind::External
+                };
                 if let Some(rx) = plugin_manager
                     .read()
                     .unwrap()
-                    .load_plugins_from_dir_with_config_request(plugin_dir, &config.plugins)
+                    .load_plugins_from_dir_with_config_request_and_kind(
+                        plugin_dir,
+                        &config.plugins,
+                        kind,
+                    )
                 {
                     dir_receivers.push((plugin_dir.clone(), rx));
                 }
@@ -271,13 +289,25 @@ fn load_startup_plugins(
         // server, GUI: every other code path that wants the
         // editor fully constructed before the constructor
         // returns.
-        for plugin_dir in plugin_dirs {
+        for (plugin_dir, bundled) in plugin_dirs {
             tracing::info!("Loading TypeScript plugins from: {:?}", plugin_dir);
             let load_start = std::time::Instant::now();
+            let kind = if bundled {
+                #[cfg(feature = "embed-plugins")]
+                {
+                    fresh_plugin_runtime::runtime::PluginLoadKind::bundled(
+                        crate::services::plugins::embedded::trusted_builtin_manifest(&plugin_dir),
+                    )
+                }
+                #[cfg(not(feature = "embed-plugins"))]
+                unreachable!("bundled plugin directory without embed-plugins feature")
+            } else {
+                fresh_plugin_runtime::runtime::PluginLoadKind::External
+            };
             let (errors, discovered_plugins) = plugin_manager
                 .read()
                 .unwrap()
-                .load_plugins_from_dir_with_config(&plugin_dir, &config.plugins);
+                .load_plugins_from_dir_with_config_and_kind(&plugin_dir, &config.plugins, kind);
             tracing::info!(
                 "Loaded TypeScript plugins from {:?} in {:?}",
                 plugin_dir,
@@ -581,6 +611,7 @@ impl Editor {
             terminal_width: parts.terminal_width,
             terminal_height: parts.terminal_height,
             last_layout_signature: None,
+            mouse_layout_generation: 0,
             tokio_runtime: parts.tokio_runtime,
             async_bridge: Some(parts.async_bridge),
             paste_pending: std::collections::HashMap::new(),
@@ -590,11 +621,15 @@ impl Editor {
             local_filesystem: parts.local_filesystem,
             menu_state: crate::view::ui::MenuState::new(parts.dir_context.themes_dir()),
             windows: parts.windows,
+            closing_windows: HashMap::new(),
+            pending_terminal_artifact_cleanup: HashMap::new(),
             dormant_remote: parts.dormant_remote,
             session_keepalives: HashMap::new(),
-            remote_attach_inflight: std::collections::HashSet::new(),
-            remote_attach_cancelled: std::collections::HashSet::new(),
-            remote_attach_cancels: std::collections::HashMap::new(),
+            next_remote_attach_attempt: 1,
+            remote_attach_attempts: HashMap::new(),
+            remote_attach_plugin_requests: HashMap::new(),
+            remote_reconnect_attempts: HashMap::new(),
+            remote_attach_cancels: HashMap::new(),
             active_window: parts.active_window,
             next_window_id: parts.next_window_id,
             window_cycle_order: None,
@@ -602,6 +637,8 @@ impl Editor {
             quick_open_registry: parts.quick_open_registry,
             lsp_uri_schemes: std::collections::HashSet::new(),
             plugin_manager: parts.plugin_manager,
+            omp_companion_delivery: super::OmpCompanionHookDelivery::default(),
+            terminal_output_delivery: super::TerminalOutputHookDelivery::default(),
             recovery_service: parts.recovery_service,
             mouse_capture: parts.mouse_capture,
             time_source: parts.time_source,
@@ -610,7 +647,10 @@ impl Editor {
             key_translator: parts.key_translator,
 
             // Trivial defaults (no external dependencies):
-            remote_reconnect_forwarders: std::collections::HashSet::new(),
+            remote_reconnect_forwarders: HashMap::new(),
+            remote_reconnect_generations: HashMap::new(),
+            pending_remote_reattach: HashMap::new(),
+            terminal_stop_tombstones: std::collections::HashSet::new(),
             remote_connected_cache: HashMap::new(),
             materialize_pending: std::collections::HashSet::new(),
             grammar_reload_pending: false,
@@ -636,7 +676,6 @@ impl Editor {
             mode_registry: ModeRegistry::new(),
             pending_authority: None,
             pending_keepalive: None,
-            remote_indicator_override: None,
             menus: crate::config::MenuConfig::translated(),
             background_process_handles: HashMap::new(),
             host_process_handles: HashMap::new(),
@@ -878,13 +917,12 @@ impl Editor {
     fn local_authority_with_filesystem(
         filesystem: Arc<dyn FileSystem + Send + Sync>,
     ) -> crate::services::authority::Authority {
-        crate::services::authority::Authority {
-            filesystem,
-            ..crate::services::authority::Authority::local(
-                Arc::new(crate::services::workspace_trust::WorkspaceTrust::permissive()),
-                Arc::new(crate::services::env_provider::EnvProvider::inactive()),
-            )
-        }
+        let mut authority = crate::services::authority::Authority::local(
+            Arc::new(crate::services::workspace_trust::WorkspaceTrust::permissive()),
+            Arc::new(crate::services::env_provider::EnvProvider::inactive()),
+        );
+        authority.filesystem = filesystem;
+        authority
     }
 
     /// Create a new editor with custom options
@@ -1022,16 +1060,20 @@ impl Editor {
         // factory picks the persisted active id/root, attaches the
         // seed buffer + LSP to it directly, and the constructor
         // sees a well-formed windows map.
-        // Orchestrator persistence lives under the local `data_dir`, so it
-        // must be read through the local filesystem — never the authority's
-        // (which is the *remote* SSH backend on an SSH launch). Routing these
-        // local-disk reads over SSH is both wrong (it queries the remote
-        // host's copy of a local-machine question) and catastrophically slow
-        // (one network round-trip per workspace file). The window content
-        // below still flows through the authority filesystem; only this
-        // editor-wide registry read is pinned local.
+        // Orchestrator persistence always stays on the local backend. A local
+        // authority may carry an injected filesystem (tests, slow I/O, fault
+        // injection), so reuse it; remote authorities remain pinned to the
+        // host's real local filesystem rather than routing data-dir reads over
+        // SSH.
         let orchestrator_filesystem: Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> =
-            Arc::new(crate::model::filesystem::StdFileSystem);
+            if authority.filesystem.remote_connection_info().is_none() {
+                Arc::clone(&authority.filesystem)
+            } else {
+                Arc::new(crate::model::filesystem::StdFileSystem)
+            };
+        crate::workspace::recover_terminal_extractions(&dir_context).map_err(|error| {
+            anyhow::anyhow!("terminal extraction recovery remains unresolved: {error}")
+        })?;
         tracing::debug!(
             data_dir = %dir_context.data_dir.display(),
             "editor_init: reading persisted windows env"

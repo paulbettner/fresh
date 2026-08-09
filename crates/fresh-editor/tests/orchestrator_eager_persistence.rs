@@ -42,6 +42,21 @@ fn editor_in(project: &Path, dir_context: &DirectoryContext) -> fresh::app::Edit
     .unwrap()
 }
 
+fn wait_for_workspace(dir_context: &DirectoryContext, root: &Path) -> Workspace {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(workspace) = Workspace::load_in(dir_context, root).unwrap() {
+            return workspace;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace checkpoint was not published for {}",
+            root.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Switching away from a window writes its workspace immediately — a later
 /// hard kill (no clean quit) still finds it in the registry.
 #[test]
@@ -53,8 +68,7 @@ fn switching_away_persists_the_outgoing_window_without_a_quit() {
     std::fs::create_dir_all(&proj_a).unwrap();
     std::fs::create_dir_all(&proj_b).unwrap();
     std::fs::create_dir_all(&data_home).unwrap();
-    // Unique tmp roots, so the global workspace registry has no stale entry for
-    // either — the precondition assertion below is meaningful.
+    // The test-scoped context starts empty, so the precondition below is meaningful.
     let proj_a = proj_a.canonicalize().unwrap();
     let proj_b = proj_b.canonicalize().unwrap();
     let file_a = proj_a.join("hello.txt");
@@ -67,7 +81,7 @@ fn switching_away_persists_the_outgoing_window_without_a_quit() {
     // No clean quit has happened and we never switched away, so A's session is
     // not yet in the on-disk registry.
     assert!(
-        Workspace::load(&proj_a).unwrap().is_none(),
+        Workspace::load_in(&dir_context, &proj_a).unwrap().is_none(),
         "precondition: window A's workspace must not be on disk before any checkpoint"
     );
 
@@ -76,9 +90,7 @@ fn switching_away_persists_the_outgoing_window_without_a_quit() {
     let win_b = e.create_window_at(proj_b.clone(), "b".into());
     e.set_active_window(win_b);
 
-    let saved = Workspace::load(&proj_a)
-        .unwrap()
-        .expect("switching away must persist the outgoing window without a quit");
+    let saved = wait_for_workspace(&dir_context, &proj_a);
     assert_eq!(
         saved.working_dir, proj_a,
         "the persisted workspace is window A's, keyed on its own root"
@@ -120,11 +132,18 @@ fn setting_global_state_persists_it_without_a_quit() {
     let dir_context = DirectoryContext::for_testing(&data_home);
     let mut e = editor_in(&proj, &dir_context);
 
-    let folders = serde_json::json!([{ "id": "df1", "name": "myfolder", "parent": null }]);
+    let model = serde_json::json!({
+        "version": 1,
+        "folders": [{ "id": "df1", "name": "myfolder", "parent": null }],
+        "assignments": {},
+        "expanded": ["folder:df1"],
+        "names": {},
+        "folderCounter": 1,
+    });
     e.handle_plugin_command(PluginCommand::SetGlobalState {
         plugin_name: "orchestrator".into(),
-        key: "orchestrator.dock.folders".into(),
-        value: Some(folders.clone()),
+        key: "orchestrator.dock.model".into(),
+        value: Some(model.clone()),
     })
     .unwrap();
 
@@ -142,22 +161,22 @@ fn setting_global_state_persists_it_without_a_quit() {
     });
     let map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
-        map["orchestrator.dock.folders"], folders,
-        "the persisted state carries the folder list the plugin just set"
+        map["orchestrator.dock.model"], model,
+        "the persisted state carries the atomic dock model the plugin just set"
     );
 
     // Deleting the key persists too (an empty map on disk, not the stale
-    // folder list) — clearing your last folder must also survive a crash.
+    // envelope) — clearing the model must also survive a crash.
     e.handle_plugin_command(PluginCommand::SetGlobalState {
         plugin_name: "orchestrator".into(),
-        key: "orchestrator.dock.folders".into(),
+        key: "orchestrator.dock.model".into(),
         value: None,
     })
     .unwrap();
     let map: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
     assert!(
-        map.get("orchestrator.dock.folders").is_none(),
+        map.get("orchestrator.dock.model").is_none(),
         "deleting the key must be flushed as well, got: {map}"
     );
 }
@@ -165,12 +184,9 @@ fn setting_global_state_persists_it_without_a_quit() {
 /// Two editor processes sharing the data dir must not clobber each other's
 /// global plugin state. Each instance loads `orchestrator/state/*.json` once
 /// at boot, and the per-change flush used to rewrite the whole file from that
-/// instance's in-memory map — so an instance that booted *before* another
-/// instance organised the dock would, on its next unrelated write (a fold
-/// toggle, a history push) or on quit, silently revert every folder and
-/// session→folder assignment the other instance had saved. Reproduced
-/// interactively: organise folders in instance B, collapse a folder in
-/// instance A → B's folders vanish from disk.
+/// instance's in-memory map. An instance that booted before another editor
+/// committed the atomic dock envelope must preserve it when writing an
+/// unrelated plugin key or saving at quit.
 ///
 /// The fix merges on write: an instance only rewrites the keys *it* changed,
 /// on top of whatever is on disk, instead of snapshotting its whole map.
@@ -193,32 +209,34 @@ fn concurrent_instances_do_not_clobber_each_others_global_state() {
     // Instance A boots first — its in-memory copy of the global state is
     // whatever was on disk now (nothing).
     let mut a = editor_in(&proj_a, &dir_context);
-    // Instance B boots and the user organises the dock there: a folder and a
-    // session filed under it.
+    // Instance B commits the complete dock model in one key.
+    let mut assignments = serde_json::Map::new();
+    assignments.insert(
+        proj_b.to_string_lossy().into_owned(),
+        serde_json::json!("df1"),
+    );
+    let model = serde_json::json!({
+        "version": 1,
+        "folders": [{ "id": "df1", "name": "Keep", "parent": null }],
+        "assignments": assignments,
+        "expanded": ["folder:df1"],
+        "names": {},
+        "folderCounter": 1,
+    });
     let mut b = editor_in(&proj_b, &dir_context);
-    let folders = serde_json::json!([{ "id": "df1", "name": "Keep", "parent": null }]);
-    let assignments = serde_json::json!({ proj_b.to_string_lossy(): "df1" });
     b.handle_plugin_command(PluginCommand::SetGlobalState {
         plugin_name: "orchestrator".into(),
-        key: "orchestrator.dock.folders".into(),
-        value: Some(folders.clone()),
-    })
-    .unwrap();
-    b.handle_plugin_command(PluginCommand::SetGlobalState {
-        plugin_name: "orchestrator".into(),
-        key: "orchestrator.dock.assignments".into(),
-        value: Some(assignments.clone()),
+        key: "orchestrator.dock.model".into(),
+        value: Some(model.clone()),
     })
     .unwrap();
 
-    // Instance A — which knows nothing of B's folders — makes an unrelated
-    // change (what a fold toggle in A's dock does). This must not wipe B's
-    // folders from disk.
-    let expanded = serde_json::json!(["folder:df1"]);
+    // Instance A — which booted before B's commit — writes an unrelated key.
+    let history = serde_json::json!(["recent command"]);
     a.handle_plugin_command(PluginCommand::SetGlobalState {
         plugin_name: "orchestrator".into(),
-        key: "orchestrator.dock.expanded".into(),
-        value: Some(expanded.clone()),
+        key: "orchestrator.history".into(),
+        value: Some(history.clone()),
     })
     .unwrap();
 
@@ -232,16 +250,12 @@ fn concurrent_instances_do_not_clobber_each_others_global_state() {
     };
     let map = read_state();
     assert_eq!(
-        map["orchestrator.dock.folders"], folders,
-        "A's unrelated write must not clobber the folders B saved; got: {map}"
+        map["orchestrator.dock.model"], model,
+        "A's unrelated write must not clobber B's dock model; got: {map}"
     );
     assert_eq!(
-        map["orchestrator.dock.assignments"], assignments,
-        "A's unrelated write must not clobber the assignments B saved; got: {map}"
-    );
-    assert_eq!(
-        map["orchestrator.dock.expanded"], expanded,
-        "A's own change must land alongside B's keys; got: {map}"
+        map["orchestrator.history"], history,
+        "A's own change must land alongside B's model; got: {map}"
     );
 
     // A's clean quit must not resurrect its stale snapshot either — the
@@ -249,26 +263,25 @@ fn concurrent_instances_do_not_clobber_each_others_global_state() {
     a.save_orchestrator_state();
     let map = read_state();
     assert_eq!(
-        map["orchestrator.dock.folders"], folders,
-        "A's quit-time save must not clobber the folders B saved; got: {map}"
+        map["orchestrator.dock.model"], model,
+        "A's quit-time save must not clobber B's dock model; got: {map}"
     );
 
-    // And a deletion in A merges too: it removes exactly that key from disk,
-    // not everything A never knew about.
+    // And a deletion in A removes exactly its key, not B's envelope.
     a.handle_plugin_command(PluginCommand::SetGlobalState {
         plugin_name: "orchestrator".into(),
-        key: "orchestrator.dock.expanded".into(),
+        key: "orchestrator.history".into(),
         value: None,
     })
     .unwrap();
     let map = read_state();
     assert!(
-        map.get("orchestrator.dock.expanded").is_none(),
+        map.get("orchestrator.history").is_none(),
         "A's deletion must be flushed; got: {map}"
     );
     assert_eq!(
-        map["orchestrator.dock.folders"], folders,
-        "A's deletion must leave B's keys intact; got: {map}"
+        map["orchestrator.dock.model"], model,
+        "A's deletion must leave B's dock model intact; got: {map}"
     );
 }
 
@@ -277,13 +290,15 @@ fn concurrent_instances_do_not_clobber_each_others_global_state() {
 /// freshly created session is in the registry the moment it is tagged — before
 /// any switch or quit.
 ///
-/// `SetWindowState` is a plugin command (`handle_plugin_command` only exists
-/// with the `plugins` feature), so this test is gated to that build — the
-/// min-size / no-plugins configuration has no session-tagging path to exercise.
+/// `SetWindowState` is a plugin command (`dispatch_plugin_command_envelope`
+/// only exists with the `plugins` feature), so this test is gated to that
+/// build — the min-size / no-plugins configuration has no tagging path.
 #[cfg(feature = "plugins")]
 #[test]
 fn tagging_a_new_session_persists_it_without_a_quit() {
-    use fresh_core::api::PluginCommand;
+    use fresh_core::api::{
+        PluginCommand, PluginCommandContext, PluginCommandEnvelope, PluginInstanceId,
+    };
 
     let sandbox = tempfile::tempdir().unwrap();
     let proj_a = sandbox.path().join("a");
@@ -312,20 +327,25 @@ fn tagging_a_new_session_persists_it_without_a_quit() {
     // Not yet tagged, and if the harness didn't checkpoint on switch we can't
     // rely on B being on disk — so drive the exact tagging call the plugin
     // makes and require *that* to persist B.
-    let before = Workspace::load(&proj_b).unwrap();
+    let before = Workspace::load_in(&dir_context, &proj_b).unwrap();
 
-    e.handle_plugin_command(PluginCommand::SetWindowState {
-        plugin_name: "orchestrator".into(),
-        key: "project_path".into(),
-        value: Some(serde_json::Value::String(
-            proj_b.to_string_lossy().into_owned(),
-        )),
-    })
-    .unwrap();
+    e.dispatch_plugin_command_envelope(PluginCommandEnvelope::new(
+        PluginCommand::SetWindowState {
+            window_id: win_b,
+            key: "project_path".into(),
+            value: Some(serde_json::Value::String(
+                proj_b.to_string_lossy().into_owned(),
+            )),
+        },
+        PluginCommandContext {
+            plugin_name: Arc::from("orchestrator"),
+            plugin_instance_id: PluginInstanceId::fresh(),
+            source_window: Some(win_b),
+            ..PluginCommandContext::default()
+        },
+    ));
 
-    let after = Workspace::load(&proj_b)
-        .unwrap()
-        .expect("tagging a session's identity must persist it without a quit");
+    let after = wait_for_workspace(&dir_context, &proj_b);
     assert_eq!(after.working_dir, proj_b);
     assert_eq!(
         after.session_plugin_state["orchestrator"]["project_path"],
@@ -338,15 +358,9 @@ fn tagging_a_new_session_persists_it_without_a_quit() {
     let _ = before;
 }
 
-/// Deleting an in-place session must forget its persisted workspace, or
-/// boot-time discovery rediscovers it and the row "comes back" after a
-/// restart. The orchestrator's Delete/Archive of a session whose directory
-/// stays on disk (a launch / in-place session, unlike a worktree it
-/// `git worktree remove`s) now follows `CloseWindow` with `DeleteWorkspace`.
-/// This pins that the explicit forget — not the window close — is what
-/// removes the registry entry the next launch would otherwise resurrect.
-/// `handle_plugin_command` (the delete's entry point) only exists with the
-/// `plugins` feature, so gate the test the same way its siblings are.
+/// Deleting an in-place session must forget its exact persisted workspace, or
+/// boot-time discovery rediscovers it and the row comes back after restart.
+/// Closing remains separate from the durable forget operation.
 #[cfg(feature = "plugins")]
 #[test]
 fn deleting_an_in_place_session_forgets_its_persisted_workspace() {
@@ -359,7 +373,7 @@ fn deleting_an_in_place_session_forgets_its_persisted_workspace() {
     std::fs::create_dir_all(&proj_a).unwrap();
     std::fs::create_dir_all(&proj_b).unwrap();
     std::fs::create_dir_all(&data_home).unwrap();
-    // Unique tmp roots, so the global workspace registry has no stale entry.
+    // The test-scoped context starts with no persisted workspace.
     let proj_a = proj_a.canonicalize().unwrap();
     let proj_b = proj_b.canonicalize().unwrap();
     let file_a = proj_a.join("hello.txt");
@@ -368,33 +382,28 @@ fn deleting_an_in_place_session_forgets_its_persisted_workspace() {
     let dir_context = DirectoryContext::for_testing(&data_home);
     let mut e = editor_in(&proj_a, &dir_context);
     let win_a = e.active_window_id();
+    let stable_id = e.session(win_a).unwrap().stable_id.clone();
     e.open_file(&file_a).unwrap();
 
     // A second window, then switch to it: the switch checkpoints A into the
     // registry (and leaves A non-active, non-last so it can be closed).
     let win_b = e.create_window_at(proj_b.clone(), "b".into());
     e.set_active_window(win_b);
-    assert!(
-        Workspace::load(&proj_a).unwrap().is_some(),
-        "precondition: switching away persisted A's workspace"
-    );
+    let _ = wait_for_workspace(&dir_context, &proj_a);
 
     // Closing the window alone does NOT forget the persisted workspace —
     // exactly why a deleted in-place row used to reappear after a restart.
     e.handle_plugin_command(PluginCommand::CloseWindow { id: win_a })
         .unwrap();
     assert!(
-        Workspace::load(&proj_a).unwrap().is_some(),
+        Workspace::load_in(&dir_context, &proj_a).unwrap().is_some(),
         "CloseWindow alone leaves the registry entry that discovery resurrects"
     );
 
-    // The explicit forget is what makes the deletion stick across a restart.
-    e.handle_plugin_command(PluginCommand::DeleteWorkspace {
-        root: proj_a.clone(),
-    })
-    .unwrap();
+    // The explicit exact-id forget is what makes the deletion stick across a restart.
+    Workspace::delete_by_id_in(&dir_context, &proj_a, &stable_id).unwrap();
     assert!(
-        Workspace::load(&proj_a).unwrap().is_none(),
+        Workspace::load_in(&dir_context, &proj_a).unwrap().is_none(),
         "a deleted in-place session must be forgotten so a restart can't rediscover it"
     );
 }

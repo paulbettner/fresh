@@ -192,7 +192,15 @@ fn suspend_client(stdout: &mut io::Stdout, conn: &mut ClientConnection) -> io::R
     // what `TerminalModes::undo()` does in direct mode. The server already
     // marked this client `needs_full_render`, so the bytes it queues next
     // will include the matching setup sequences + a full paint.
-    let teardown = crate::server::capture_backend::terminal_teardown_sequences();
+    let mut teardown = Vec::new();
+    if crate::services::terminal_modes::smarty_fresh_ghostty_passthrough_enabled() {
+        teardown.extend(
+            crate::services::terminal_modes::smarty_fresh_terminal_rects_sequence(
+                std::iter::empty(),
+            ),
+        );
+    }
+    teardown.extend(crate::server::capture_backend::terminal_teardown_sequences());
     stdout.write_all(&teardown)?;
     stdout.flush()?;
 

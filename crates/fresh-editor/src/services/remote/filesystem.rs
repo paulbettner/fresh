@@ -30,6 +30,8 @@ struct RemoteSysInfo {
     home: Option<PathBuf>,
     /// Remote temp dir (agent's `tempfile.gettempdir()`), `/tmp` fallback.
     temp_dir: PathBuf,
+    /// Full SHA-256 tenant anchor minted and verified by the remote agent.
+    tenant_anchor: Option<String>,
 }
 
 /// Remote filesystem that communicates with the Python agent
@@ -42,6 +44,16 @@ pub struct RemoteFileSystem {
     /// thereafter so the editor-thread accessors that need `$HOME` / the temp
     /// dir don't issue a blocking round-trip on the hot path.
     sys_info: Arc<OnceLock<RemoteSysInfo>>,
+}
+
+pub(crate) fn is_remote_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 impl RemoteFileSystem {
@@ -59,7 +71,30 @@ impl RemoteFileSystem {
         RemoteSysInfo {
             home: info.get("home").and_then(|v| v.as_str()).map(PathBuf::from),
             temp_dir: Self::parse_temp_dir_from_info(Some(info)),
+            tenant_anchor: info
+                .get("tenant_anchor")
+                .and_then(|value| value.as_str())
+                .filter(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+                .map(str::to_owned),
         }
+    }
+
+    fn parse_canonical_path(result: &serde_json::Value) -> io::Result<PathBuf> {
+        let path = result
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid realpath response")
+            })?;
+        if !is_remote_absolute_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote realpath response was not absolute",
+            ));
+        }
+        Ok(PathBuf::from(path))
     }
 
     /// Fetch the static `info` (home / temp dir) once and cache it, awaiting
@@ -112,6 +147,21 @@ impl RemoteFileSystem {
     pub fn connection_string(&self) -> &str {
         &self.connection_string
     }
+    pub fn tenant_anchor(&self) -> Option<String> {
+        self.sys_info().and_then(|info| info.tenant_anchor)
+    }
+
+    pub async fn canonicalize_remote(&self, path: &Path) -> io::Result<PathBuf> {
+        let result = self
+            .channel
+            .request(
+                "realpath",
+                serde_json::json!({"path": path.to_string_lossy()}),
+            )
+            .await
+            .map_err(Self::to_io_error)?;
+        Self::parse_canonical_path(&result)
+    }
 
     /// Check if connected
     pub fn is_connected(&self) -> bool {
@@ -134,7 +184,9 @@ impl RemoteFileSystem {
         match e {
             ChannelError::Io(e) => e,
             ChannelError::Remote(msg) => {
-                let kind = if msg.contains("not found") || msg.contains("No such file") {
+                let kind = if msg.starts_with("cross-device:") {
+                    io::ErrorKind::CrossesDevices
+                } else if msg.contains("not found") || msg.contains("No such file") {
                     io::ErrorKind::NotFound
                 } else if msg.contains("permission denied") {
                     io::ErrorKind::PermissionDenied
@@ -535,11 +587,7 @@ impl FileSystem for RemoteFileSystem {
             .request_blocking("realpath", params)
             .map_err(Self::to_io_error)?;
 
-        let canonical = result.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing path in response")
-        })?;
-
-        Ok(PathBuf::from(canonical))
+        Self::parse_canonical_path(&result)
     }
 
     fn current_uid(&self) -> u32 {
@@ -562,6 +610,16 @@ impl FileSystem for RemoteFileSystem {
 
     fn remote_reconnect_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
         Some(self.channel.reconnect_notify())
+    }
+
+    fn remote_reconnect_generation(&self) -> Option<u64> {
+        Some(self.channel.reconnect_generation())
+    }
+
+    fn remote_reconnect_generation_counter(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        Some(self.channel.reconnect_generation_counter())
     }
 
     fn home_dir(&self) -> io::Result<PathBuf> {
@@ -876,6 +934,33 @@ mod tests {
 
         let meta = RemoteFileSystem::convert_metadata(&rm, ".hidden");
         assert!(meta.is_hidden);
+    }
+
+    #[test]
+    fn canonical_path_parser_rejects_relative_agent_response() {
+        assert_eq!(
+            RemoteFileSystem::parse_canonical_path(&serde_json::json!({"path": "/workspace"}))
+                .unwrap(),
+            PathBuf::from("/workspace")
+        );
+        assert_eq!(
+            RemoteFileSystem::parse_canonical_path(&serde_json::json!({"path": "C:\\workspace"}),)
+                .unwrap(),
+            PathBuf::from("C:\\workspace")
+        );
+        let error = RemoteFileSystem::parse_canonical_path(
+            &serde_json::json!({"path": "relative/workspace"}),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn remote_cross_device_error_preserves_exdev_kind() {
+        let error = RemoteFileSystem::to_io_error(ChannelError::Remote(
+            "cross-device: Invalid cross-device link".to_string(),
+        ));
+        assert_eq!(error.kind(), io::ErrorKind::CrossesDevices);
     }
 
     #[test]

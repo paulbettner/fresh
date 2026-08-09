@@ -17,7 +17,8 @@ use std::collections::HashMap;
 /// v4: the channel carries *scripts* rather than command ids —
 /// `ClientControl::RunScript` / `ServerControl::ScriptResult` replace the
 /// command-id verbs (`ListCommands` / `RunCommand` / `CommandList`).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: attached clients negotiate Ghostty terminal-rectangle passthrough.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Terminal size in columns and rows
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,9 @@ pub struct ClientHello {
     /// client) — script evaluation is then refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd_token: Option<String>,
+    /// The attached terminal understands Fresh's Ghostty rectangle OSC.
+    #[serde(default)]
+    pub ghostty_passthrough: bool,
 }
 
 impl ClientHello {
@@ -72,6 +76,7 @@ impl ClientHello {
             cmd_token: std::env::var("FRESH_CMD_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty()),
+            ghostty_passthrough: std::env::var_os("SMARTY_FRESH_GHOSTTY_PASSTHROUGH").is_some(),
         }
     }
 
@@ -268,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_roundtrips_ghostty_passthrough_capability() {
+        let mut hello = ClientHello::new(TermSize::new(80, 24));
+        hello.ghostty_passthrough = true;
+
+        let json = serde_json::to_string(&hello).unwrap();
+        let parsed: ClientHello = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.ghostty_passthrough);
+    }
+
+    #[test]
     fn test_open_window_roundtrip() {
         let msg = ClientControl::OpenWindow {
             path: "/home/user/project".to_string(),
@@ -431,5 +447,6 @@ mod tests {
         let json = r#"{"protocol_version":3,"client_version":"x","term_size":{"cols":80,"rows":24},"env":{}}"#;
         let parsed: ClientHello = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.cmd_token, None);
+        assert!(!parsed.ghostty_passthrough);
     }
 }

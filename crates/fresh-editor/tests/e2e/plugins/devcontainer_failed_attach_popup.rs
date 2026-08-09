@@ -152,7 +152,10 @@ fn devcontainer_failed_attach_popup_reopen_local_clears_override() {
     // Plant the FailedAttach override manually — normally set by the
     // plugin's `enterFailedAttach`, but that path races the
     // `plugins_loaded` scheduling we're deliberately bypassing.
-    harness.editor_mut().remote_indicator_override = Some(RemoteIndicatorOverride::FailedAttach {
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .remote_indicator_override = Some(RemoteIndicatorOverride::FailedAttach {
         error: Some("exit 1".into()),
     });
 
@@ -162,7 +165,7 @@ fn devcontainer_failed_attach_popup_reopen_local_clears_override() {
     // Sanity: popup is up and override is set.
     assert!(
         matches!(
-            harness.editor().remote_indicator_override,
+            harness.editor().active_window().remote_indicator_override,
             Some(RemoteIndicatorOverride::FailedAttach { .. })
         ),
         "Precondition: FailedAttach override must be set"
@@ -181,6 +184,11 @@ fn devcontainer_failed_attach_popup_reopen_local_clears_override() {
         .unwrap();
 
     harness
-        .wait_until(|h| h.editor().remote_indicator_override.is_none())
+        .wait_until(|h| {
+            h.editor()
+                .active_window()
+                .remote_indicator_override
+                .is_none()
+        })
         .unwrap();
 }

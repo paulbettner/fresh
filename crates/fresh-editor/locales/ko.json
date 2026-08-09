@@ -1554,6 +1554,8 @@
   "whitespace.already_has_newline": "파일이 이미 줄바꿈으로 끝납니다",
   "workspace.extract_no_file_path": "추출할 수 없음: 버퍼에 파일 경로가 없습니다",
   "workspace.extract_terminal_dormant": "추출할 수 없음: 터미널에 활성 세션이 없습니다",
+  "workspace.extract_terminal_companion": "추출할 수 없음: OMP 컴패니언 터미널은 원래 워크스페이스에 있어야 합니다",
+  "workspace.extract_terminal_script_capable": "추출할 수 없음: 스크립트 접근 권한이 있는 터미널은 원래 워크스페이스에 있어야 합니다",
   "workspace.extract_already_rooted": "이미 %{root}를 루트로 하는 워크스페이스에 있습니다",
   "workspace.extracted_tab": "%{name}을(를) 워크스페이스 %{label}(으)로 추출했습니다",
   "whitespace.newline_added": "마지막 줄바꿈이 추가되었습니다",

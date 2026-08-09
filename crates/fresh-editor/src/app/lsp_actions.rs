@@ -124,138 +124,119 @@ impl Editor {
     /// Called after an LSP server starts or restarts so it immediately knows
     /// about every open file (rather than waiting for the next user edit).
     pub(crate) fn reopen_buffers_for_language(&mut self, language: &str) {
-        // Collect buffer info first to avoid borrow conflicts
-        // Use buffer's stored language rather than detecting from path
-        let buffers_for_language: Vec<_> = self
-            .buffers()
+        self.reopen_buffers_for_language_in_window(self.active_window, language);
+    }
+
+    pub(crate) fn reopen_buffers_for_language_in_window(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        language: &str,
+    ) {
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        let buffers_for_language: Vec<_> = window
+            .buffers
             .iter()
-            .filter_map(|(buf_id, state)| {
-                if state.language == language {
-                    self.active_window()
-                        .buffer_metadata
-                        .get(buf_id)
-                        .and_then(|meta| meta.file_path().map(|p| (*buf_id, p.clone())))
-                } else {
-                    None
+            .filter_map(|(buffer_id, state)| {
+                if state.language != language {
+                    return None;
                 }
+                let path = window.buffer_metadata.get(buffer_id)?.file_path()?.clone();
+                let uri = super::types::file_path_to_lsp_uri_with_translation(
+                    &path,
+                    window.authority().path_translation.as_ref(),
+                )?;
+                Some((
+                    *buffer_id,
+                    path,
+                    uri,
+                    state.language.clone(),
+                    state.buffer.line_count().unwrap_or(1000),
+                    state.buffer.version(),
+                ))
             })
             .collect();
-
         let enable_inlay_hints = self.config.editor.enable_inlay_hints;
 
-        for (buffer_id, buf_path) in buffers_for_language {
-            let Some(state) = self
-                .windows
-                .get(&self.active_window)
-                .map(|w| &w.buffers)
-                .expect("active window present")
+        for (buffer_id, path, uri, language, line_count, version) in buffers_for_language {
+            let Some(window) = self.windows.get_mut(&window_id) else {
+                return;
+            };
+            use crate::services::lsp::manager::LspSpawnResult;
+            if window.lsp.try_spawn(&language, Some(&path)) != LspSpawnResult::Spawned {
+                continue;
+            }
+
+            let opened_with = window
+                .buffer_metadata
                 .get(&buffer_id)
-            else {
-                continue;
-            };
-
-            let Some(content) = state.buffer.to_string() else {
-                continue; // Skip buffers that aren't fully loaded
-            };
-
-            let Some(uri) = super::types::file_path_to_lsp_uri_with_translation(
-                &buf_path,
-                self.authority().path_translation.as_ref(),
-            ) else {
-                continue;
-            };
-
-            let lang_id = state.language.clone();
-            let line_count = state.buffer.line_count().unwrap_or(1000);
-            let buffer_version = state.buffer.version();
-
-            let __active_id = self.active_window;
-
-            if let Some(__win) = self.windows.get_mut(&__active_id) {
-                let lsp = &mut __win.lsp;
-                // Respect auto_start setting for this user action
-                use crate::services::lsp::manager::LspSpawnResult;
-                if lsp.try_spawn(&lang_id, Some(&buf_path)) != LspSpawnResult::Spawned {
-                    continue;
-                }
-
-                // Collect handles that need didOpen (not yet tracked in
-                // lsp_opened_with for this buffer).
-                let opened_with = __win
-                    .buffer_metadata
+                .map(|metadata| metadata.lsp_opened_with.clone())
+                .unwrap_or_default();
+            let handles: Vec<(String, u64)> = window
+                .lsp
+                .get_handles(&language)
+                .into_iter()
+                .filter(|server| !opened_with.contains(&server.handle.id()))
+                .map(|server| (server.name.clone(), server.handle.id()))
+                .collect();
+            let content = if handles.is_empty() {
+                None
+            } else {
+                let Some(content) = window
+                    .buffers
                     .get(&buffer_id)
-                    .map(|m| m.lsp_opened_with.clone())
-                    .unwrap_or_default();
-
-                let handles_needing_open: Vec<(String, u64)> = lsp
-                    .get_handles(&lang_id)
+                    .and_then(|state| state.buffer.to_string())
+                else {
+                    continue;
+                };
+                Some(content)
+            };
+            for (name, handle_id) in handles {
+                let result = window
+                    .lsp
+                    .get_handles_mut(&language)
                     .into_iter()
-                    .filter(|sh| !opened_with.contains(&sh.handle.id()))
-                    .map(|sh| (sh.name.clone(), sh.handle.id()))
-                    .collect();
-
-                // Send didOpen to each handle that hasn't seen this buffer yet
-                for (name, handle_id) in handles_needing_open {
-                    let sh = lsp
-                        .get_handles_mut(&lang_id)
-                        .into_iter()
-                        .find(|s| s.handle.id() == handle_id);
-
-                    if let Some(sh) = sh {
-                        if let Err(e) =
-                            sh.handle
-                                .did_open(uri.clone(), content.clone(), lang_id.clone())
-                        {
-                            tracing::warn!("LSP did_open to '{}' failed: {}", name, e);
-                        } else if let Some(metadata) = __win.buffer_metadata.get_mut(&buffer_id) {
+                    .find(|server| server.handle.id() == handle_id)
+                    .and_then(|server| {
+                        content.as_ref().map(|content| {
+                            server
+                                .handle
+                                .did_open(uri.clone(), content.clone(), language.clone())
+                        })
+                    });
+                match result {
+                    Some(Ok(())) => {
+                        if let Some(metadata) = window.buffer_metadata.get_mut(&buffer_id) {
                             metadata.lsp_opened_with.insert(handle_id);
                         }
                     }
+                    Some(Err(error)) => {
+                        tracing::warn!("LSP did_open to '{}' failed: {}", name, error);
+                    }
+                    None => {}
                 }
             }
 
-            // Kick off inlay hints for this buffer right after (re)opening.
-            // Servers that emit a `serverQuiescent` notification (e.g.
-            // rust-analyzer) will refresh these later once indexing is
-            // done, but servers that don't would otherwise never get a
-            // hints request unless the user edits the buffer.
             if enable_inlay_hints {
-                let __active_id = self.active_window;
-                if let Some(__win) = self.windows.get_mut(&__active_id) {
-                    let __next_id = &mut __win.next_lsp_request_id;
-                    let __pending = &mut __win.pending_inlay_hints_requests;
-                    {
-                        let lsp = &mut __win.lsp;
-                        if let Some(sh) = lsp
-                            .handle_for_feature_mut(&lang_id, crate::types::LspFeature::InlayHints)
-                        {
-                            let request_id = *__next_id;
-                            *__next_id += 1;
-                            let last_line = line_count.saturating_sub(1) as u32;
-                            if let Err(e) = sh.handle.inlay_hints(
-                                request_id,
-                                uri.clone(),
-                                0,
-                                0,
-                                last_line,
-                                10000,
-                            ) {
-                                tracing::debug!(
-                                    "Failed to request inlay hints for {}: {}",
-                                    uri.as_str(),
-                                    e
-                                );
-                            } else {
-                                __pending.insert(
-                                    request_id,
-                                    super::InlayHintsRequest {
-                                        buffer_id,
-                                        version: buffer_version,
-                                    },
-                                );
-                            }
-                        }
-                    }
+                let request_id = window.next_lsp_request_id;
+                window.next_lsp_request_id += 1;
+                let Some(server) = window
+                    .lsp
+                    .handle_for_feature_mut(&language, crate::types::LspFeature::InlayHints)
+                else {
+                    continue;
+                };
+                let last_line = line_count.saturating_sub(1) as u32;
+                if let Err(error) = server
+                    .handle
+                    .inlay_hints(request_id, uri, 0, 0, last_line, 10000)
+                {
+                    tracing::debug!("Failed to request inlay hints: {}", error);
+                } else {
+                    window
+                        .pending_inlay_hints_requests
+                        .insert(request_id, super::InlayHintsRequest { buffer_id, version });
                 }
             }
         }

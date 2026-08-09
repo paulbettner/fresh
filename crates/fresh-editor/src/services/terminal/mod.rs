@@ -12,33 +12,28 @@
 //! ## Data Flow
 //!
 //! 1. **PTY Read Loop** (manager.rs): As PTY output arrives, `process_output()` updates
-//!    the terminal grid, then `flush_new_scrollback()` appends any new scrollback lines
-//!    to the backing file. Scrollback is written one line at a time as lines scroll off.
+//!    the terminal grid, then `flush_new_scrollback()` appends complete scrollback lines
+//!    to the rendered history file.
 //!
-//! 2. **Terminal → Scrollback** (terminal.rs: `sync_terminal_to_buffer`): Appends visible
-//!    screen (~50 lines) to backing file, then loads it as read-only buffer.
-//!    Performance: O(screen_size) ≈ 5ms.
+//! 2. **Terminal → Scrollback** (terminal.rs: `sync_terminal_to_buffer`): Flushes history,
+//!    atomically replaces a separate history + visible-screen checkpoint, then loads that
+//!    checkpoint as the read-only buffer.
 //!
-//! 3. **Scrollback → Terminal** (terminal.rs: `enter_terminal_mode`): Truncates backing
-//!    file to `backing_file_history_end` (removes visible screen tail), resumes live
-//!    rendering. Performance: O(1) ≈ 1ms.
+//! 3. **Scrollback → Terminal** (terminal.rs: `enter_terminal_mode`): Resumes the live grid.
+//!    Neither the append-only history nor its checkpoint needs truncation.
 //!
-//! 4. **Session Save** (session.rs): `sync_all_terminal_backing_files()` appends visible
-//!    screen to all terminal backing files before saving session metadata.
+//! 4. **Workspace Save** (app/workspace.rs): Atomically refreshes each terminal checkpoint
+//!    before serializing its distinct history and checkpoint paths.
 //!
-//! 5. **Session Restore** (session.rs): `load_terminal_backing_file_as_buffer()` loads
-//!    backing file directly (skips log replay). User starts in scrollback mode.
-//!    Performance: O(1) ≈ 10ms (lazy load).
+//! 5. **Workspace Restore** (app/workspace.rs): Loads the checkpoint directly (skipping log
+//!    replay), while a replacement PTY continues only the append-only history file.
 //!
-//! ## Backing File Structure
+//! ## Terminal Artifact Structure
 //!
-//! Located at `~/.local/share/fresh/terminals/{workdir}/fresh-terminal-{id}.txt`:
-//!
-//! - **Scrollback history** (top): Append-only, grows as lines scroll off screen
-//! - **Visible screen** (bottom): Rewritable tail (~50 lines), present only in scrollback mode
-//!
-//! The `backing_file_history_end` offset marks where scrollback ends, used for truncation
-//! when re-entering terminal mode.
+//! Under the workspace's terminal artifact directory each terminal owns:
+//! - `*.history.txt`: append-only rendered scrollback
+//! - `*.txt`: atomically replaced read-only history + visible-screen checkpoint
+//! - `*.log`: unfiltered PTY byte stream
 //!
 //! ## Module Responsibilities
 //!
@@ -48,6 +43,7 @@
 //! - `../app/session.rs`: Session save/restore integration
 
 pub mod manager;
+mod omp_companion;
 pub mod path_link;
 pub mod pty;
 pub mod term;

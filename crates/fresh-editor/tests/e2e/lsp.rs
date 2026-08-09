@@ -2137,10 +2137,11 @@ fn test_handle_rename_response_with_document_changes() -> anyhow::Result<()> {
         change_annotations: None,
     };
 
+    let source_window = harness.editor().active_window_id();
     // Call handle_rename_response directly
     harness
         .editor_mut()
-        .handle_rename_response(0, Ok(workspace_edit))?;
+        .handle_rename_response(source_window, 0, Ok(workspace_edit))?;
     harness.render()?;
 
     // Verify the buffer was modified
@@ -2252,10 +2253,11 @@ fn test_cross_file_rename_keeps_focus_on_invoking_buffer() -> anyhow::Result<()>
         document_changes: Some(DocumentChanges::Edits(vec![main_edit, shapes_edit])),
         change_annotations: None,
     };
+    let source_window = harness.editor().active_window_id();
 
     harness
         .editor_mut()
-        .handle_rename_response(0, Ok(workspace_edit))?;
+        .handle_rename_response(source_window, 0, Ok(workspace_edit))?;
     harness.render()?;
 
     // Focus must remain on the buffer the user was editing.
@@ -2704,10 +2706,11 @@ fn test_lsp_rename_consecutive_same_position() -> anyhow::Result<()> {
         }])),
         change_annotations: None,
     };
+    let source_window = harness.editor().active_window_id();
 
     harness
         .editor_mut()
-        .handle_rename_response(1, Ok(first_rename_edit))?;
+        .handle_rename_response(source_window, 1, Ok(first_rename_edit))?;
     harness.render()?;
 
     let after_first = harness.get_buffer_content().unwrap();
@@ -2762,7 +2765,7 @@ fn test_lsp_rename_consecutive_same_position() -> anyhow::Result<()> {
 
     harness
         .editor_mut()
-        .handle_rename_response(2, Ok(second_rename_edit))?;
+        .handle_rename_response(source_window, 2, Ok(second_rename_edit))?;
     harness.render()?;
 
     let after_second = harness.get_buffer_content().unwrap();

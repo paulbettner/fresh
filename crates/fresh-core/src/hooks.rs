@@ -8,6 +8,13 @@ use std::path::PathBuf;
 
 use crate::action::Action;
 use crate::{BufferId, CursorId, SplitId};
+mod omp_companion;
+
+pub use omp_companion::{
+    OmpCompanionAsyncJobs, OmpCompanionContext, OmpCompanionCurrentTool, OmpCompanionGoal,
+    OmpCompanionGoalStatus, OmpCompanionModel, OmpCompanionSnapshotV1, OmpCompanionState,
+    OmpCompanionThinkingLevel, OmpCompanionTodos,
+};
 
 /// Arguments passed to hook callbacks
 #[derive(Debug, Clone, serde::Serialize)]
@@ -417,6 +424,16 @@ pub enum HookArgs {
         /// The newly active session id. Always present in the
         /// `sessions` list.
         active_id: u64,
+    },
+
+    /// Authenticated structured state from the exact live OMP companion PTY.
+    /// The editor supplies the exact terminal identity; no capability or raw
+    /// frame material crosses this hook boundary.
+    OmpCompanionSnapshot {
+        window_id: u64,
+        terminal_id: u64,
+        received_at_ms: u64,
+        snapshot: OmpCompanionSnapshotV1,
     },
 
     /// PTY terminal received output bytes from the spawned process.

@@ -1,16 +1,14 @@
 //! Regression test for issue #2424: in a remote SSH workspace, the integrated
-//! terminal's scrollback *backing file* must be managed on the **local**
-//! filesystem, never through the (remote) session authority filesystem.
+//! terminal's append-only history and published checkpoint must be managed on
+//! the **local** filesystem, never through the remote session authority.
 //!
 //! The integrated terminal's PTY always runs on the local host (an SSH
 //! terminal spawns `ssh` as a *local* child), and the PTY read loop renders
-//! scrollback into a backing file on local disk. Before the fix, the editor
-//! routed the backing file's create / exists / append / truncate / read
-//! through `authority().filesystem` — which in remote mode is the SSH
-//! filesystem. That made every scrollback-mode toggle do a blocking SSH
-//! round-trip against a path that only exists locally: the UI hung and the
-//! truncate failed with "Failed to truncate terminal backing file", leaving
-//! scrollback empty.
+//! scrollback into a local history file. Before the fix, the editor routed
+//! terminal artifact I/O through `authority().filesystem` — which in remote
+//! mode is the SSH filesystem. That made every scrollback-mode toggle do a
+//! blocking SSH round-trip against paths that only exist locally, leaving
+//! scrollback empty when those operations failed.
 //!
 //! This test injects a filesystem that (a) reports itself as a *remote*
 //! connection and (b) records every path it is asked to touch. It then drives
@@ -18,7 +16,7 @@
 //! scrollback mode and back (Ctrl+Space) — and asserts that the remote
 //! filesystem was **never** asked to operate on the terminal directory. With
 //! the bug present this fails (the remote fs sees `…/terminals/…` paths);
-//! with the fix it passes (those ops go to the local filesystem).
+//! with the fix it passes (history and checkpoint I/O stay local).
 //!
 //! Skips (rather than fails) when a PTY can't be opened in the environment.
 
@@ -243,7 +241,7 @@ fn terminal_backing_file_stays_local_in_remote_mode() {
         .expect("terminal should print up to Line 100");
 
     // Toggle into scrollback mode (Ctrl+Space) and back — the round-trip that
-    // truncates the backing file on re-entry (the reported failure point).
+    // flushes append-only history and publishes the read-only checkpoint.
     harness
         .editor_mut()
         .handle_key(KeyCode::Char(' '), KeyModifiers::CONTROL)
@@ -264,8 +262,8 @@ fn terminal_backing_file_stays_local_in_remote_mode() {
     );
     harness.render().unwrap();
 
-    // The terminal backing file is a local artifact: not one of its
-    // create/exists/append/truncate/read operations may have been routed
+    // Terminal history and checkpoints are local artifacts: none of their
+    // create/exists/append/replace/read operations may have been routed
     // through the remote authority filesystem.
     let leaked = fs.terminal_paths();
     assert!(

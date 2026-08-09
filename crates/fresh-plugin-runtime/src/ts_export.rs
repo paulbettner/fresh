@@ -16,17 +16,18 @@ use ts_rs::{Config as TsConfig, TS};
 
 use fresh_core::api::{
     ActionPopupAction, ActionPopupOptions, ActionSpec, AnimationRect, BackgroundProcessResult,
-    BufferGroupResult, BufferInfo, BufferSavedDiff, CompositeHunk, CompositeLayoutConfig,
-    CompositePaneStyle, CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
-    CreateVirtualBufferInExistingSplitOptions, CreateVirtualBufferInSplitOptions,
-    CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult, DirEntry, FormatterPackConfig,
-    GrammarInfoSnapshot, GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry,
-    KeyEventPayload, LanguagePackConfig, LayoutHints, LineDiffHunk, LspServerPackConfig,
+    BufferGroupResult, BufferInfo, BufferSavedDiff, CompletionItem, CompositeHunk,
+    CompositeLayoutConfig, CompositePaneStyle, CompositeSourceConfig, CreateCompositeBufferOptions,
+    CreateTerminalOptions, CreateVirtualBufferInExistingSplitOptions,
+    CreateVirtualBufferInSplitOptions, CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult,
+    DirEntry, DualListOption, FormatterPackConfig, GrammarInfoSnapshot, GrepMatch, JsDiagnostic,
+    JsPosition, JsRange, JsTextPropertyEntry, KeyEventPayload, LanguagePackConfig, LayoutHints,
+    LineDiffHunk, LspServerPackConfig, OmpCompanionCommandTargetV1, OmpCompanionCommandType,
     OverlayColorSpec, OverlayOptions, PluginAnimationEdge, PluginAnimationKind,
     ProcessLimitsPackConfig, RemoteBackendInfo, ReplaceResult, ScreenSize, ScrollbarMarker,
-    SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult, TextPropertiesAtCursor,
-    TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire, ViewTokenWireKind, ViewportInfo,
-    VirtualBufferResult, WindowInfo,
+    SearchTakeResult, SpawnResult, SplitSnapshot, TerminalCompanion, TerminalResult,
+    TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire,
+    ViewTokenWireKind, ViewportInfo, VirtualBufferResult, WindowInfo,
 };
 use fresh_core::command::Suggestion;
 use fresh_core::file_explorer::{
@@ -34,6 +35,7 @@ use fresh_core::file_explorer::{
     FileExplorerTrailingSlot,
 };
 use fresh_core::text_property::InlineOverlay;
+use fresh_core::{WindowId, WindowTerminalId};
 
 /// Get the TypeScript declaration for a type by name
 ///
@@ -65,6 +67,13 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "LineTarget" => Some(fresh_core::api::LineTarget::decl(&cfg)),
         "PaneDescription" => Some(fresh_core::api::PaneDescription::decl(&cfg)),
         "WorkspaceDescription" => Some(fresh_core::api::WorkspaceDescription::decl(&cfg)),
+        "WorkspacePersistenceFile" => {
+            Some(fresh_core::api::WorkspacePersistenceFile::decl(&cfg))
+        }
+        "WorkspaceCreateAttemptInventory" => Some(
+            fresh_core::api::WorkspaceCreateAttemptInventory::decl(&cfg),
+        ),
+        "WindowId" => Some(WindowId::decl(&cfg)),
         "ActionSpec" => Some(ActionSpec::decl(&cfg)),
         "BufferSavedDiff" => Some(BufferSavedDiff::decl(&cfg)),
         "LineDiffHunk" => Some(LineDiffHunk::decl(&cfg)),
@@ -86,6 +95,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         ),
 
         // Terminal types
+        "WindowTerminalId" => Some(WindowTerminalId::decl(&cfg)),
         "TerminalResult" => Some(TerminalResult::decl(&cfg)),
         "CreateTerminalOptions" => Some(CreateTerminalOptions::decl(&cfg)),
         "CreateWindowWithTerminalOptions" => {
@@ -94,6 +104,9 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "SessionWithTerminalResult" => {
             Some(fresh_core::api::SessionWithTerminalResult::decl(&cfg))
         }
+        "TerminalCompanion" => Some(TerminalCompanion::decl(&cfg)),
+        "OmpCompanionCommandType" => Some(OmpCompanionCommandType::decl(&cfg)),
+        "OmpCompanionCommandTargetV1" => Some(OmpCompanionCommandTargetV1::decl(&cfg)),
 
         // Composite buffer types (ts-rs renames these with Ts prefix)
         "TsCompositeLayoutConfig" | "CompositeLayoutConfig" => {
@@ -138,6 +151,8 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "TextPropertiesAtCursor" => Some(TextPropertiesAtCursor::decl(&cfg)),
         "VirtualBufferResult" => Some(VirtualBufferResult::decl(&cfg)),
         "BufferGroupResult" => Some(BufferGroupResult::decl(&cfg)),
+        "CompletionItem" => Some(CompletionItem::decl(&cfg)),
+        "DualListOption" => Some(DualListOption::decl(&cfg)),
 
         // Prompt and directory types
         "PromptSuggestion" | "Suggestion" => Some(Suggestion::decl(&cfg)),
@@ -188,6 +203,14 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         // Keep in sync with
         // `crates/fresh-editor/src/services/authority/mod.rs`.
         "RemoteAgentSpec" => Some(REMOTE_AGENT_SPEC_DECL.to_string()),
+
+        // Exact born-window identity returned by `attachRemoteAgent`.
+        "RemoteAttachResult" => Some(REMOTE_ATTACH_RESULT_DECL.to_string()),
+        // Runtime promise handle returned by `attachRemoteAgent`.
+        "RemoteAttachRequest" => Some(REMOTE_ATTACH_REQUEST_DECL.to_string()),
+
+        // Named async return for `editor.getCompositeCursorInfo(...)`.
+        "CompositeCursorInfo" => Some(COMPOSITE_CURSOR_INFO_DECL.to_string()),
 
         // Remote Indicator override — payload for
         // `editor.setRemoteIndicatorState(...)`. Same hand-written
@@ -301,6 +324,10 @@ const REMOTE_AGENT_SPEC_DECL: &str = r#"type RemoteAgentTransport = {
 
 type RemoteAgentSpec = {
   transport: RemoteAgentTransport;
+  /** Immutable remote tenant anchor verified by the remote agent. */
+  verified_anchor?: { digest: string };
+  /** Exact canonical remote root paired with `verified_anchor`. */
+  canonical_root?: string;
   /**
   * Captured in-pod env (PATH/HOME/LANG/…) applied to LSP spawns and
   * binary-presence probes. Omit when no probe was run.
@@ -313,10 +340,30 @@ type RemoteAgentSpec = {
   * a real session row beside local ones.
   */
   window?: boolean;
+  /** Keep the born window active. Defaults to true. Set false for a
+  * background attach that must preserve focus at installation time. */
+  activate?: boolean;
   /** Window label (window mode only). Omit to use the transport's display. */
   label?: string;
   /** Optional agent argv for the new window's seed terminal (window mode). */
   command?: string[];
+  /** Plugin-owned state atomically installed in a born remote window before
+  * activation and promise resolution. */
+  initialState?: Record<string, unknown>;
+};"#;
+
+/// Result of `editor.attachRemoteAgent(...)`. Global restart mode has no born
+/// window, while window mode resolves with the exact identity it constructed.
+const REMOTE_ATTACH_RESULT_DECL: &str = r#"type RemoteAttachResult = {
+  /** Exact identity of the born-attached window. Omitted for global restart. */
+  windowId?: number;
+};"#;
+
+/// `attachRemoteAgent` is a real Promise augmented with caller-owned
+/// cancellation metadata by the QuickJS bootstrap.
+const REMOTE_ATTACH_REQUEST_DECL: &str = r#"type RemoteAttachRequest = Promise<RemoteAttachResult> & {
+  readonly requestId: number;
+  cancel(): void;
 };"#;
 
 /// Hand-written declaration for `RemoteIndicatorStatePayload`. Keep in
@@ -329,6 +376,13 @@ const REMOTE_INDICATOR_STATE_DECL: &str = r#"type RemoteIndicatorStatePayload =
   | { kind: "connected"; label?: string | null }
   | { kind: "failed_attach"; error?: string | null }
   | { kind: "disconnected"; label?: string | null };"#;
+
+/// Named async result for `editor.getCompositeCursorInfo(...)`.
+const COMPOSITE_CURSOR_INFO_DECL: &str = r#"type CompositeCursorInfo = {
+  focusedPane: number;
+  paneCount: number;
+  lines: Array<number | null>;
+};"#;
 
 /// Types that are dependencies of other types and must always be included.
 /// These are types referenced inside option structs or other complex types
@@ -351,6 +405,8 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "LineTarget",                      // Used by editor.setLineTargets()
     "PaneDescription",                 // Part of WorkspaceDescription
     "WorkspaceDescription",            // Returned by editor.describeWorkspace()
+    "WorkspacePersistenceFile",        // Returned by inspectWorkspacePersistence
+    "WorkspaceCreateAttemptInventory", // Returned by inspectWorkspaceCreateAttempt
     "LayoutHints",                     // Used by plugins for view transforms
     "ViewTokenWire",                   // Used by plugins for view transforms
     "ViewTokenWireKind",               // Used by ViewTokenWire
@@ -376,10 +432,21 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "FileExplorerTooltip",             // Used by FileExplorerTrailingSlot
     "FormatterPackConfig",             // Used by LanguagePackConfig.formatter
     "ProcessLimitsPackConfig",         // Used by LspServerPackConfig.process_limits
+    "WindowTerminalId",                // Exact identity used by terminal results and controls
     "TerminalResult",                  // Used by createTerminal return type
     "CreateWindowWithTerminalOptions", // Used by createWindowWithTerminal opts
     "SessionWithTerminalResult",       // Used by createWindowWithTerminal return type
     "CreateTerminalOptions",           // Used by createTerminal opts parameter
+    "TerminalCompanion",               // CreateWindowWithTerminalOptions.companion
+    "OmpCompanionCommandType",         // sendOmpCompanionCommand type parameter
+    "OmpCompanionCommandTargetV1",     // sendOmpCompanionCommand identity fence
+    "WindowId",                        // Used by CreateTerminalOptions.windowId
+    "CompletionItem",                  // Used by WidgetSpec/WidgetMutation completions
+    "DualListOption",                  // Used by WidgetSpec::DualList options
+    "BufferGroupResult",               // Used by the hand-written buffer group API trailer
+    "RemoteAttachResult",              // Used by RemoteAttachRequest's promise value
+    "RemoteAttachRequest",             // Used by attachRemoteAgent's API signature
+    "CompositeCursorInfo",             // Used by getCompositeCursorInfo's async return
     "CursorInfo",                      // Used by getPrimaryCursor, getAllCursors
     "OverlayOptions",                  // Used by TextPropertyEntry.style and InlineOverlay
     "OverlayColorSpec",                // Used by OverlayOptions.fg/bg
@@ -483,24 +550,7 @@ pub fn format_typescript(source: &str) -> String {
     Codegen::new().build(&parser_ret.program).code
 }
 
-/// Generate and write the complete fresh.d.ts file
-///
-/// Combines ts-rs generated types with proc macro output,
-/// validates the syntax, formats the output, and writes to disk.
-pub fn write_fresh_dts() -> Result<(), String> {
-    use crate::backend::quickjs_backend::{JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE};
-
-    let ts_types = collect_ts_types();
-
-    // After the macro-generated EditorAPI interface, merge in a
-    // typed overload of `getPluginApi` that looks through the
-    // `FreshPluginRegistry` interface (declared in the preamble,
-    // augmented by each loaded plugin's `plugins.d.ts`). Declared
-    // AFTER the base interface so TypeScript's overload resolution
-    // prefers the typed form when the name is a known key; the
-    // untyped `getPluginApi(name: string): unknown | null` from the
-    // macro output is the fallback.
-    let plugin_api_trailer = r#"
+const PLUGIN_API_TRAILER: &str = r#"
 
 /**
  * Typed overload of `editor.getPluginApi`. When the caller passes a
@@ -537,6 +587,48 @@ interface EditorAPI {
     options: { values: readonly E[]; default: NoInfer<E>; description?: string },
   ): E;
   getPluginConfig<T = unknown>(): T;
+}
+
+interface OmpCompanionSnapshotV1 {
+  version: 1;
+  incarnation: string;
+  sequence: number;
+  sessionGeneration: number;
+  workEpoch: number;
+  timestampMs: number;
+  ompVersion: string;
+  processId: number;
+  sessionId: string;
+  sessionName?: string;
+  cwd: string;
+  state:
+    | "idle"
+    | "working"
+    | "awaiting_approval"
+    | "retrying"
+    | "compacting"
+    | "stopped"
+    | "error";
+  statusText?: string;
+  model?: { provider: string; id: string };
+  thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  runningTools: number;
+  currentTool?: { name: string; intent?: string };
+  goal?: {
+    objective: string;
+    status: "active" | "paused" | "budget-limited" | "complete" | "dropped";
+  };
+  todos?: {
+    pending: number;
+    inProgress: number;
+    blocked: number;
+    completed: number;
+    abandoned: number;
+    current?: string;
+  };
+  context?: { tokens: number; contextWindow: number; percentBps: number };
+  pendingApprovals: number;
+  asyncJobs?: { running: number; recentFailures: number; pendingDelivery: number };
 }
 
 /**
@@ -714,6 +806,14 @@ interface HookEventMap {
     missing_servers: string[];
     user_dismissed: boolean;
   };
+  lsp_open_external_uri: {
+    uri: string;
+    scheme: string;
+    line: number;
+    character: number;
+    language: string;
+    server_name: string;
+  };
 
   // ── UI events ────────────────────────────────────────────────────────────
   action_popup_result: { popup_id: string; action_id: string };
@@ -734,7 +834,13 @@ interface HookEventMap {
   // so a plugin can attribute output to a session: output from ANY terminal
   // in the window counts, and it fires on every PTY read (in-place redraws
   // and carriage-return progress bars register, not just newlines).
-  terminal_output: { terminal_id: number; window_id: number; last_line: string };
+  terminal_output: {
+    terminal_id: number;
+    window_id: number;
+    last_line: string;
+    terminal_title: string;
+    osc_activity: boolean | null;
+  };
   terminal_exit: { terminal_id: number; window_id: number; exit_code: number | null };
 
   // ── filesystem watching (watchPath plugin API) ────────────────────────────
@@ -814,16 +920,26 @@ interface EditorAPI {
 }
 "#;
 
+fn generate_fresh_dts() -> Result<String, String> {
+    use crate::backend::quickjs_backend::{JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE};
+
     let content = format!(
         "{}\n{}\n{}{}",
-        JSEDITORAPI_TS_PREAMBLE, ts_types, JSEDITORAPI_TS_EDITOR_API, plugin_api_trailer
+        JSEDITORAPI_TS_PREAMBLE,
+        collect_ts_types(),
+        JSEDITORAPI_TS_EDITOR_API,
+        PLUGIN_API_TRAILER
     );
-
-    // Validate the generated TypeScript syntax
     validate_typescript(&content)?;
+    Ok(format_typescript(&content))
+}
 
-    // Format the TypeScript
-    let formatted = format_typescript(&content);
+/// Generate and write the complete fresh.d.ts file.
+///
+/// Combines ts-rs generated types with proc macro output,
+/// validates the syntax, formats the output, and writes to disk.
+pub fn write_fresh_dts() -> Result<(), String> {
+    let formatted = generate_fresh_dts()?;
 
     // Determine output path - write to fresh-editor/plugins/lib/fresh.d.ts
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
@@ -941,10 +1057,15 @@ mod tests {
             "LayoutHints",
             "SpawnResult",
             "BackgroundProcessResult",
+            "WindowTerminalId",
             "TerminalResult",
             "CreateTerminalOptions",
             "CreateWindowWithTerminalOptions",
             "SessionWithTerminalResult",
+            "TerminalCompanion",
+            "OmpCompanionCommandType",
+            "OmpCompanionCommandTargetV1",
+            "CompositeCursorInfo",
             "TsCompositeLayoutConfig",
             "TsCompositeSourceConfig",
             "TsCompositePaneStyle",
@@ -1114,26 +1235,69 @@ mod tests {
 
     #[test]
     fn test_generated_dts_validates_as_typescript() {
-        use crate::backend::quickjs_backend::{JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE};
-
-        let ts_types = collect_ts_types();
-        let content = format!(
-            "{}\n{}\n{}",
-            JSEDITORAPI_TS_PREAMBLE, ts_types, JSEDITORAPI_TS_EDITOR_API
-        );
-
+        let content = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
         validate_typescript(&content).expect("Generated TypeScript should be syntactically valid");
     }
 
     #[test]
-    fn test_generated_dts_no_undefined_type_references() {
-        use crate::backend::quickjs_backend::{JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE};
+    fn test_generated_dts_terminal_output_matches_runtime_payload() {
+        let generated = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
+        let terminal_output_start = generated
+            .find("terminal_output: {")
+            .expect("generated HookEventMap should declare terminal_output");
+        let declaration = &generated[terminal_output_start..];
+        let open = declaration
+            .find('{')
+            .expect("terminal_output declaration must open an object");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in declaration[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let terminal_output = &declaration[..end.expect("terminal_output object must close")];
 
-        let ts_types = collect_ts_types();
-        let content = format!(
-            "{}\n{}\n{}",
-            JSEDITORAPI_TS_PREAMBLE, ts_types, JSEDITORAPI_TS_EDITOR_API
+        let fields: Vec<_> = terminal_output
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(':') && line.ends_with(';'))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "terminal_id: number;",
+                "window_id: number;",
+                "last_line: string;",
+                "terminal_title: string;",
+                "osc_activity: boolean | null;",
+            ],
+            "generated terminal_output payload must exactly match the runtime hook contract"
         );
+    }
+    #[test]
+    fn test_generated_dts_companion_snapshot_requires_work_epoch() {
+        let generated = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
+        let snapshot = &generated[generated
+            .find("interface OmpCompanionSnapshotV1 {")
+            .expect("generated hook payload should declare its snapshot")..];
+        assert!(
+            snapshot.contains("workEpoch: number;"),
+            "the companion hook snapshot must retain required workEpoch"
+        );
+    }
+
+    #[test]
+    fn test_generated_dts_no_undefined_type_references() {
+        let content = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
 
         // Collect all defined type names
         let mut defined_types = std::collections::HashSet::new();
@@ -1183,9 +1347,17 @@ mod tests {
             }
         }
 
-        // Extract capitalized identifiers from EditorAPI method signature lines only
-        // (skip JSDoc comment lines which contain prose with capitalized words)
-        let interface_section = JSEDITORAPI_TS_EDITOR_API;
+        // Check the first generated EditorAPI declaration (the proc-macro API),
+        // rather than rebuilding a second declaration source in this test.
+        let editor_api_start = content
+            .find("interface EditorAPI {")
+            .expect("generated fresh.d.ts should declare EditorAPI");
+        let editor_api_tail = &content[editor_api_start..];
+        let editor_api_end = editor_api_tail
+            .find("\n}\n")
+            .expect("generated EditorAPI declaration should close")
+            + 2;
+        let interface_section = &editor_api_tail[..editor_api_end];
         let mut undefined_refs = Vec::new();
 
         for line in interface_section.lines() {
@@ -1225,6 +1397,23 @@ mod tests {
             "Found undefined type references in EditorAPI interface: {:?}",
             undefined_refs
         );
+    }
+
+    #[test]
+    fn test_generated_dts_dependency_closure_includes_nested_and_manual_types() {
+        let generated = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
+        for name in [
+            "WindowId",
+            "DualListOption",
+            "CompletionItem",
+            "RemoteAttachResult",
+            "BufferGroupResult",
+        ] {
+            assert!(
+                generated.contains(&format!("type {name} =")),
+                "generated fresh.d.ts must declare the {name} dependency"
+            );
+        }
     }
 
     #[test]
@@ -1275,6 +1464,60 @@ mod tests {
         assert!(
             api.contains("TerminalResult"),
             "createTerminal should reference TerminalResult"
+        );
+        assert!(
+            api.contains(
+                "sendOmpCompanionCommand(terminalId: WindowTerminalId, type: OmpCompanionCommandType, target: OmpCompanionCommandTargetV1): Promise<boolean>;"
+            ),
+            "sendOmpCompanionCommand should expose the exact typed promise"
+        );
+        let generated = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
+        let target = &generated[generated
+            .find("type OmpCompanionCommandTargetV1 = {")
+            .expect("generated declarations should include the command target")..];
+        assert!(
+            target.contains("workEpoch: number;"),
+            "the generated command target must expose its required work epoch"
+        );
+    }
+
+    #[test]
+    fn test_editor_api_remote_attach_returns_born_window_identity() {
+        use crate::backend::quickjs_backend::JSEDITORAPI_TS_EDITOR_API;
+
+        let api = JSEDITORAPI_TS_EDITOR_API;
+        assert!(
+            api.contains("attachRemoteAgent(payload: RemoteAgentSpec): RemoteAttachRequest;"),
+            "attachRemoteAgent should expose its exact cancellable promise handle"
+        );
+        let types = collect_ts_types();
+        assert!(
+            types.contains("type RemoteAttachResult = {")
+                && types.contains("windowId?: number;")
+                && types.contains("type RemoteAttachRequest = Promise<RemoteAttachResult> & {")
+                && types.contains("readonly requestId: number;")
+                && types.contains("cancel(): void;")
+                && types.contains("activate?: boolean;")
+                && types.contains("initialState?: Record<string, unknown>;")
+                && types.contains("verified_anchor?: { digest: string };")
+                && types.contains("canonical_root?: string;"),
+            "remote attach declarations must include tenant identity, activation, initial state, window identity, and cancellation"
+        );
+    }
+
+    #[test]
+    fn test_editor_api_lifecycle_recovery_methods_have_exact_contracts() {
+        let generated = generate_fresh_dts().expect("full fresh.d.ts generation should succeed");
+        assert!(
+            generated.contains(
+                "restoreWorkspaceWindow(root: string, label: string, stableId: string | null, activate: boolean): Promise<{"
+            ) && generated.contains("windowId: number;")
+                && generated.contains("stableId: string;"),
+            "restoreWorkspaceWindow must expose the exact trusted rollback result"
+        );
+        assert!(
+            generated.contains("stopWindow(id: number, graceMs: number): boolean;"),
+            "stopWindow must expose its exact synchronous grace-period contract"
         );
     }
 

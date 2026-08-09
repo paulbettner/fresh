@@ -67,3 +67,50 @@ fn watch_path_round_trip_registers_and_fires() {
         .handle_plugin_command(PluginCommand::UnwatchPath { handle })
         .unwrap();
 }
+
+#[test]
+fn remote_watch_path_is_not_reinterpreted_on_the_host() {
+    let mut harness = EditorTestHarness::with_temp_project(80, 24).unwrap();
+    let host_path = harness.project_dir().unwrap().join("remote-looking");
+    std::fs::create_dir_all(&host_path).unwrap();
+    let window_id = harness.editor().active_window_id();
+    harness.editor_mut().set_session_authority_spec(
+        window_id,
+        fresh::services::authority::SessionAuthoritySpec::RemoteAgent(
+            fresh::services::authority::RemoteAgentSpec {
+                transport: fresh::services::authority::RemoteTransportSpec::Ssh {
+                    user: Some("dev".to_string()),
+                    host: "remote.example".to_string(),
+                    port: None,
+                    identity_file: None,
+                    remote_path: Some("/workspace".to_string()),
+                    extra_args: Vec::new(),
+                },
+                verified_anchor: None,
+                canonical_root: None,
+                base_env: Vec::new(),
+                window: true,
+                label: None,
+                command: None,
+            },
+        ),
+    );
+
+    harness
+        .editor_mut()
+        .handle_plugin_command(PluginCommand::WatchPath {
+            path: host_path,
+            recursive: true,
+            request_id: 8002,
+        })
+        .unwrap();
+
+    let error = harness
+        .editor()
+        .last_watch_response_for_test()
+        .expect("remote watch response")
+        .1
+        .as_ref()
+        .expect_err("remote paths must never enter the host notify backend");
+    assert!(error.contains("unavailable for remote authorities"));
+}

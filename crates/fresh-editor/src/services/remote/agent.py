@@ -10,6 +10,9 @@ import subprocess
 import re
 import threading
 import select
+import hashlib
+import secrets
+import errno
 from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 65536
@@ -52,6 +55,14 @@ def validate_path(p):
     if not os.path.isabs(expanded):
         expanded = os.path.abspath(expanded)
     return os.path.realpath(expanded)
+
+def validate_leaf_path(p):
+    """Canonicalize the parent without following the final path component."""
+    if not p:
+        raise ValueError("empty path")
+    expanded = os.path.abspath(os.path.expanduser(p))
+    parent, name = os.path.split(expanded)
+    return os.path.join(os.path.realpath(parent), name)
 
 
 # === File Operations ===
@@ -209,20 +220,20 @@ def cmd_ls(id, p):
 
 
 def cmd_rm(id, p):
-    """Remove a file."""
-    os.unlink(validate_path(p["path"]))
+    """Remove a file or symlink without following the final component."""
+    os.unlink(validate_leaf_path(p["path"]))
     send(id, r={})
 
 
 def cmd_rmdir(id, p):
-    """Remove an empty directory."""
-    os.rmdir(validate_path(p["path"]))
+    """Remove an empty directory without following the final component."""
+    os.rmdir(validate_leaf_path(p["path"]))
     send(id, r={})
 
 
 def cmd_mkdir(id, p):
     """Create a directory."""
-    path = validate_path(p["path"])
+    path = validate_leaf_path(p["path"])
     if p.get("parents"):
         os.makedirs(path, exist_ok=True)
     else:
@@ -231,17 +242,14 @@ def cmd_mkdir(id, p):
 
 
 def cmd_mv(id, p):
-    """Move/rename a file or directory.
-
-    Uses shutil.move() to handle cross-device moves (e.g., /tmp to /etc).
-    """
-    shutil.move(validate_path(p["from"]), validate_path(p["to"]))
+    """Atomically rename within one volume; EXDEV is handled by the client."""
+    os.rename(validate_leaf_path(p["from"]), validate_leaf_path(p["to"]))
     send(id, r={})
 
 
 def cmd_cp(id, p):
-    """Copy a file."""
-    dst = validate_path(p["to"])
+    """Copy a file to an exact destination path."""
+    dst = validate_leaf_path(p["to"])
     shutil.copy2(validate_path(p["from"]), dst)
     send(id, r={"size": os.path.getsize(dst)})
 
@@ -359,6 +367,82 @@ def cmd_exists(id, p):
         send(id, r={"exists": False})
 
 
+def _read_tenant_anchor(anchor_path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(anchor_path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(errno.EINVAL, "tenant anchor is not a regular file")
+        token = b""
+        while len(token) < 33:
+            chunk = os.read(fd, 33 - len(token))
+            if not chunk:
+                break
+            token += chunk
+    finally:
+        os.close(fd)
+    if len(token) != 32:
+        raise OSError(errno.EINVAL, "tenant anchor must contain exactly 32 bytes")
+    return token
+
+
+def _fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def tenant_anchor_digest():
+    """Return a durable stable, non-locator identity for this remote tenant."""
+    anchor_dir = os.path.join(os.path.expanduser("~"), ".cache", "fresh")
+    anchor_path = os.path.join(anchor_dir, "tenant-anchor-v1")
+    os.makedirs(anchor_dir, mode=0o700, exist_ok=True)
+    try:
+        token = _read_tenant_anchor(anchor_path)
+    except FileNotFoundError:
+        staging = f"{anchor_path}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        fd = os.open(
+            staging,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            token = secrets.token_bytes(32)
+            written = 0
+            while written < len(token):
+                count = os.write(fd, token[written:])
+                if count == 0:
+                    raise OSError(errno.EIO, "tenant anchor write made no progress")
+                written += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            try:
+                os.link(staging, anchor_path, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            _fsync_directory(anchor_dir)
+        finally:
+            try:
+                os.unlink(staging)
+            except FileNotFoundError:
+                pass
+        token = _read_tenant_anchor(anchor_path)
+
+    root = os.stat("/")
+    identity = b"\0".join([
+        token,
+        str(os.getuid()).encode("ascii"),
+        str(root.st_dev).encode("ascii"),
+        str(root.st_ino).encode("ascii"),
+    ])
+    return hashlib.sha256(identity).hexdigest()
+
+
 def cmd_info(id, p):
     """Get system info (home directory, cwd, temp directory, etc.)."""
     import tempfile
@@ -366,6 +450,7 @@ def cmd_info(id, p):
         "home": os.path.expanduser("~"),
         "cwd": os.getcwd(),
         "temp_dir": tempfile.gettempdir(),
+        "tenant_anchor": tenant_anchor_digest(),
     })
 
 
@@ -677,7 +762,10 @@ def handle_request(line):
     except NotADirectoryError as e:
         send(id, e=f"not a directory: {e}")
     except OSError as e:
-        send(id, e=f"os error: {e}")
+        if e.errno == errno.EXDEV:
+            send(id, e=f"cross-device: {e}")
+        else:
+            send(id, e=f"os error: {e}")
     except Exception as e:
         send(id, e=str(e))
 

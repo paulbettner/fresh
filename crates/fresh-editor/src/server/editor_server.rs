@@ -202,12 +202,46 @@ struct ConnectedClient {
     input_parser: ClientInputParser,
     /// Whether this client needs a full screen render on next frame
     needs_full_render: bool,
+    /// Suspend teardown ran on the client; prepend setup before its next paint.
+    needs_terminal_setup: bool,
     /// If set, this client is waiting for a --wait completion signal
     wait_id: Option<u64>,
     /// Per-workspace capability token presented in this client's `Hello`
     /// (from `$FRESH_CMD_TOKEN`). Authorizes `RunScript` against the token's
     /// grant; `None` for clients that carry no token.
     cmd_token: Option<String>,
+    /// Whether this client's host terminal negotiated Ghostty rectangle reports.
+    ghostty_passthrough: bool,
+    /// Last rectangle set successfully queued to this client.
+    last_ghostty_rects: Vec<ratatui::layout::Rect>,
+}
+
+fn client_terminal_teardown(ghostty_passthrough: bool) -> Vec<u8> {
+    let mut teardown = Vec::new();
+    if ghostty_passthrough {
+        teardown.extend(
+            crate::services::terminal_modes::smarty_fresh_terminal_rects_sequence(
+                std::iter::empty(),
+            ),
+        );
+    }
+    teardown.extend(terminal_teardown_sequences());
+    teardown
+}
+#[cfg(test)]
+mod ghostty_attach_tests {
+    use super::*;
+
+    #[test]
+    fn negotiated_client_teardown_ends_rectangle_context() {
+        let capable = client_terminal_teardown(true);
+        let ordinary = client_terminal_teardown(false);
+
+        assert!(
+            String::from_utf8_lossy(&capable).contains("3008;end=smarty-fresh-terminal-rects-v1")
+        );
+        assert!(!String::from_utf8_lossy(&ordinary).contains("smarty-fresh-terminal-rects-v1"));
+    }
 }
 
 impl EditorServer {
@@ -467,7 +501,7 @@ impl EditorServer {
                     if idx < self.clients.len() {
                         tracing::info!("Client {} requested detach", self.clients[idx].id);
                         let client = self.clients.remove(idx);
-                        let teardown = terminal_teardown_sequences();
+                        let teardown = client_terminal_teardown(client.ghostty_passthrough);
                         // Best-effort: client may already be disconnected
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = client.data_writer.try_write(&teardown);
@@ -515,6 +549,8 @@ impl EditorServer {
                         // full paint once the client resumes and reconnects its
                         // terminal.
                         self.clients[idx].needs_full_render = true;
+                        self.clients[idx].needs_terminal_setup = true;
+                        self.clients[idx].last_ghostty_rects.clear();
                     }
                 } else {
                     tracing::warn!("Suspend requested but no input source; ignoring");
@@ -998,6 +1034,7 @@ impl EditorServer {
         // editor, so a remote workspace isn't dropped to the local placeholder
         // `build_editor_instance` leaves behind. A real authority transition
         // (`new_authority`) overwrites `current_authority` just below.
+        let authority_transition = new_authority.is_some();
         if new_authority.is_none() {
             if let Some(ref mut editor) = self.editor {
                 self.current_authority = editor.take_active_authority();
@@ -1029,20 +1066,19 @@ impl EditorServer {
             // and let the env-manager plugin re-detect for the new workspace.
             self.env_provider.clear();
         }
+        // Keepalive ownership follows the authority transition exactly. Drop
+        // the retired remote carrier before publishing its replacement; a
+        // connection-backed replacement supplies `Some`, while local/docker
+        // supplies `None`.
+        if authority_transition {
+            self.session_keepalive = new_keepalive;
+        }
         if let Some(auth) = new_authority {
             tracing::info!(
                 "Rebuild: installing authority with label {:?}",
                 auth.display_label
             );
             self.current_authority = auth;
-        }
-        // Adopt the keepalive that rode with a connection-backed authority
-        // (remote agent / K8s) so its carrier + reconnect/heartbeat tasks
-        // survive the rebuild; the previous keepalive drops, tearing down
-        // any prior remote backend. A local/docker transition carries
-        // none, leaving the current workspace untouched.
-        if let Some(keepalive) = new_keepalive {
-            self.session_keepalive = Some(keepalive);
         }
 
         let (mut editor, terminal) = self.build_editor_instance()?;
@@ -1175,8 +1211,11 @@ impl EditorServer {
             id: client_id,
             input_parser: ClientInputParser::new(),
             needs_full_render: true,
+            needs_terminal_setup: false,
             wait_id: None,
             cmd_token: hello.cmd_token,
+            ghostty_passthrough: hello.ghostty_passthrough,
+            last_ghostty_rects: Vec::new(),
         })
     }
 
@@ -1491,7 +1530,7 @@ impl EditorServer {
                 }
             }
             // Best-effort teardown via the non-blocking writer
-            let teardown = terminal_teardown_sequences();
+            let teardown = client_terminal_teardown(client.ghostty_passthrough);
             let _ = client.data_writer.try_write(&teardown);
             tracing::info!("Client {} disconnected", client.id);
             // Invalidate input source if that client disconnected
@@ -1600,32 +1639,63 @@ impl EditorServer {
 
         // Get the captured output
         let output = terminal.backend_mut().take_buffer();
+        let ghostty_rects: Vec<_> = editor.smarty_fresh_live_terminal_rects().collect();
 
-        if output.is_empty() && pending_sequences.is_empty() {
+        let ghostty_update_pending = self
+            .clients
+            .iter()
+            .any(|client| client.ghostty_passthrough && client.last_ghostty_rects != ghostty_rects);
+        let terminal_setup_pending = self
+            .clients
+            .iter()
+            .any(|client| client.needs_terminal_setup);
+        if output.is_empty()
+            && pending_sequences.is_empty()
+            && !ghostty_update_pending
+            && !terminal_setup_pending
+        {
             return Ok(());
         }
 
+        let setup_sequences =
+            terminal_setup_sequences(self.config.editor_config.editor.mouse_hover_enabled);
         // Broadcast to all clients via non-blocking writer threads (skip waiting clients)
         for client in &mut self.clients {
             if client.wait_id.is_some() {
                 continue;
             }
-            // Combine pending sequences and output into a single frame
-            let frame = if !pending_sequences.is_empty() && !output.is_empty() {
-                let mut combined = Vec::with_capacity(pending_sequences.len() + output.len());
-                combined.extend_from_slice(&pending_sequences);
-                combined.extend_from_slice(&output);
-                combined
-            } else if !pending_sequences.is_empty() {
-                pending_sequences.clone()
-            } else {
-                output.clone()
-            };
-
-            if !frame.is_empty() && !client.data_writer.try_write(&frame) {
-                tracing::warn!("Client {} output buffer full, dropping frame", client.id);
+            // Combine terminal mode changes, cell output, and this client's
+            // negotiated Ghostty rectangle report into one ordered frame.
+            let rects_changed =
+                client.ghostty_passthrough && client.last_ghostty_rects != ghostty_rects;
+            let rect_report = rects_changed.then(|| {
+                crate::services::terminal_modes::smarty_fresh_terminal_rects_sequence(
+                    ghostty_rects.iter().copied(),
+                )
+            });
+            let frame_len = (client.needs_terminal_setup as usize) * setup_sequences.len()
+                + pending_sequences.len()
+                + output.len()
+                + rect_report.as_ref().map_or(0, Vec::len);
+            let mut frame = Vec::with_capacity(frame_len);
+            if client.needs_terminal_setup {
+                frame.extend_from_slice(&setup_sequences);
             }
-            // Clear full render flag after sending
+            frame.extend_from_slice(&pending_sequences);
+            frame.extend_from_slice(&output);
+            if let Some(report) = rect_report.as_ref() {
+                frame.extend_from_slice(report);
+            }
+            if !frame.is_empty() {
+                if client.data_writer.try_write(&frame) {
+                    client.needs_terminal_setup = false;
+                    if rects_changed {
+                        client.last_ghostty_rects.clone_from(&ghostty_rects);
+                    }
+                } else {
+                    tracing::warn!("Client {} output buffer full, dropping frame", client.id);
+                }
+            }
             client.needs_full_render = false;
         }
 
@@ -1634,8 +1704,10 @@ impl EditorServer {
 
     /// Disconnect all clients
     fn disconnect_all_clients(&mut self, reason: &str) -> io::Result<()> {
-        let teardown = terminal_teardown_sequences();
+        // Teardown is capability-specific because only negotiated Ghostty
+        // clients receive the rectangle context terminator.
         for client in &mut self.clients {
+            let teardown = client_terminal_teardown(client.ghostty_passthrough);
             // Best-effort: client may already be disconnected
             #[allow(clippy::let_underscore_must_use)]
             let _ = client.data_writer.try_write(&teardown);
@@ -1728,6 +1800,35 @@ mod wave_dismiss_tests {
         server
     }
 
+    struct DropMarker(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn local_authority_rebuild_drops_retired_remote_keepalive() {
+        let mut server = server_with_editor("authority-keepalive");
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        server.session_keepalive = Some(Box::new(DropMarker(std::sync::Arc::clone(&dropped))));
+        let authority = crate::services::authority::Authority::local(
+            std::sync::Arc::clone(&server.workspace_trust),
+            std::sync::Arc::clone(&server.env_provider),
+        );
+
+        server
+            .rebuild_editor(None, Some(authority), None)
+            .expect("local authority rebuild");
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "retired remote keepalive must be dropped before local authority publication"
+        );
+        assert!(server.session_keepalive.is_none());
+    }
+
     /// A bracketed paste from a client must land in the focused floating-panel
     /// text field, not in the buffer obscured behind the modal — the same
     /// routing the local terminal loop applies (`Ev::Paste` in
@@ -1793,6 +1894,7 @@ mod wave_dismiss_tests {
             scrollbar_tracks: Vec::new(),
             scrollbar_mouse: Default::default(),
             scrollbar_drag_key: None,
+            last_outer_rect: None,
             last_inner_rect: None,
             scrollbar_hover_zones: Vec::new(),
             scrollbar_zone_hovered: false,

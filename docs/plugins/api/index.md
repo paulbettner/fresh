@@ -542,6 +542,17 @@ interface TsCreateCompositeBufferOptions {
 | `sources` | Source panes to display |
 | `hunks` | Optional diff hunks for line alignment |
 
+### WindowTerminalId
+
+Exact immutable identity of a terminal within its owning window.
+
+```typescript
+interface WindowTerminalId {
+  windowId: number;
+  terminalId: number;
+}
+```
+
 ### TerminalResult
 
 Result returned when creating a terminal
@@ -549,7 +560,7 @@ Result returned when creating a terminal
 ```typescript
 interface TerminalResult {
   bufferId: number;
-  terminalId: number;
+  terminalId: WindowTerminalId;
   splitId: number | null;
 }
 ```
@@ -557,7 +568,7 @@ interface TerminalResult {
 | Field | Description |
 |-------|-------------|
 | `bufferId` | The created buffer ID (for use with `setSplitBuffer`, etc.) |
-| `terminalId` | The terminal ID (for use with `sendTerminalInput`, `closeTerminal`) |
+| `terminalId` | Exact window-owned terminal identity (for use with `sendTerminalInput`, `sendOmpCompanionCommand`, and `closeTerminal`) |
 | `splitId` | The split ID (if created in a new split) |
 
 ### CreateTerminalOptions
@@ -589,16 +600,26 @@ Snapshot of one session as returned by `listWindows`.
 ```typescript
 interface WindowInfo {
   id: number;
+  stable_id: string;
   label: string;
   root: string;
+  project_path: string;
+  shared_worktree?: boolean;
+  selectedAgentTerminalId?: WindowTerminalId;
+  remote?: RemoteBackendInfo | null;
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `id` | Stable session identifier (the base session is always `1`) |
+| `id` | Process-local session identifier (the base session is always `1`) |
+| `stable_id` | Durable workspace identity that survives restarts and relabels |
 | `label` | User-visible label |
-| `root` | Absolute path of the session's project root |
+| `root` | Absolute path of the session's workspace root |
+| `project_path` | Canonical project/repository root this session belongs to |
+| `shared_worktree` | Whether this session shares its working tree with other sessions |
+| `selectedAgentTerminalId` | Exact live terminal selected as this session's agent; omitted while the durable selection is exited or unavailable |
+| `remote` | Remote backend identity and connection state, when the session uses one |
 
 ### ActionSpecJs
 

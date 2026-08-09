@@ -74,6 +74,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 
+const BUNDLED_ORCHESTRATOR_MARKER: &str = ".fresh-test-use-bundled-orchestrator";
+
 /// Copy a plugin and its i18n file (if exists) from the main plugins directory to a test plugins directory.
 ///
 /// # Arguments
@@ -88,6 +90,10 @@ use tempfile::TempDir;
 /// copy_plugin(&plugins_dir, "todo_highlighter");
 /// ```
 pub fn copy_plugin(plugins_dir: &Path, plugin_name: &str) {
+    if plugin_name == "orchestrator" {
+        fs::write(plugins_dir.join(BUNDLED_ORCHESTRATOR_MARKER), []).unwrap();
+        return;
+    }
     // Use CARGO_MANIFEST_DIR to find plugins regardless of current working directory
     let source_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
 
@@ -130,6 +136,9 @@ fn mirror_plugins_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        if entry.file_name() == BUNDLED_ORCHESTRATOR_MARKER {
+            continue;
+        }
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         if src_path.is_dir() {
@@ -725,6 +734,9 @@ impl EditorTestHarness {
         // the pre-#1722 behavior, where any `working_dir/plugins/` (even
         // empty) suppressed embedded loading.
         t.phase("grammar_registry");
+        let use_bundled_orchestrator = working_plugins_path
+            .join(BUNDLED_ORCHESTRATOR_MARKER)
+            .is_file();
 
         if working_plugins_populated {
             let target = dir_context.config_dir.join("plugins");
@@ -734,7 +746,8 @@ impl EditorTestHarness {
         // Embedded loads only when the test isn't taking control. The
         // `force_embedded_plugins` escape hatch overrides this for tests
         // that need production plugin-loading semantics (see #1722).
-        let enable_embedded_plugins = options.force_embedded_plugins || !user_controls_plugins;
+        let enable_embedded_plugins =
+            options.force_embedded_plugins || use_bundled_orchestrator || !user_controls_plugins;
 
         // Create editor
         let mut editor = Editor::for_test(

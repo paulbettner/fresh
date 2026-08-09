@@ -88,6 +88,8 @@ pub struct EnvProvider {
     /// in this env (no post-boot `setEnv` → restart flicker, issue #2280).
     /// `None` for placeholder / non-persistent providers (remote stubs, tests).
     store: RwLock<Option<EnvStore>>,
+    /// Whether recipe caches may inspect env-input files on this host.
+    local_input_scans: bool,
 }
 
 impl EnvProvider {
@@ -101,6 +103,7 @@ impl EnvProvider {
                 delta_cache: None,
             }),
             store: RwLock::new(None),
+            local_input_scans: true,
         }
     }
 
@@ -115,6 +118,12 @@ impl EnvProvider {
         let p = Self::inactive();
         p.set_store(Some(EnvStore::for_project_dir(project_state_dir)), trusted);
         p
+    }
+    pub fn for_remote_session(project_state_dir: &Path, trusted: bool) -> Self {
+        let mut provider = Self::inactive();
+        provider.local_input_scans = false;
+        provider.set_store(Some(EnvStore::for_project_dir(project_state_dir)), trusted);
+        provider
     }
 
     /// Attach (or replace) the recipe store. When `trusted` and the store has
@@ -210,11 +219,13 @@ impl EnvProvider {
             return Vec::new();
         }
 
-        let hash = inputs_hash(dir.as_deref());
-        if let Ok(s) = self.state.read() {
-            if let Some(c) = &s.cache {
-                if c.inputs_hash == hash {
-                    return c.vars.clone();
+        let hash = self.local_input_scans.then(|| inputs_hash(dir.as_deref()));
+        if let Some(hash) = hash {
+            if let Ok(s) = self.state.read() {
+                if let Some(c) = &s.cache {
+                    if c.inputs_hash == hash {
+                        return c.vars.clone();
+                    }
                 }
             }
         }
@@ -225,11 +236,13 @@ impl EnvProvider {
         };
         let vars = parse_env(&stdout);
 
-        if let Ok(mut s) = self.state.write() {
-            s.cache = Some(Cached {
-                inputs_hash: hash,
-                vars: vars.clone(),
-            });
+        if let Some(hash) = hash {
+            if let Ok(mut s) = self.state.write() {
+                s.cache = Some(Cached {
+                    inputs_hash: hash,
+                    vars: vars.clone(),
+                });
+            }
         }
         vars
     }
@@ -264,6 +277,9 @@ impl EnvProvider {
     /// raw spawn that does not apply this provider's env, or capture would
     /// recurse.
     fn capture_delta_blocking(&self, run: impl FnOnce(String) -> Option<String>) -> EnvDelta {
+        if !self.local_input_scans {
+            return EnvDelta::default();
+        }
         let (snippet, dir) = match self.state.read() {
             Ok(s) => (s.snippet.clone(), s.dir.clone()),
             Err(_) => return EnvDelta::default(),
@@ -612,6 +628,44 @@ mod tests {
         let v2 = p.current(|_s| run()).await;
         assert_eq!(v2, v1);
         assert_eq!(calls.get(), 1, "cache should prevent a second capture");
+    }
+
+    #[tokio::test]
+    async fn remote_session_never_uses_host_input_cache_or_local_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let remote_root = tmp.path().join("looks-remote");
+        std::fs::create_dir_all(&remote_root).unwrap();
+        std::fs::write(remote_root.join(".envrc"), "export TENANT=host\n").unwrap();
+        let provider = EnvProvider::for_remote_session(&state_dir, true);
+        provider.set("remote-activate".into(), Some(remote_root));
+
+        let calls = std::cell::Cell::new(0);
+        for value in ["one", "two"] {
+            let vars = provider
+                .current(|_| {
+                    calls.set(calls.get() + 1);
+                    async move { Some(format!("TENANT={value}\n")) }
+                })
+                .await;
+            assert_eq!(vars, vec![("TENANT".to_string(), value.to_string())]);
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "remote capture must run on its carrier each time"
+        );
+
+        let local_shell_ran = std::cell::Cell::new(false);
+        let delta = provider.capture_delta_blocking(|_| {
+            local_shell_ran.set(true);
+            Some(String::new())
+        });
+        assert_eq!(delta, EnvDelta::default());
+        assert!(
+            !local_shell_ran.get(),
+            "remote env must never spawn the host shell"
+        );
     }
 
     #[tokio::test]

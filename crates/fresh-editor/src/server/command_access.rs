@@ -26,17 +26,15 @@
 //! from a v4 UUID); it is not a secret from the user themselves.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::app::Editor;
 
 /// What a capability token is permitted to do.
 #[derive(Debug, Clone, Default)]
 pub struct Grant {
-    /// The window/workspace this token drives. A script is evaluated with this
-    /// window made active (derived from the token, never supplied by the
-    /// client), so a token starts out pointed at its own workspace. `None` =
-    /// not pinned to a window (falls back to the active one).
+    /// The window/workspace this token drives. Script-capable grants must be
+    /// pinned; an absent id is refused rather than inheriting mutable focus.
     pub window_id: Option<u64>,
     /// Whether this token may evaluate scripts. `false` — the default — refuses
     /// `RunScript` outright, which is what a token minted for a workspace whose
@@ -108,6 +106,78 @@ fn completions() -> &'static Mutex<Vec<QueuedOutcome>> {
     COMPLETED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+#[derive(Clone)]
+struct PendingScript {
+    plugin_name: String,
+    plugin_instance_id: fresh_core::api::PluginInstanceId,
+    window_id: fresh_core::WindowId,
+    authority: fresh_core::api::AuthorityStamp,
+}
+
+static PENDING_SCRIPTS: LazyLock<Mutex<HashMap<u64, PendingScript>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn pending_scripts() -> &'static Mutex<HashMap<u64, PendingScript>> {
+    &PENDING_SCRIPTS
+}
+/// Accept an agent-script completion only from the exact loader-created
+/// plugin instance and source window registered for this request. Returns the
+/// ephemeral plugin name that is now safe to unload.
+pub fn complete_agent_script(
+    context: &fresh_core::api::PluginCommandContext,
+    request_id: u64,
+    current_authority: Option<fresh_core::api::AuthorityStamp>,
+    ok: bool,
+    output: Option<String>,
+    error: Option<String>,
+) -> Option<String> {
+    if context.agent_script_request_id() != Some(request_id) {
+        return None;
+    }
+    let mut pending = pending_scripts().lock().ok()?;
+    let expected = pending.get(&request_id)?.clone();
+    if expected.plugin_name.as_str() != context.plugin_name.as_ref()
+        || expected.plugin_instance_id != context.plugin_instance_id
+        || Some(expected.window_id) != context.window_scope
+        || Some(expected.window_id) != context.source_window
+        || Some(expected.authority) != context.source_authority
+    {
+        return None;
+    }
+    pending.remove(&request_id)?;
+    drop(pending);
+    if current_authority != Some(expected.authority) {
+        complete(
+            request_id,
+            false,
+            None,
+            Some("script source authority changed before completion".to_string()),
+        );
+    } else {
+        complete(request_id, ok, output, error);
+    }
+    Some(expected.plugin_name)
+}
+
+/// Settle a script whose loader failed before its wrapper could answer. A
+/// stale monitor from another instance cannot settle the current request.
+pub fn fail_pending_script(
+    request_id: u64,
+    plugin_instance_id: fresh_core::api::PluginInstanceId,
+    error: String,
+) {
+    let removed = pending_scripts().lock().ok().and_then(|mut pending| {
+        (pending
+            .get(&request_id)
+            .is_some_and(|expected| expected.plugin_instance_id == plugin_instance_id))
+        .then(|| pending.remove(&request_id))
+        .flatten()
+    });
+    if removed.is_some() {
+        complete(request_id, false, None, Some(error));
+    }
+}
+
 /// Allocate the id that ties a running script to the caller waiting on it.
 /// Process-wide and monotonic; ids are never reused within a run.
 fn next_request_id() -> u64 {
@@ -116,9 +186,8 @@ fn next_request_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Record a settled script. Called from the editor thread when the plugin
-/// runtime reports the script's return value (or its failure).
-pub fn complete(request_id: u64, ok: bool, output: Option<String>, error: Option<String>) {
+/// Record a completion after its exact pending plugin instance was verified.
+fn complete(request_id: u64, ok: bool, output: Option<String>, error: Option<String>) {
     if let Ok(mut done) = completions().lock() {
         done.push(QueuedOutcome {
             outcome: CommandOutcome {
@@ -274,11 +343,10 @@ const FRESH_WINDOW_ID = {window_id};
 /// token is unknown/expired, or the grant doesn't include script access.
 ///
 /// The script is evaluated as an ephemeral plugin — its own QuickJS context,
-/// named for the request so two concurrent scripts can't collide or read each
-/// other's globals. It is deliberately never unloaded: unloading runs the
-/// plugin-cleanup path, which sends compensating commands that would tear down
-/// the very things a script is usually run to create (a terminal, a workspace).
-/// Run-and-forget is what makes the created state outlive the caller.
+/// named for the request so two concurrent scripts cannot collide or read each
+/// other's globals. Once the request settles, the editor queues that context
+/// for unload. Durable editor-owned objects such as terminals remain; plugin
+/// callbacks and other executable authority do not outlive the request.
 pub fn run_script(
     editor: Option<&mut Editor>,
     token: Option<&str>,
@@ -295,25 +363,47 @@ pub fn run_script(
     if !grant.may_script {
         return CommandDispatch::refused("this workspace's agent was not granted editor control");
     }
+    let Some(window_id) = grant.window_id else {
+        return CommandDispatch::refused("capability token is not bound to a window");
+    };
     let Some(editor) = editor else {
         return CommandDispatch::refused("editor unavailable");
     };
-
-    // Point the editor at the token's own window before the script's first
-    // statement. `set_active_window` is a no-op for an unknown id, so an
-    // already-torn-down window falls back to the currently active one.
-    if let Some(wid) = grant.window_id {
-        editor.set_active_window(fresh_core::WindowId(wid));
-    }
-    let window_id = grant
-        .window_id
-        .unwrap_or_else(|| editor.active_window_id().0);
-
+    let window_id = fresh_core::WindowId(window_id);
+    let Some(authority) = editor.plugin_authority_stamp(window_id) else {
+        return CommandDispatch::refused("the capability's window is no longer available");
+    };
     let request_id = next_request_id();
-    let wrapped = wrap_script(source, request_id, window_id);
-    match editor.eval_agent_script(&wrapped, request_id) {
+    let plugin_instance_id = fresh_core::api::PluginInstanceId::fresh();
+    let plugin_name = format!("agent-script-{request_id}");
+    if let Ok(mut pending) = pending_scripts().lock() {
+        pending.insert(
+            request_id,
+            PendingScript {
+                plugin_name,
+                plugin_instance_id,
+                window_id,
+                authority,
+            },
+        );
+    } else {
+        return CommandDispatch::refused("script completion registry unavailable");
+    }
+    let wrapped = wrap_script(source, request_id, window_id.0);
+    match editor.eval_agent_script(
+        &wrapped,
+        request_id,
+        plugin_instance_id,
+        window_id,
+        authority,
+    ) {
         Ok(()) => CommandDispatch::Pending { request_id },
-        Err(e) => CommandDispatch::refused(e),
+        Err(error) => {
+            if let Ok(mut pending) = pending_scripts().lock() {
+                pending.remove(&request_id);
+            }
+            CommandDispatch::refused(error)
+        }
     }
 }
 
@@ -428,6 +518,14 @@ mod tests {
         revoke(&token);
     }
 
+    #[test]
+    fn run_script_requires_a_window_bound_grant() {
+        let token = mint(Grant::new(None, true));
+        let reason = refusal_reason(run_script(None, Some(&token), "return 1;"));
+        assert!(reason.contains("not bound to a window"), "{}", reason);
+        revoke(&token);
+    }
+
     /// An outcome reported by the plugin runtime is picked up exactly once by
     /// the host that owns the request — a second drain must not re-deliver it
     /// (which would write a stray reply to an unrelated client).
@@ -476,6 +574,52 @@ mod tests {
             1,
             "the other host's outcome must still be waiting for it"
         );
+    }
+
+    #[test]
+    fn authority_replacement_rejects_agent_script_completion() {
+        let request_id = u64::MAX - 19;
+        let plugin_name = format!("agent-script-{request_id}");
+        let plugin_instance_id = fresh_core::api::PluginInstanceId::fresh();
+        let window_id = fresh_core::WindowId(7);
+        let authority = fresh_core::api::AuthorityStamp {
+            id: 4,
+            generation: 2,
+        };
+        pending_scripts().lock().unwrap().insert(
+            request_id,
+            PendingScript {
+                plugin_name: plugin_name.clone(),
+                plugin_instance_id,
+                window_id,
+                authority,
+            },
+        );
+        let context = fresh_core::api::PluginCommandContext {
+            plugin_name: plugin_name.clone().into(),
+            plugin_instance_id,
+            provenance: fresh_core::api::PluginLoadProvenance::AgentScript { request_id },
+            source_window: Some(window_id),
+            source_authority: Some(authority),
+            window_scope: Some(window_id),
+            ..fresh_core::api::PluginCommandContext::default()
+        };
+
+        let replaced = fresh_core::api::AuthorityStamp {
+            id: authority.id,
+            generation: authority.generation + 1,
+        };
+        assert_eq!(
+            complete_agent_script(&context, request_id, Some(replaced), true, None, None),
+            Some(plugin_name)
+        );
+        let outcomes = take_completed_where(|id| id == request_id);
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].ok);
+        assert!(outcomes[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("authority changed")));
     }
 
     /// An outcome older than the retention window is reaped by the next scan,

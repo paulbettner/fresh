@@ -16,6 +16,7 @@ serde_json.workspace = true
 jsonc-parser.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+sha2 = "0.10"
 tracing.workspace = true
 fresh-core = { workspace = true, features = ["plugins"] }
 fresh-parser-js.workspace = true

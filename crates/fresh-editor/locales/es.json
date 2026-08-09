@@ -1554,6 +1554,8 @@
   "whitespace.already_has_newline": "El archivo ya termina con nueva línea",
   "workspace.extract_no_file_path": "No se puede extraer: el búfer no tiene ruta de archivo",
   "workspace.extract_terminal_dormant": "No se puede extraer: el terminal no tiene una sesión activa",
+  "workspace.extract_terminal_companion": "No se puede extraer: los terminales complementarios de OMP deben permanecer en su espacio de trabajo",
+  "workspace.extract_terminal_script_capable": "No se puede extraer: los terminales con acceso a scripts deben permanecer en su espacio de trabajo",
   "workspace.extract_already_rooted": "Ya está en un espacio de trabajo con raíz en %{root}",
   "workspace.extracted_tab": "%{name} extraído al espacio %{label}",
   "whitespace.newline_added": "Nueva línea final añadida",

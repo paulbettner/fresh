@@ -1,6 +1,13 @@
 /// <reference path="./lib/fresh.d.ts" />
 
-import { Finder, FilterSource, defaultFuzzyFilter, DisplayEntry } from "./lib/finder.ts";
+import {
+  defaultFuzzyFilter,
+  DisplayEntry,
+  FilterSource,
+  Finder,
+} from "./lib/finder.ts";
+
+const editor = getEditor();
 
 interface SymbolItem {
   name: string;
@@ -123,11 +130,20 @@ function navigateToSymbol(
 
   clearOverlay(bufferId);
   if (mode === "preview") {
-    editor.addOverlay(bufferId, OVERLAY_NS, pos, pos + sym.name.length, MATCH_STYLE);
+    editor.addOverlay(
+      bufferId,
+      OVERLAY_NS,
+      pos,
+      pos + sym.name.length,
+      MATCH_STYLE,
+    );
   }
 }
 
-async function loadSymbols(filePath: string, language: string): Promise<SymbolItem[]> {
+async function loadSymbols(
+  filePath: string,
+  language: string,
+): Promise<SymbolItem[]> {
   try {
     const uri = editor.pathToFileUri(filePath);
     const result = await editor.sendLspRequest(
@@ -218,7 +234,9 @@ function buildSnippetSpans(sym: SymbolItem): StyledText[] | undefined {
 }
 
 function format(sym: SymbolItem): DisplayEntry {
-  const trimmed = sym.lineText ? sym.lineText.trim() : `line ${sym.nameLine + 1}`;
+  const trimmed = sym.lineText
+    ? sym.lineText.trim()
+    : `line ${sym.nameLine + 1}`;
   return {
     label: `[${getKindLabel(sym.kind)}] ${sym.name}`,
     description: trimmed,
@@ -226,7 +244,10 @@ function format(sym: SymbolItem): DisplayEntry {
   };
 }
 
-function findMatchingSymbolIndex(symbols: SymbolItem[], cursorLine: number): number {
+function findMatchingSymbolIndex(
+  symbols: SymbolItem[],
+  cursorLine: number,
+): number {
   let bestIdx = -1;
   let bestSpan = Number.MAX_SAFE_INTEGER;
   let bestStartLine = Number.MAX_SAFE_INTEGER;
@@ -239,7 +260,8 @@ function findMatchingSymbolIndex(symbols: SymbolItem[], cursorLine: number): num
       if (
         span < bestSpan ||
         (span === bestSpan && sym.startLine < bestStartLine) ||
-        (span === bestSpan && sym.startLine === bestStartLine && sym.nameCharacter < bestStartChar)
+        (span === bestSpan && sym.startLine === bestStartLine &&
+          sym.nameCharacter < bestStartChar)
       ) {
         bestIdx = i;
         bestSpan = span;
@@ -369,7 +391,9 @@ function parseSymbols(result: unknown): SymbolItem[] {
           startLine = typeof start.line === "number" ? start.line : 0;
           endLine = typeof end.line === "number" ? end.line : startLine;
           nameLine = startLine;
-          nameCharacter = typeof start.character === "number" ? start.character : 0;
+          nameCharacter = typeof start.character === "number"
+            ? start.character
+            : 0;
         }
       } else {
         // Hierarchical DocumentSymbol: `range` is the full extent,
@@ -382,13 +406,17 @@ function parseSymbols(result: unknown): SymbolItem[] {
           startLine = typeof start.line === "number" ? start.line : 0;
           endLine = typeof end.line === "number" ? end.line : startLine;
           nameLine = startLine;
-          nameCharacter = typeof start.character === "number" ? start.character : 0;
+          nameCharacter = typeof start.character === "number"
+            ? start.character
+            : 0;
         }
         if ("selectionRange" in raw && typeof raw.selectionRange === "object") {
           const selectionRange = raw.selectionRange as Record<string, unknown>;
           const start = selectionRange.start as Record<string, unknown>;
           nameLine = typeof start.line === "number" ? start.line : nameLine;
-          nameCharacter = typeof start.character === "number" ? start.character : nameCharacter;
+          nameCharacter = typeof start.character === "number"
+            ? start.character
+            : nameCharacter;
         }
       }
 

@@ -1272,16 +1272,10 @@ fn wait_for_explicit_value_changes_the_cutoff() {
 /// `status.parse_failed` (`"devcontainer.json could not be
 /// parsed"`) message ever surfaces.
 ///
-/// Root cause of the regression: the QuickJS `readFile` binding
-/// returns JS `undefined` (not `null`) for a missing file, but
-/// `findConfig`'s discovery guards used strict `!== null`. Because
-/// `undefined !== null` is true, the `undefined` content slipped
-/// into `parseJsonc`, which threw
-/// `Error converting from js 'undefined' into type 'string'`. That
-/// throw was caught by `tryParse`, set `lastParseError`, and — on
-/// the "no config found" branch — got surfaced to the status bar
-/// on every launch. The fix loosens the guards to `!= null` so
-/// both `null` and `undefined` are excluded.
+/// Root cause of the regression was the QuickJS `readFile` binding returning
+/// JavaScript `undefined` despite its declared `string | null` contract. The
+/// devcontainer discovery guards now reject either nullish value, and the
+/// runtime binding itself returns `null` for a missing file.
 ///
 /// This asserts the observable contract: after the plugin inits in
 /// a config-less workspace, the parse-failure marker must never
@@ -1318,8 +1312,6 @@ fn no_devcontainer_config_does_not_surface_parse_error() {
     assert!(
         !screen.contains("could not be parsed"),
         "G8 (#2709): with no devcontainer config present, the plugin \
-         must not surface a parse error. `readFile` returns `undefined` \
-         for a missing file and the `findConfig` guards must exclude it. \
-         Screen:\n{screen}"
+         must not surface a parse error for a missing file. Screen:\n{screen}"
     );
 }

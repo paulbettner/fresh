@@ -121,6 +121,41 @@ pub fn smarty_fresh_ghostty_passthrough_enabled() -> bool {
     std::env::var_os(SMARTY_FRESH_GHOSTTY_ENV).is_some()
 }
 
+fn write_smarty_fresh_terminal_rects<W, I>(mut out: W, rects: I) -> std::io::Result<()>
+where
+    W: Write,
+    I: IntoIterator<Item = ratatui::layout::Rect>,
+{
+    let mut rects = rects.into_iter().peekable();
+    if rects.peek().is_none() {
+        return write!(
+            out,
+            "\x1b]3008;end={SMARTY_FRESH_TERMINAL_RECTS_CONTEXT}\x1b\\"
+        );
+    }
+    write!(
+        out,
+        "\x1b]3008;start={SMARTY_FRESH_TERMINAL_RECTS_CONTEXT};rects="
+    )?;
+    for (index, rect) in rects.enumerate() {
+        if index > 0 {
+            out.write_all(b"|")?;
+        }
+        write!(out, "{},{},{},{}", rect.x, rect.y, rect.width, rect.height)?;
+    }
+    out.write_all(b"\x1b\\")
+}
+
+pub(crate) fn smarty_fresh_terminal_rects_sequence<I>(rects: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = ratatui::layout::Rect>,
+{
+    let mut output = Vec::new();
+    write_smarty_fresh_terminal_rects(&mut output, rects)
+        .expect("writing a Ghostty rectangle report to memory cannot fail");
+    output
+}
+
 /// Tracks which terminal modes have been enabled and provides cleanup.
 ///
 /// Use `TerminalModes::enable()` to set up the terminal, then call `undo()`
@@ -256,26 +291,9 @@ impl TerminalModes {
             return Ok(());
         }
 
-        let rects: Vec<_> = rects.into_iter().take(8).collect();
+        let report = smarty_fresh_terminal_rects_sequence(rects);
         let mut out = stdout().lock();
-        if rects.is_empty() {
-            write!(
-                out,
-                "\x1b]3008;end={SMARTY_FRESH_TERMINAL_RECTS_CONTEXT}\x1b\\"
-            )?;
-        } else {
-            write!(
-                out,
-                "\x1b]3008;start={SMARTY_FRESH_TERMINAL_RECTS_CONTEXT};rects="
-            )?;
-            for (index, rect) in rects.iter().enumerate() {
-                if index > 0 {
-                    out.write_all(b"|")?;
-                }
-                write!(out, "{},{},{},{}", rect.x, rect.y, rect.width, rect.height)?;
-            }
-            out.write_all(b"\x1b\\")?;
-        }
+        out.write_all(&report)?;
         out.flush()
     }
 
@@ -431,4 +449,21 @@ pub fn emergency_cleanup() {
 
     // Flush stdout
     let _ = stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_rect_protocol_keeps_every_live_terminal() {
+        let rects: Vec<_> = (0..9)
+            .map(|x| ratatui::layout::Rect::new(x, 1, 1, 2))
+            .collect();
+        let mut bytes = Vec::new();
+        write_smarty_fresh_terminal_rects(&mut bytes, rects).unwrap();
+        let message = String::from_utf8(bytes).unwrap();
+        assert_eq!(message.matches('|').count(), 8);
+        assert!(message.contains("8,1,1,2"));
+    }
 }

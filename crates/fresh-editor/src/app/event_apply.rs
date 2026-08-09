@@ -768,10 +768,8 @@ impl Editor {
             #[cfg(feature = "plugins")]
             self.update_plugin_state_snapshot();
 
-            self.plugin_manager
-                .read()
-                .unwrap()
-                .run_hook(hook_name, args.clone());
+            let owner = self.active_window;
+            self.run_plugin_hook_for_window(owner, hook_name, args.clone());
         }
 
         // Cursor movement needs NO refresh here: cursor-dependent conceals

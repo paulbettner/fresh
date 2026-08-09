@@ -1355,29 +1355,29 @@ createTerminal(opts?: CreateTerminalOptions): Promise<TerminalResult>
 
 ### `sendTerminalInput`
 
-Send input data to a terminal by its terminal ID.
+Send input data to one exact window-owned terminal.
 
 ```typescript
-sendTerminalInput(terminalId: number, data: string): boolean
+sendTerminalInput(terminalId: WindowTerminalId, data: string): boolean
 ```
 
 **Parameters:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `terminalId` | `number` | The terminal ID (from `TerminalResult`) |
+| `terminalId` | `WindowTerminalId` | Exact terminal identity returned by `TerminalResult` |
 | `data` | `string` | Data to write to the terminal PTY (UTF-8 string, may include escape sequences) |
 
 ### `closeTerminal`
 
-Close a terminal by its terminal ID.
+Close one exact window-owned terminal.
 
 ```typescript
-closeTerminal(terminalId: number): boolean
+closeTerminal(terminalId: WindowTerminalId): boolean
 ```
 
 **Parameters:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `terminalId` | `number` | The terminal ID to close |
+| `terminalId` | `WindowTerminalId` | Exact terminal identity to close |

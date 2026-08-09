@@ -81,6 +81,12 @@ lto = "fat"
 codegen-units = 1
 opt-level = "z"
 
+# Rust 1.95 on Darwin 27 otherwise produces an unusable release artifact for
+# `rquickjs-macro`, and `rquickjs` fails with E0463. Keep only this build-time
+# crate unstripped; the shipped Fresh binary retains the normal release profile.
+[profile.release.package.rquickjs-macro]
+strip = "none"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

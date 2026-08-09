@@ -150,12 +150,15 @@ fn create_terminal_targets_inactive_session_via_session_id() {
             ratio: None,
             focus: None,
             persistent: false,
-            window_id: Some(alpha),
+            window_id: alpha,
             command: None,
+            relaunch: None,
             title: None,
             resume: None,
             env: None,
+            companion: None,
             allow_script: false,
+            selected_agent: false,
             request_id: 9999,
         })
         .unwrap();
@@ -193,6 +196,43 @@ fn create_terminal_targets_inactive_session_via_session_id() {
             .buffers
             .has_splits(),
         "alpha's split stash should be seeded with the terminal's leaf"
+    );
+}
+
+#[test]
+fn create_terminal_rejects_a_stale_explicit_session_id() {
+    use fresh_core::api::PluginCommand;
+
+    let mut harness = EditorTestHarness::with_temp_project(80, 24).unwrap();
+    let active_before = harness.editor().active_session_id();
+    let buffer_count_before = harness.editor().active_window().buffers.len();
+
+    harness
+        .editor_mut()
+        .handle_plugin_command(PluginCommand::CreateTerminal {
+            cwd: None,
+            direction: None,
+            ratio: None,
+            focus: None,
+            persistent: false,
+            window_id: WindowId(u64::MAX),
+            command: None,
+            relaunch: None,
+            title: None,
+            resume: None,
+            env: None,
+            companion: None,
+            allow_script: false,
+            selected_agent: false,
+            request_id: 10_001,
+        })
+        .unwrap();
+
+    assert_eq!(harness.editor().active_session_id(), active_before);
+    assert_eq!(
+        harness.editor().active_window().buffers.len(),
+        buffer_count_before,
+        "a stale explicit target must not fall back to the active session",
     );
 }
 

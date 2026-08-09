@@ -224,22 +224,19 @@ fn extract_tab_on_unsaved_buffer_reports_no_path() {
     harness.assert_screen_contains("Cannot extract: buffer has no file path");
 }
 
-/// The extracted workspace inherits the source workspace's authority
-/// *configuration* (its backend spec) rather than being silently downgraded
-/// to a plain local backend. A `Plugin` (devcontainer/docker) spec is used as
-/// the non-local marker: it makes `authority_spec.is_remote()` true, and its
-/// reconnect is the owning plugin's job so core's reconnect-on-activate is a
-/// no-op — no live connection is attempted in the test.
+/// Remote authority is a hard boundary: extraction must not create a
+/// co-tenant or touch the source buffer/split state.
 #[test]
-fn extract_inherits_source_workspace_authority_spec() {
+fn extract_remote_source_is_rejected_without_mutation() {
     use fresh::services::authority::{
         AuthorityPayload, FilesystemSpec, SessionAuthoritySpec, SpawnerSpec, TerminalWrapperSpec,
     };
 
     let mut harness = harness_with_subproject_file();
-
-    // Give the source window a non-local backend spec (its live authority
-    // stays the local placeholder — only the persisted config is remote).
+    harness.type_text("REMOTE EDIT ").unwrap();
+    let source_id = harness.editor().active_window_id();
+    let source_buffer = harness.editor().active_buffer_id();
+    let source_buffer_count = harness.editor().active_window().buffers.len();
     let source_spec = SessionAuthoritySpec::Plugin(AuthorityPayload {
         filesystem: FilesystemSpec::Local,
         spawner: SpawnerSpec::Local,
@@ -247,39 +244,32 @@ fn extract_inherits_source_workspace_authority_spec() {
         display_label: "test-container".to_string(),
         path_translation: None,
     });
-    let source_id = harness.editor().active_window_id();
     harness
         .editor_mut()
         .set_session_authority_spec(source_id, source_spec.clone());
 
-    // Extract the focused tab into a co-tenant over the same project root.
-    let bid = harness.editor().active_buffer();
-    harness.editor_mut().extract_tab_to_new_workspace(bid);
+    harness
+        .editor_mut()
+        .extract_tab_to_new_workspace(source_buffer);
     harness.render().unwrap();
-    harness.assert_screen_contains("into workspace project_root (2)");
 
-    // The extraction landed in a new window whose authority config matches the
-    // source — not a downgraded `Local`.
-    let target_id = harness.editor().active_window_id();
-    assert_ne!(
-        target_id, source_id,
-        "extraction should land in a distinct new window"
-    );
-    let target_spec = harness
-        .editor()
-        .session(target_id)
-        .expect("target window exists")
-        .authority_spec
-        .clone();
+    assert_eq!(harness.editor().session_count(), 1);
+    assert_eq!(harness.editor().active_window_id(), source_id);
+    assert_eq!(harness.editor().active_buffer_id(), source_buffer);
     assert_eq!(
-        target_spec, source_spec,
-        "extracted workspace must inherit the source's authority configuration, \
-         not downgrade to Local"
+        harness.editor().active_window().buffers.len(),
+        source_buffer_count
     );
-    assert!(
-        target_spec.is_remote(),
-        "sanity: the inherited spec must be the non-local one we set"
+    assert_eq!(
+        harness
+            .editor()
+            .session(source_id)
+            .expect("source window remains")
+            .authority_spec,
+        source_spec,
     );
+    harness.assert_screen_contains("Cannot extract: source workspace is not local");
+    harness.assert_screen_contains("REMOTE EDIT notes");
 }
 
 // ── Terminal tab coverage ────────────────────────────────────────────────────
@@ -332,6 +322,22 @@ fn extract_terminal_tab_moves_live_terminal_to_co_tenant() {
     harness.editor_mut().open_terminal();
     harness.render().unwrap();
     harness.assert_screen_contains("*Terminal 0*");
+    let source_stable_id = harness.editor().active_window().stable_id.clone();
+    let source_terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(harness.editor().active_buffer_id())
+        .unwrap();
+    let source_pid = harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .get(source_terminal_id)
+        .and_then(|terminal| terminal.pid());
+    let source_backing =
+        harness.editor().active_window().terminal_backing_files[&source_terminal_id].clone();
+    let source_history =
+        harness.editor().active_window().terminal_history_files[&source_terminal_id].clone();
 
     // A live marker so we can prove the *same* shell keeps running after the
     // move (the echoed input line never resolves the arithmetic).
@@ -340,6 +346,7 @@ fn extract_terminal_tab_moves_live_terminal_to_co_tenant() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.wait_for_screen_contains("PRE2").unwrap();
+    let source_window_id = harness.editor().active_window_id();
 
     // The palette is reachable from terminal mode (Ctrl+P bypasses PTY
     // capture) and the command is available in the Terminal context.
@@ -349,6 +356,64 @@ fn extract_terminal_tab_moves_live_terminal_to_co_tenant() {
         .unwrap();
     // Rooted at the same project — a co-tenant, not the shell's cwd.
     assert_eq!(harness.editor().active_window().root, source_root);
+    let target_stable_id = harness.editor().active_window().stable_id.clone();
+    let target_terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(harness.editor().active_buffer_id())
+        .unwrap();
+    let target_backing =
+        harness.editor().active_window().terminal_backing_files[&target_terminal_id].clone();
+    let target_history =
+        harness.editor().active_window().terminal_history_files[&target_terminal_id].clone();
+    assert_ne!(source_stable_id, target_stable_id);
+    assert_ne!(source_backing, target_backing);
+    assert_eq!(
+        target_backing.parent().and_then(|path| path.file_name()),
+        Some(std::ffi::OsStr::new(target_stable_id.as_str())),
+        "the extracted co-tenant must own a stable-id-namespaced transcript",
+    );
+    assert_ne!(source_backing.parent(), target_backing.parent());
+    assert_ne!(source_history, target_history);
+    assert_eq!(
+        target_history.parent().and_then(|path| path.file_name()),
+        Some(std::ffi::OsStr::new(target_stable_id.as_str())),
+        "the extracted co-tenant must own its append-only terminal history",
+    );
+
+    let persisted_target = fresh::workspace::Workspace::load_by_id_in(
+        harness.editor().dir_context(),
+        &source_root,
+        &target_stable_id,
+    )
+    .unwrap()
+    .expect("extraction publishes the target workspace");
+    let persisted_terminal = persisted_target
+        .terminals
+        .first()
+        .expect("extracted target persists its terminal");
+    let generation = persisted_terminal
+        .checkpoint_generation
+        .as_deref()
+        .expect("extraction preserves the exact checkpoint generation");
+    assert!(persisted_terminal.backing_path.exists());
+    assert_ne!(persisted_terminal.backing_path, target_backing);
+    assert_eq!(
+        persisted_terminal
+            .backing_path
+            .parent()
+            .and_then(|path| path.file_name()),
+        Some(std::ffi::OsStr::new(target_stable_id.as_str())),
+        "the immutable checkpoint must move into the target namespace",
+    );
+    assert!(
+        persisted_terminal
+            .backing_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&format!("checkpoint-{generation}.txt"))),
+        "the committed checkpoint path must match its generation",
+    );
 
     // The PTY moved live: it still runs, has terminal focus in the new
     // workspace, and its (retagged) output streams into this window.
@@ -356,16 +421,247 @@ fn extract_terminal_tab_moves_live_terminal_to_co_tenant() {
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
+    assert_eq!(
+        harness
+            .editor()
+            .active_window()
+            .terminal_manager
+            .get(target_terminal_id)
+            .and_then(|terminal| terminal.pid()),
+        source_pid,
+        "extraction must retain the live terminal process, not respawn it",
+    );
     harness.wait_for_screen_contains("LIVE5").unwrap();
 
     // Back in the source window: the terminal tab is gone, keep.txt stayed.
     run_command_palette(&mut harness, "Next Window");
+    assert_eq!(
+        harness.editor().active_window_id(),
+        source_window_id,
+        "cycling back must return to the exact source window",
+    );
     harness.assert_screen_contains("keep.txt");
     let screen = harness.screen_to_string();
     assert!(
         !screen.contains("*Terminal"),
         "extracted terminal tab should no longer render in the source window, got screen:\n{screen}"
     );
+}
+
+/// Failures before any durable artifact move and after checkpoint/history
+/// moves must return the exact source terminal and all artifacts, then remove
+/// the empty target co-tenant. Missing bindings inject each transfer boundary
+/// without touching the live PTY.
+#[cfg(target_os = "linux")]
+#[test]
+fn extract_terminal_artifact_failures_roll_back_source_and_target() {
+    if !pty_available() {
+        eprintln!("Skipping terminal test: PTY not available in this environment");
+        return;
+    }
+    let mut harness = sh_terminal_harness();
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    let source_window = harness.editor().active_window_id();
+    let source_buffer = harness.editor().active_buffer_id();
+    let source_terminal = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(source_buffer)
+        .expect("fixture terminal exists");
+    let source_pid = harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .get(source_terminal)
+        .and_then(|terminal| terminal.pid());
+    let source_backing =
+        harness.editor().active_window().terminal_backing_files[&source_terminal].clone();
+    let source_log = harness.editor().active_window().terminal_log_files[&source_terminal].clone();
+    let source_history =
+        harness.editor().active_window().terminal_history_files[&source_terminal].clone();
+    let backing_before = fs::read(&source_backing).unwrap();
+    let log_before = fs::read(&source_log).unwrap();
+    let history_before = fs::read(&source_history).unwrap();
+    let artifact_root = source_backing
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut entries_before: Vec<_> = fs::read_dir(&artifact_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries_before.sort();
+    let missing_log = source_log.with_file_name("missing-extraction-log");
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .terminal_log_files
+        .insert(source_terminal, missing_log.clone());
+
+    harness
+        .editor_mut()
+        .extract_tab_to_new_workspace(source_buffer);
+
+    assert_eq!(
+        harness.editor().session_count(),
+        1,
+        "no target window remains"
+    );
+    assert_eq!(harness.editor().active_window_id(), source_window);
+    assert_eq!(harness.editor().active_buffer_id(), source_buffer);
+    let source = harness.editor().active_window();
+    assert_eq!(source.terminal_log_files[&source_terminal], missing_log);
+    assert_eq!(
+        source.terminal_backing_files[&source_terminal],
+        source_backing
+    );
+    assert_eq!(
+        source.terminal_history_files[&source_terminal],
+        source_history
+    );
+    assert_eq!(
+        source
+            .terminal_manager
+            .get(source_terminal)
+            .and_then(|terminal| terminal.pid()),
+        source_pid,
+        "the original terminal handle returns to the exact source window",
+    );
+    assert_eq!(fs::read(&source_backing).unwrap(), backing_before);
+    assert_eq!(fs::read(&source_log).unwrap(), log_before);
+    assert_eq!(fs::read(&source_history).unwrap(), history_before);
+    let mut entries_after: Vec<_> = fs::read_dir(&artifact_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries_after.sort();
+    assert_eq!(
+        entries_after, entries_before,
+        "no target artifact directory remains"
+    );
+
+    // Now fail the first durable move too. The prior failure left every
+    // source-owned artifact in place, so this second injection starts from the
+    // same byte-for-byte baseline.
+    let missing_backing = source_backing.with_file_name("missing-extraction-backing");
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .terminal_backing_files
+        .insert(source_terminal, missing_backing.clone());
+    harness
+        .editor_mut()
+        .extract_tab_to_new_workspace(source_buffer);
+    let source = harness.editor().active_window();
+    assert_eq!(
+        harness.editor().session_count(),
+        1,
+        "no target window remains"
+    );
+    assert_eq!(harness.editor().active_window_id(), source_window);
+    assert_eq!(
+        source.terminal_backing_files[&source_terminal],
+        missing_backing
+    );
+    assert_eq!(source.terminal_log_files[&source_terminal], missing_log);
+    assert_eq!(
+        source.terminal_history_files[&source_terminal],
+        source_history
+    );
+    assert_eq!(
+        source
+            .terminal_manager
+            .get(source_terminal)
+            .and_then(|terminal| terminal.pid()),
+        source_pid,
+    );
+    assert_eq!(fs::read(&source_backing).unwrap(), backing_before);
+    assert_eq!(fs::read(&source_log).unwrap(), log_before);
+    assert_eq!(fs::read(&source_history).unwrap(), history_before);
+    let mut entries_after_first_move_failure: Vec<_> = fs::read_dir(&artifact_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries_after_first_move_failure.sort();
+    assert_eq!(entries_after_first_move_failure, entries_before);
+}
+/// The interactive updater owns its terminal until it exits. Extracting that
+/// tab would strand the updater's tracked window/buffer identity, so the host
+/// refuses the move and keeps the existing workspace active.
+#[cfg(target_os = "linux")]
+#[test]
+fn extract_self_update_terminal_is_refused() {
+    if !pty_available() {
+        eprintln!("Skipping terminal test: PTY not available in this environment");
+        return;
+    }
+    let mut harness = sh_terminal_harness();
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    let window_id = harness.editor().active_window_id();
+    let buffer_id = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("self-update fixture must own a terminal");
+    harness.editor_mut().begin_self_update(
+        fresh_core::WindowTerminalId::new(window_id, terminal_id),
+        buffer_id,
+    );
+
+    harness.editor_mut().extract_tab_to_new_workspace(buffer_id);
+    harness.render().unwrap();
+
+    assert_eq!(harness.editor().session_count(), 1);
+    assert_eq!(harness.editor().active_window_id(), window_id);
+    assert_eq!(harness.editor().active_buffer_id(), buffer_id);
+    harness.assert_screen_contains("Updating…");
+}
+
+#[cfg(all(target_os = "linux", feature = "plugins"))]
+#[test]
+fn extract_script_capable_terminal_is_refused() {
+    if !pty_available() {
+        eprintln!("Skipping terminal test: PTY not available in this environment");
+        return;
+    }
+    let mut harness = sh_terminal_harness();
+    let window_id = harness.editor().active_window_id();
+    harness
+        .editor_mut()
+        .handle_plugin_command(fresh_core::api::PluginCommand::CreateTerminal {
+            cwd: None,
+            direction: None,
+            ratio: None,
+            focus: Some(true),
+            persistent: false,
+            window_id,
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()]),
+            relaunch: None,
+            title: Some("script-capable".into()),
+            resume: None,
+            env: None,
+            companion: None,
+            allow_script: true,
+            selected_agent: false,
+            request_id: 10_002,
+        })
+        .unwrap();
+
+    let buffer_id = harness.editor().active_buffer_id();
+    harness.editor_mut().extract_tab_to_new_workspace(buffer_id);
+    harness.render().unwrap();
+
+    assert_eq!(harness.editor().session_count(), 1);
+    assert_eq!(harness.editor().active_window_id(), window_id);
+    assert_eq!(harness.editor().active_buffer_id(), buffer_id);
+    harness.assert_screen_contains("terminals with script access must stay");
 }
 
 /// A file sitting at the workspace root extracts fine now — it becomes a

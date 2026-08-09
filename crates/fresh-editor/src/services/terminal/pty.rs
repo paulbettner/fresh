@@ -61,9 +61,11 @@ pub fn key_to_pty_bytes(
         }
         KeyCode::Enter => {
             if shift {
-                // Match Ghostty's legacy modified-key encoding so shells and
-                // prompt editors can distinguish Shift+Enter from submission.
-                Some(maybe_esc(alt, b"\x1b[27;2;13~".to_vec()))
+                // Match Ghostty's legacy modified-key encoding. The full
+                // additive modifier parameter preserves Shift+Alt/Ctrl rather
+                // than hard-coding Shift and then adding a second ESC prefix.
+                let param = xterm_modifier_param(modifiers).expect("shift is a modifier");
+                Some(csi(&format!("27;{param};13"), b'~'))
             } else {
                 Some(maybe_esc(alt, vec![b'\r']))
             }
@@ -276,6 +278,26 @@ mod tests {
     fn test_shift_enter() {
         let bytes = key_to_pty_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false);
         assert_eq!(bytes, Some(b"\x1b[27;2;13~".to_vec()));
+    }
+
+    #[test]
+    fn test_shift_alt_enter() {
+        let bytes = key_to_pty_bytes(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+            false,
+        );
+        assert_eq!(bytes, Some(b"\x1b[27;4;13~".to_vec()));
+    }
+
+    #[test]
+    fn test_shift_ctrl_enter() {
+        let bytes = key_to_pty_bytes(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            false,
+        );
+        assert_eq!(bytes, Some(b"\x1b[27;6;13~".to_vec()));
     }
 
     #[test]

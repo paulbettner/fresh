@@ -20,9 +20,78 @@
 #![cfg(feature = "plugins")]
 
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
+#[cfg(unix)]
+use crate::common::PathGuard;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+fn delayed_git_guard(
+    slow_repo: &std::path::Path,
+    marker: &std::path::Path,
+) -> (tempfile::TempDir, PathGuard) {
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim = shim_dir.path().join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *\"{}\"*) : > \"{}\"; sleep 1;; esac\nexec \"{}\" \"$@\"\n",
+            slow_repo.display(),
+            marker.display(),
+            real_git.trim(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim, permissions).unwrap();
+    let guard = PathGuard::prepend(shim_dir.path());
+    (shim_dir, guard)
+}
+
+#[cfg(unix)]
+fn gated_branch_completion_guard(
+    slow_repo: &std::path::Path,
+    marker: &std::path::Path,
+    gate: &std::path::Path,
+    done: &std::path::Path,
+) -> (tempfile::TempDir, PathGuard) {
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim = shim_dir.path().join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *\"{}\"*for-each-ref*refs/remotes/*) : > \"{}\"; while [ -e \"{}\" ]; do sleep 0.02; done; \"{}\" \"$@\"; status=$?; : > \"{}\"; exit $status;; esac\nexec \"{}\" \"$@\"\n",
+            slow_repo.display(),
+            marker.display(),
+            gate.display(),
+            real_git.trim(),
+            done.display(),
+            real_git.trim(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim, permissions).unwrap();
+    let guard = PathGuard::prepend(shim_dir.path());
+    (shim_dir, guard)
+}
 
 /// Build a workspace with two `alpha*` subdirs and the orchestrator
 /// plugin installed. Returns (tempdir guard, canonicalized
@@ -1231,12 +1300,10 @@ fn expand_advanced(harness: &mut EditorTestHarness) {
 }
 
 /// The launcher prioritises the coding-CLI presets — a bare `terminal`,
-/// then `claude`, `codex`, `opencode` — ahead of the long-standing `aider`
-/// and the `custom…` escape hatch. The agent selector is a single dropdown
-/// (`Agent: [<selected> ▼]`); ←/→ cycles it through the presets in that
-/// priority order. We prove the ordering by adjacency — from `claude`, one
-/// `→` lands on `codex`, the next on `opencode` — which is independent of
-/// whichever preset the dropdown happens to open on.
+/// then `claude`, `codex`, `opencode`, and the native-TUI `omp` companion —
+/// ahead of the long-standing `aider` and the `custom…` escape hatch. The
+/// agent selector is a single dropdown (`Agent: [<selected> ▼]`); ←/→ cycles
+/// it in registry order.
 #[test]
 fn preset_row_lists_prioritised_agents_in_order() {
     let (_temp, workspace) = set_up_workspace();
@@ -1277,6 +1344,16 @@ fn preset_row_lists_prioritised_agents_in_order() {
     assert!(
         focused_line(&harness.screen_to_string()).contains("opencode"),
         "`→` from codex must select opencode next. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        focused_line(&harness.screen_to_string()).contains("omp"),
+        "`→` from opencode must select the native OMP preset next. Screen:\n{}",
         harness.screen_to_string(),
     );
 }
@@ -1584,6 +1661,40 @@ fn opencode_shows_start_prompt_without_auto_mode() {
     );
 }
 
+/// OMP accepts a launch-only positional start prompt but deliberately has no
+/// approval-bypass flag. The native companion does not widen OMP's approval
+/// posture.
+#[test]
+fn omp_shows_start_prompt_without_auto_mode() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    focus_agent_preset_stop(&mut harness);
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("omp") {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 8,
+            "stepping the preset selector never reached omp. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Start prompt"),
+        "OMP accepts the normal positional start prompt. Screen:\n{screen}",
+    );
+    assert!(
+        !screen.contains("Auto mode"),
+        "OMP must not surface an approval-bypass auto-mode flag. Screen:\n{screen}",
+    );
+}
+
 /// The "Teach agent the Fresh CLI" toggle lives under the "Advanced…" fold
 /// (enabled by default, but folded away so it doesn't clutter the common
 /// case). It's an agent-only control: even with Advanced expanded it stays
@@ -1790,4 +1901,181 @@ fn custom_agent_is_typable_when_running_in_the_current_workspace() {
     harness
         .wait_until(|h| h.screen_to_string().contains("zzcustomcmd"))
         .unwrap();
+}
+
+/// Closing and reopening the form creates a new async-generation boundary.
+/// A slow git probe owned by the old form must not mutate the replacement
+/// form's git controls when it finally completes.
+#[test]
+#[cfg(unix)]
+fn close_and_reopen_fences_slow_project_probe() {
+    let (_temp, workspace) = set_up_workspace();
+    let slow = workspace.join("slow-repo");
+    let fast = workspace.join("fast-non-git");
+    fs::create_dir(&slow).unwrap();
+    fs::create_dir(&fast).unwrap();
+    let init = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(&slow)
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let marker = workspace.join("slow-probe-started");
+    let (_shim, _path_guard) = delayed_git_guard(&slow, &marker);
+
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, workspace).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_new_session_command(&mut harness);
+    open_new_session_form(&mut harness);
+    harness.type_text(slow.to_str().unwrap()).unwrap();
+
+    // Advance the plugin debounce and wait until the shim proves the old
+    // form's git process is sleeping off-thread.
+    harness.sleep(std::time::Duration::from_millis(250));
+    harness.tick_and_render().unwrap();
+    for _ in 0..40 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        harness.tick_and_render().unwrap();
+    }
+    assert!(marker.exists(), "slow form probe never started");
+
+    // Esc may first close the path-completion popup; keep going only while
+    // the form itself is still visible.
+    for _ in 0..2 {
+        if !harness
+            .screen_to_string()
+            .contains("ORCHESTRATOR :: New Workspace")
+        {
+            break;
+        }
+        harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+    }
+    harness
+        .wait_until(|h| {
+            !h.screen_to_string()
+                .contains("ORCHESTRATOR :: New Workspace")
+        })
+        .unwrap();
+
+    open_new_session_form(&mut harness);
+    harness.type_text(fast.to_str().unwrap()).unwrap();
+    harness.sleep(std::time::Duration::from_millis(250));
+    harness.tick_and_render().unwrap();
+    if harness.screen_to_string().contains('┄') {
+        harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    }
+    let (advanced_col, advanced_row) = harness
+        .find_text_on_screen("Advanced")
+        .expect("advanced disclosure");
+    harness.mouse_click(advanced_col, advanced_row).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("disabled — non-git"))
+        .unwrap();
+
+    // Let the old probe finish and drain its completion. The replacement form
+    // must remain classified from `fast-non-git`, not from `slow-repo`.
+    std::thread::sleep(std::time::Duration::from_millis(1_150));
+    harness.tick_and_render().unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("disabled — non-git") && screen.contains("fast-non-git"),
+        "stale old-form probe mutated the reopened form:\n{screen}"
+    );
+}
+
+/// Branch completion is asynchronous too. A result owned by a closed form
+/// must not populate the replacement form's completion popup.
+#[test]
+#[cfg(unix)]
+fn close_and_reopen_fences_slow_branch_completion() {
+    let (_temp, workspace) = set_up_workspace();
+    let slow = workspace.join("slow-branches");
+    let fast = workspace.join("fast-branches");
+    fs::create_dir(&slow).unwrap();
+    fs::create_dir(&fast).unwrap();
+    let git = |repo: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for (repo, branch) in [(&slow, "old-completion"), (&fast, "new-completion")] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("README.md"), branch).unwrap();
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-qm", "initial"]);
+        git(repo, &["branch", branch]);
+    }
+
+    let marker = workspace.join("slow-completion-started");
+    let gate = workspace.join("slow-completion-gate");
+    let done = workspace.join("slow-completion-done");
+    fs::write(&gate, "blocked\n").unwrap();
+    let (_shim, _path_guard) = gated_branch_completion_guard(&slow, &marker, &gate, &done);
+
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, workspace).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_new_session_command(&mut harness);
+    open_new_session_form(&mut harness);
+    harness.type_text(slow.to_str().unwrap()).unwrap();
+    if screen_has_completion_dim_separator(&harness.screen_to_string()) {
+        harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    }
+    expand_advanced(&mut harness);
+    // Advanced → Agent Command → worktree toggle → Checkout branch.
+    for _ in 0..3 {
+        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+    }
+    harness.type_text("old").unwrap();
+    harness
+        .wait_until(|_| marker.exists())
+        .unwrap_or_else(|_| panic!("old form's branch completion never started"));
+
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| {
+            !h.screen_to_string()
+                .contains("ORCHESTRATOR :: New Workspace")
+        })
+        .unwrap();
+
+    open_new_session_form(&mut harness);
+    harness.type_text(fast.to_str().unwrap()).unwrap();
+    if screen_has_completion_dim_separator(&harness.screen_to_string()) {
+        harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    }
+    expand_advanced(&mut harness);
+    for _ in 0..3 {
+        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+    }
+    harness.type_text("new").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("new-completion"))
+        .unwrap();
+
+    fs::remove_file(&gate).unwrap();
+    harness
+        .wait_until(|_| done.exists())
+        .unwrap_or_else(|_| panic!("old branch completion never finished"));
+    harness.wait_for_async_quiescence(3).unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("new-completion") && !screen.contains("old-completion"),
+        "stale old-form completion replaced the reopened form's candidates:\n{screen}"
+    );
 }

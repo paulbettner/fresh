@@ -28,7 +28,7 @@
 //! ("may drive this editor as a plugin would"), and the spawn path that hands
 //! it out is the plugin `createTerminal` command, which the trimmed
 //! no-plugins build doesn't compile at all.
-#![cfg(all(target_os = "linux", feature = "plugins"))]
+#![cfg(all(unix, feature = "plugins"))]
 
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
@@ -99,6 +99,7 @@ fn pty_available() -> bool {
 /// exited one restores dead, by design, and would never respawn).
 fn spawn_agent_terminal(editor: &mut fresh::app::Editor) {
     let script = format!("printf '{MARKER}%s\\n' \"${{FRESH_CMD_TOKEN:-none}}\"; exec cat");
+    let window_id = editor.active_window_id();
     editor
         .handle_plugin_command(PluginCommand::CreateTerminal {
             cwd: None,
@@ -108,12 +109,15 @@ fn spawn_agent_terminal(editor: &mut fresh::app::Editor) {
             // Ephemeral, like every plugin-created terminal; carrying a launch
             // command is what makes it a restorable session terminal anyway.
             persistent: false,
-            window_id: None,
+            window_id,
             command: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+            relaunch: None,
             title: None,
             resume: None,
             env: None,
+            companion: None,
             allow_script: true,
+            selected_agent: true,
             request_id: 0,
         })
         .expect("agent terminal should spawn");
@@ -135,12 +139,11 @@ fn transcript_path(editor: &fresh::app::Editor) -> std::path::PathBuf {
 
 /// Block until the transcript holds at least `count` announcements, then
 /// return the last one's token.
-///
-/// Semantic wait, no deadline: the PTY reader thread writes this file on its
-/// own, so the only thing to wait for is the child having run. A regression
-/// keeps the *count* honest — a restore that spawns without the grant still
-/// announces, it just announces `none`.
 fn nth_announced_token(path: &Path, count: usize) -> String {
+    const WAIT_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let deadline = std::time::Instant::now() + MAX_WAIT;
     loop {
         let transcript = std::fs::read_to_string(path).unwrap_or_default();
         let announcements: Vec<&str> = transcript.split(MARKER).skip(1).collect();
@@ -151,7 +154,14 @@ fn nth_announced_token(path: &Path, count: usize) -> String {
                 .unwrap_or_default()
                 .to_string();
         }
-        std::thread::yield_now();
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {count} token announcements; found {} in {}. Transcript:\n{transcript}",
+                announcements.len(),
+                path.display(),
+            );
+        }
+        std::thread::sleep(WAIT_SLEEP);
     }
 }
 
@@ -182,6 +192,10 @@ fn a_restored_agent_terminal_can_still_drive_the_editor() {
         e1.save_workspace().unwrap();
         token
     };
+    assert!(
+        !command_access::may_script(&first_token),
+        "dropping the original editor must revoke its terminal capability"
+    );
 
     // Session 2: cold reboot, exactly what the user gets on relaunch.
     let mut e2 = editor_in(&project, &dir_context);
@@ -215,4 +229,130 @@ fn a_restored_agent_terminal_can_still_drive_the_editor() {
         Some(restored_window.0),
         "the restored agent's token must drive the window it came back in"
     );
+
+    let buffer_id = e2.active_buffer_id();
+    let terminal_id = e2
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("the restored terminal is still live");
+    e2.active_window_mut().terminal_manager.close(terminal_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while command_access::may_script(&restored_token)
+        || e2.active_window().exited_terminal(buffer_id).is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal exit did not revoke the restored capability"
+        );
+        e2.process_async_messages();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let restarted_id = e2
+        .active_window_mut()
+        .restart_terminal_buffer(buffer_id)
+        .expect("the exited agent terminal should restart");
+    assert_ne!(restarted_id, terminal_id);
+    let reminted_token = nth_announced_token(&log, 3);
+    assert_ne!(reminted_token, restored_token);
+    assert!(command_access::may_script(&reminted_token));
+
+    drop(e2);
+    assert!(
+        !command_access::may_script(&reminted_token),
+        "dropping the restored window must revoke its reminted capability"
+    );
+    explicit_terminal_close_revokes_grant_and_preserves_one_final_screen();
+}
+
+fn explicit_terminal_close_revokes_grant_and_preserves_one_final_screen() {
+    if !pty_available() {
+        return;
+    }
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir_context = isolated_dir_context(sandbox.path());
+    let project = sandbox.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let mut editor = editor_in(&project, &dir_context);
+    spawn_agent_terminal(&mut editor);
+
+    let token = nth_announced_token(&transcript_path(&editor), 1);
+    let buffer_id = editor.active_buffer_id();
+    let terminal_id = editor
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("live terminal");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let rendered = editor
+            .active_window()
+            .terminal_manager
+            .get(terminal_id)
+            .and_then(|handle| {
+                handle
+                    .state
+                    .lock()
+                    .ok()
+                    .map(|state| state.full_content_string())
+            })
+            .unwrap_or_default();
+        if rendered.contains(MARKER) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal output did not reach the rendered state before close"
+        );
+        editor.process_async_messages();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let backing = editor.active_window().terminal_backing_files[&terminal_id].clone();
+
+    editor.close_terminal();
+
+    assert!(!command_access::may_script(&token));
+    assert!(editor
+        .active_window()
+        .terminal_buffers
+        .values()
+        .all(|binding| binding.terminal_id != terminal_id));
+    let stem = backing
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap();
+    let retained_prefix = format!("{stem}-closed-");
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let marker_count = loop {
+        editor.process_async_messages();
+        let retained_count = std::fs::read_dir(backing.parent().unwrap())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.starts_with(&retained_prefix))
+            })
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .map(|text| text.matches(MARKER).count())
+            .sum::<usize>();
+        if retained_count > 0 {
+            let original_count = std::fs::read_to_string(&backing)
+                .map(|text| text.matches(MARKER).count())
+                .unwrap_or(0);
+            assert_eq!(
+                original_count, 0,
+                "reader recreated the live backing path after post-drain retention"
+            );
+            break retained_count;
+        }
+        assert!(
+            std::time::Instant::now() < cleanup_deadline,
+            "closed terminal backing never retained the final rendered screen"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(marker_count, 1);
 }

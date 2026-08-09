@@ -15,10 +15,14 @@ use std::sync::Arc;
 
 use anyhow::Result as AnyhowResult;
 
-use fresh_core::api::{BufferSavedDiff, JsCallbackId, PluginCommand};
+use fresh_core::api::{
+    BufferSavedDiff, EditorStateSnapshot, JsCallbackId, PluginCommand, PluginCommandContext,
+    PluginCommandEnvelope,
+};
 
 use crate::model::event::{BufferId, LeafId, SplitId};
 use crate::services::async_bridge::AsyncMessage;
+use crate::services::plugins::hooks::HookArgs;
 use crate::view::split::SplitViewState;
 
 use super::window::Window;
@@ -112,6 +116,11 @@ fn buffer_line_byte_offset(
         None
     }
 }
+fn plugin_context_may_dispatch(context: &PluginCommandContext, instance_is_active: bool) -> bool {
+    context.provenance == fresh_core::api::PluginLoadProvenance::Internal
+        || context.is_compensating_cleanup()
+        || instance_is_active
+}
 
 impl Editor {
     /// Update the plugin state snapshot with current editor state.
@@ -194,32 +203,85 @@ impl Editor {
     }
 
     pub fn update_plugin_state_snapshot(&mut self) {
-        // Rebuild the per-window filesystem registry so plugin file I/O resolves
-        // against the correct window's authority (or the active one). This runs
-        // on the same cadence as the snapshot, so it captures window
-        // create/close and focus changes without hooking each site.
+        self.update_plugin_state_snapshot_to(None, None);
+    }
+
+    fn update_plugin_state_snapshot_to(
+        &mut self,
+        target: Option<Arc<std::sync::RwLock<EditorStateSnapshot>>>,
+        scoped_window: Option<fresh_core::WindowId>,
+    ) {
+        let private_snapshot = target.is_some();
+        let inherited_plugin_state = if private_snapshot {
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .state_snapshot_handle()
+                .and_then(|shared| {
+                    shared.read().ok().map(|shared| {
+                        (
+                            shared.plugin_markers.clone(),
+                            shared.keybinding_labels.clone(),
+                        )
+                    })
+                })
+        } else {
+            None
+        };
+
+        // Only the shared snapshot retargets the global filesystem registry.
+        // Agent-script snapshots are private views and must not affect other
+        // plugins' authority routing.
         #[cfg(feature = "plugins")]
-        if let Some(registry) = self.plugin_manager.read().unwrap().window_fs_registry() {
-            let active = self.active_window;
-            let entries: Vec<(
-                fresh_core::WindowId,
-                std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
-            )> = self
-                .windows
-                .iter()
-                .map(|(id, w)| (*id, std::sync::Arc::clone(&w.authority.filesystem)))
-                .collect();
-            registry.rebuild(active, entries);
+        if target.is_none() {
+            if let Some(registry) = self.plugin_manager.read().unwrap().window_fs_registry() {
+                let active = self.active_window;
+                let entries: Vec<(
+                    fresh_core::WindowId,
+                    fresh_core::api::AuthorityStamp,
+                    std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+                )> = self
+                    .windows
+                    .iter()
+                    .map(|(id, window)| {
+                        (
+                            *id,
+                            window.authority().stamp(),
+                            Arc::clone(&window.authority.filesystem),
+                        )
+                    })
+                    .collect();
+                registry.rebuild(active, entries);
+            }
         }
 
-        let Some(snapshot_handle) = self.plugin_manager.read().unwrap().state_snapshot_handle()
-        else {
+        let snapshot_handle =
+            target.or_else(|| self.plugin_manager.read().unwrap().state_snapshot_handle());
+        let Some(snapshot_handle) = snapshot_handle else {
             return;
         };
         let mut snapshot = snapshot_handle.write().unwrap();
+        if let Some((plugin_markers, keybinding_labels)) = inherited_plugin_state {
+            snapshot.plugin_markers = plugin_markers;
+            snapshot.keybinding_labels = keybinding_labels;
+        }
 
         self.active_window_mut()
             .populate_plugin_state_snapshot(&mut snapshot);
+        // Private invocation snapshots expose one window; the shared runtime
+        // snapshot retains markers for every still-open window. Buffer IDs are
+        // editor-global, so preserving inactive-window markers is unambiguous.
+        if private_snapshot {
+            let mut plugin_markers = std::mem::take(&mut snapshot.plugin_markers);
+            plugin_markers.retain(|buffer_id, _| snapshot.buffers.contains_key(buffer_id));
+            snapshot.plugin_markers = plugin_markers;
+        } else {
+            snapshot.plugin_markers.retain(|buffer_id, _| {
+                self.windows
+                    .values()
+                    .any(|window| window.buffers.contains_key(buffer_id))
+            });
+        }
 
         // Editor-wide fields below — these reach state outside any
         // single Window.
@@ -300,6 +362,7 @@ impl Editor {
                     // Never connected (or its window would exist) — the dock
                     // badges it as its real backend, disconnected.
                     remote: d.authority_spec.remote_backend_info(false),
+                    selected_agent_terminal_id: None,
                 }
             });
         let mut session_infos: Vec<fresh_core::api::WindowInfo> = self
@@ -330,17 +393,30 @@ impl Editor {
                     root: normalize_plugin_path(s.root.clone()),
                     project_path: normalize_plugin_path(project_path),
                     shared_worktree,
-                    // A parked keepalive is what distinguishes a live remote
-                    // window from a dormant one's disconnected shell.
-                    remote: s
-                        .authority_spec
-                        .remote_backend_info(self.session_keepalives.contains_key(&s.id)),
+                    selected_agent_terminal_id: s.tracked_agent_terminal.and_then(|terminal_id| {
+                        let live = s
+                            .terminal_buffers
+                            .values()
+                            .any(|binding| binding.terminal_id == terminal_id)
+                            && s.terminal_manager
+                                .get(terminal_id)
+                                .is_some_and(|handle| handle.is_alive());
+                        live.then_some(fresh_core::WindowTerminalId::new(s.id, terminal_id))
+                    }),
+
+                    remote: s.authority_spec.remote_backend_info(
+                        s.authority.filesystem.remote_connection_info().is_some()
+                            && s.authority.filesystem.is_remote_connected(),
+                    ),
                 }
             })
             .collect();
         session_infos.extend(dormant_infos);
         session_infos.sort_by_key(|s| s.id.0);
         snapshot.windows = session_infos;
+        if let Some(window_id) = scoped_window {
+            snapshot.windows.retain(|window| window.id == window_id);
+        }
         snapshot.active_window_id = self.active_window;
 
         // Reserialize config only when the underlying `Arc<Config>`
@@ -373,6 +449,575 @@ impl Editor {
                 entry.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
+        if !private_snapshot {
+            snapshot.host_revision = snapshot.host_revision.wrapping_add(1);
+        }
+    }
+
+    fn create_plugin_snapshot(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        scoped: bool,
+    ) -> Option<Arc<std::sync::RwLock<EditorStateSnapshot>>> {
+        if !self.windows.contains_key(&window_id) {
+            return None;
+        }
+        let previous = self.active_window;
+        self.switch_active_window_pointer(window_id);
+        let snapshot = Arc::new(std::sync::RwLock::new(EditorStateSnapshot::new()));
+        self.update_plugin_state_snapshot_to(
+            Some(Arc::clone(&snapshot)),
+            scoped.then_some(window_id),
+        );
+        self.switch_active_window_pointer(previous);
+        Some(snapshot)
+    }
+
+    pub(crate) fn create_scoped_plugin_snapshot(
+        &mut self,
+        window_id: fresh_core::WindowId,
+    ) -> Option<Arc<std::sync::RwLock<EditorStateSnapshot>>> {
+        self.create_plugin_snapshot(window_id, true)
+    }
+    pub(crate) fn plugin_authority_stamp(
+        &self,
+        window_id: fresh_core::WindowId,
+    ) -> Option<fresh_core::api::AuthorityStamp> {
+        self.windows
+            .get(&window_id)
+            .map(|window| window.authority().stamp())
+    }
+    pub(crate) fn plugin_invocation(
+        &mut self,
+        window_id: fresh_core::WindowId,
+    ) -> Option<fresh_core::api::PluginInvocation> {
+        let authority = self.windows.get(&window_id)?.authority().stamp();
+        let snapshot = self.create_plugin_snapshot(window_id, false)?;
+        Some(fresh_core::api::PluginInvocation {
+            window_id,
+            authority: Some(authority),
+            state_snapshot: Some(snapshot),
+        })
+    }
+    pub(crate) fn run_plugin_hook_for_window(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        hook_name: &str,
+        args: fresh_core::hooks::HookArgs,
+    ) -> bool {
+        if !self
+            .plugin_manager
+            .read()
+            .unwrap()
+            .has_subscribers(hook_name)
+        {
+            return false;
+        }
+        let Some(invocation) = self.plugin_invocation(window_id) else {
+            return false;
+        };
+        self.plugin_manager
+            .read()
+            .unwrap()
+            .run_hook_with_invocation(hook_name, args, Some(invocation))
+    }
+
+    pub(crate) fn run_plugin_hook_for_plugin_in_window(
+        &mut self,
+        plugin: &str,
+        window_id: fresh_core::WindowId,
+        hook_name: &str,
+        args: fresh_core::hooks::HookArgs,
+    ) -> bool {
+        if !self
+            .plugin_manager
+            .read()
+            .unwrap()
+            .has_subscriber(plugin, hook_name)
+        {
+            return false;
+        }
+        let Some(invocation) = self.plugin_invocation(window_id) else {
+            return false;
+        };
+        self.plugin_manager
+            .read()
+            .unwrap()
+            .run_hook_for_plugin_with_invocation(plugin, hook_name, args, Some(invocation))
+    }
+
+    pub(crate) fn closed_plugin_invocation(
+        window_id: fresh_core::WindowId,
+    ) -> fresh_core::api::PluginInvocation {
+        fresh_core::api::PluginInvocation {
+            window_id,
+            authority: None,
+            state_snapshot: None,
+        }
+    }
+
+    fn scoped_plugin_command_allowed(
+        &self,
+        scope: fresh_core::WindowId,
+        command: &PluginCommand,
+    ) -> bool {
+        match command {
+            // Window-addressed operations may only touch the immutable script scope.
+            PluginCommand::SetActiveWindow { id }
+            | PluginCommand::ActivateWindow { id, .. }
+            | PluginCommand::CloseWindow { id }
+            | PluginCommand::PrewarmWindow { id }
+            | PluginCommand::SignalWindow { id, .. }
+            | PluginCommand::StopWindow { id, .. } => *id == scope,
+            PluginCommand::SetActiveWindowAnimated { id, .. } => *id == scope,
+            PluginCommand::OpenFileInBackground { window_id, .. } => {
+                window_id.map_or(true, |id| id == scope)
+            }
+            PluginCommand::SpawnProcess { window_id, .. }
+            | PluginCommand::SpawnBackgroundProcess { window_id, .. }
+            | PluginCommand::KillBackgroundProcess { window_id, .. }
+            | PluginCommand::SpawnProcessWait { window_id, .. }
+            | PluginCommand::SetWindowState { window_id, .. }
+            | PluginCommand::SetRemoteIndicatorState { window_id, .. }
+            | PluginCommand::ClearRemoteIndicatorState { window_id }
+            | PluginCommand::CreateTerminal { window_id, .. } => *window_id == scope,
+            PluginCommand::SendTerminalInput { terminal_id, .. }
+            | PluginCommand::CloseTerminal { terminal_id } => terminal_id.window == scope,
+
+            // These commands are local to the temporarily-selected scoped window.
+            PluginCommand::InsertText { .. }
+            | PluginCommand::DeleteRange { .. }
+            | PluginCommand::AddOverlay { .. }
+            | PluginCommand::RemoveOverlay { .. }
+            | PluginCommand::SetStatus { .. }
+            | PluginCommand::SetStatusBarValue { .. }
+            | PluginCommand::WatchPath { .. }
+            | PluginCommand::UnwatchPath { .. }
+            | PluginCommand::InsertAtCursor { .. }
+            | PluginCommand::Delay { .. }
+            | PluginCommand::HttpFetch { .. }
+            | PluginCommand::SetLayoutHints { .. }
+            | PluginCommand::SetLineNumbers { .. }
+            | PluginCommand::SetIndentationGuide { .. }
+            | PluginCommand::SetViewMode { .. }
+            | PluginCommand::SetLineWrap { .. }
+            | PluginCommand::SetViewState { .. }
+            | PluginCommand::ClearAllOverlays { .. }
+            | PluginCommand::ClearNamespace { .. }
+            | PluginCommand::ClearOverlaysInRange { .. }
+            | PluginCommand::ClearOverlaysInRangeForNamespace { .. }
+            | PluginCommand::AddVirtualText { .. }
+            | PluginCommand::AddVirtualTextStyled { .. }
+            | PluginCommand::RemoveVirtualText { .. }
+            | PluginCommand::RemoveVirtualTextsByPrefix { .. }
+            | PluginCommand::ClearVirtualTexts { .. }
+            | PluginCommand::AddVirtualLine { .. }
+            | PluginCommand::ClearVirtualTextNamespace { .. }
+            | PluginCommand::ClearVirtualLinesInRange { .. }
+            | PluginCommand::AddConceal { .. }
+            | PluginCommand::ClearConcealNamespace { .. }
+            | PluginCommand::ClearConcealsInRange { .. }
+            | PluginCommand::ClearConcealsInRangeForNamespace { .. }
+            | PluginCommand::AddFold { .. }
+            | PluginCommand::ClearFolds { .. }
+            | PluginCommand::SetFoldingRanges { .. }
+            | PluginCommand::AddSoftBreak { .. }
+            | PluginCommand::ClearSoftBreakNamespace { .. }
+            | PluginCommand::ClearSoftBreaksInRange { .. }
+            | PluginCommand::RefreshLines { .. }
+            | PluginCommand::RefreshAllLines
+            | PluginCommand::HookCompleted { .. }
+            | PluginCommand::SetLineIndicator { .. }
+            | PluginCommand::SetLineIndicators { .. }
+            | PluginCommand::ClearLineIndicators { .. }
+            | PluginCommand::SetScrollbarMarkers { .. }
+            | PluginCommand::SetScrollbarMarkersInRange { .. }
+            | PluginCommand::ClearScrollbarMarkers { .. }
+            | PluginCommand::SetFileExplorerDecorations { .. }
+            | PluginCommand::ClearFileExplorerDecorations { .. }
+            | PluginCommand::SetFileExplorerSlots { .. }
+            | PluginCommand::ClearFileExplorerSlots { .. }
+            | PluginCommand::OpenFileAtLocation { .. }
+            | PluginCommand::OpenFileInSplit { .. }
+            | PluginCommand::CancelPrompt
+            | PluginCommand::StartPrompt { .. }
+            | PluginCommand::StartPromptWithInitial { .. }
+            | PluginCommand::StartPromptAsync { .. }
+            | PluginCommand::StartFilePickAsync { .. }
+            | PluginCommand::AwaitNextKey { .. }
+            | PluginCommand::SetKeyCaptureActive { .. }
+            | PluginCommand::SetPromptSuggestions { .. }
+            | PluginCommand::SetPromptInputSync { .. }
+            | PluginCommand::SetPromptTitle { .. }
+            | PluginCommand::SetPromptFooter { .. }
+            | PluginCommand::SetPromptToolbar { .. }
+            | PluginCommand::SetPromptStatus { .. }
+            | PluginCommand::ToggleOverlayToolbarWidget { .. }
+            | PluginCommand::SetPromptSelectedIndex { .. }
+            | PluginCommand::CreateVirtualBuffer { .. }
+            | PluginCommand::CreateVirtualBufferWithContent { .. }
+            | PluginCommand::CreateVirtualBufferInSplit { .. }
+            | PluginCommand::SetVirtualBufferContent { .. }
+            | PluginCommand::GetTextPropertiesAtCursor { .. }
+            | PluginCommand::CreateBufferGroup { .. }
+            | PluginCommand::SetPanelContent { .. }
+            | PluginCommand::CloseBufferGroup { .. }
+            | PluginCommand::FocusPanel { .. }
+            | PluginCommand::ShowBuffer { .. }
+            | PluginCommand::StartAnimationArea { .. }
+            | PluginCommand::StartAnimationVirtualBuffer { .. }
+            | PluginCommand::CancelAnimation { .. }
+            | PluginCommand::CreateVirtualBufferInExistingSplit { .. }
+            | PluginCommand::CloseBuffer { .. }
+            | PluginCommand::CloseOtherBuffersInSplit { .. }
+            | PluginCommand::CloseAllBuffersInSplit { .. }
+            | PluginCommand::CloseBuffersToRightInSplit { .. }
+            | PluginCommand::CloseBuffersToLeftInSplit { .. }
+            | PluginCommand::MoveTabLeft
+            | PluginCommand::MoveTabRight
+            | PluginCommand::CreateCompositeBuffer { .. }
+            | PluginCommand::UpdateCompositeAlignment { .. }
+            | PluginCommand::CloseCompositeBuffer { .. }
+            | PluginCommand::FlushLayout
+            | PluginCommand::MoveBufferToSplit { .. }
+            | PluginCommand::SetLineTargets { .. }
+            | PluginCommand::SplitWindow { .. }
+            | PluginCommand::CompositeNextHunk { .. }
+            | PluginCommand::CompositePrevHunk { .. }
+            | PluginCommand::FocusSplit { .. }
+            | PluginCommand::SetSplitBuffer { .. }
+            | PluginCommand::SetSplitScroll { .. }
+            | PluginCommand::RequestHighlights { .. }
+            | PluginCommand::CloseSplit { .. }
+            | PluginCommand::SetSplitRatio { .. }
+            | PluginCommand::SetSplitLabel { .. }
+            | PluginCommand::ClearSplitLabel { .. }
+            | PluginCommand::GetSplitByLabel { .. }
+            | PluginCommand::DistributeSplitsEvenly { .. }
+            | PluginCommand::SetBufferCursor { .. }
+            | PluginCommand::SetBufferShowCursors { .. }
+            | PluginCommand::SendLspRequest { .. }
+            | PluginCommand::SetClipboard { .. }
+            | PluginCommand::DeleteSelection
+            | PluginCommand::SetReviewDiffHunks { .. }
+            | PluginCommand::GetBufferText { .. }
+            | PluginCommand::GetLineStartPosition { .. }
+            | PluginCommand::GetLineEndPosition { .. }
+            | PluginCommand::GetBufferLineCount { .. }
+            | PluginCommand::GetCompositeCursorInfo { .. }
+            | PluginCommand::OpenFileStreaming { .. }
+            | PluginCommand::RefreshBufferFromDisk { .. }
+            | PluginCommand::SetBufferGroupPanelBuffer { .. }
+            | PluginCommand::ScrollToLineCenter { .. }
+            | PluginCommand::ScrollBufferToLine { .. }
+            | PluginCommand::ShowActionPopup { .. }
+            | PluginCommand::MarkBufferReadOnly { .. }
+            | PluginCommand::CreateScrollSyncGroup { .. }
+            | PluginCommand::SetScrollSyncAnchors { .. }
+            | PluginCommand::RemoveScrollSyncGroup { .. }
+            | PluginCommand::SaveBufferToPath { .. }
+            | PluginCommand::RegisterDiffBaseline { .. }
+            | PluginCommand::DiffAgainstBaseline { .. }
+            | PluginCommand::DiffBaselinePair { .. }
+            | PluginCommand::GetBaselineLines { .. }
+            | PluginCommand::RefreshDiffBaseline { .. }
+            | PluginCommand::ReleaseDiffBaseline { .. }
+            | PluginCommand::GrepProject { .. }
+            | PluginCommand::BeginSearch { .. }
+            | PluginCommand::ReplaceInBuffer { .. }
+            | PluginCommand::MountWidgetPanel { .. }
+            | PluginCommand::UpdateWidgetPanel { .. }
+            | PluginCommand::UnmountWidgetPanel { .. }
+            | PluginCommand::WidgetCommand { .. }
+            | PluginCommand::WidgetMutate { .. } => true,
+
+            // Global registration/configuration, host authority, remote lifecycle,
+            // companion control, and future command variants are denied by default.
+            _ => false,
+        }
+    }
+    fn source_plugin_command_allowed(
+        &self,
+        source: fresh_core::WindowId,
+        command: &PluginCommand,
+        trusted_orchestrator: bool,
+    ) -> bool {
+        match command {
+            PluginCommand::SetActiveWindow { id }
+            | PluginCommand::ActivateWindow { id, .. }
+            | PluginCommand::CloseWindow { id }
+            | PluginCommand::PrewarmWindow { id }
+            | PluginCommand::SignalWindow { id, .. }
+            | PluginCommand::StopWindow { id, .. } => *id == source || trusted_orchestrator,
+            PluginCommand::SetActiveWindowAnimated { id, .. } => {
+                *id == source || trusted_orchestrator
+            }
+            PluginCommand::OpenFileInBackground { window_id, .. } => {
+                window_id.map_or(true, |id| id == source)
+            }
+            PluginCommand::SpawnProcess { window_id, .. }
+            | PluginCommand::SpawnBackgroundProcess { window_id, .. }
+            | PluginCommand::KillBackgroundProcess { window_id, .. }
+            | PluginCommand::SpawnProcessWait { window_id, .. }
+            | PluginCommand::SetRemoteIndicatorState { window_id, .. }
+            | PluginCommand::ClearRemoteIndicatorState { window_id }
+            | PluginCommand::CreateTerminal { window_id, .. }
+            | PluginCommand::SetAuthority { window_id, .. }
+            | PluginCommand::ClearAuthority { window_id }
+            | PluginCommand::AttachRemoteAgent { window_id, .. } => *window_id == source,
+            PluginCommand::SetWindowState { window_id, .. } => {
+                *window_id == source || trusted_orchestrator
+            }
+            PluginCommand::SendTerminalInput { terminal_id, .. }
+            | PluginCommand::CloseTerminal { terminal_id } => terminal_id.window == source,
+            PluginCommand::RestoreWorkspaceWindow { .. } => trusted_orchestrator,
+            _ => true,
+        }
+    }
+    fn async_command_callback_id(command: &PluginCommand) -> Option<JsCallbackId> {
+        if matches!(command, PluginCommand::CompleteCommand { .. }) {
+            return None;
+        }
+        let serialized = serde_json::to_value(command).ok()?;
+        let payload = serialized.as_object()?.values().next()?.as_object()?;
+        payload
+            .get("callback_id")
+            .or_else(|| payload.get("request_id"))
+            .and_then(serde_json::Value::as_u64)
+            .map(JsCallbackId::from)
+    }
+
+    fn reject_dropped_async_command(
+        &self,
+        command: &PluginCommand,
+        context: &PluginCommandContext,
+        reason: &str,
+    ) {
+        if let Some(callback_id) = Self::async_command_callback_id(command) {
+            self.reject_callback_for_context(context, callback_id, reason.to_string());
+        }
+    }
+
+    pub fn dispatch_plugin_command_envelope(&mut self, envelope: PluginCommandEnvelope) {
+        let PluginCommandEnvelope { command, context } = envelope;
+        if let PluginCommand::CompleteCommand {
+            request_id,
+            ok,
+            output,
+            error,
+        } = &command
+        {
+            let request_id = *request_id;
+            let current_authority = context.source_window.and_then(|window_id| {
+                self.windows
+                    .get(&window_id)
+                    .map(|window| window.authority().stamp())
+            });
+            if context.is_agent_script() {
+                if let Some(plugin_name) = crate::server::command_access::complete_agent_script(
+                    &context,
+                    request_id,
+                    current_authority,
+                    *ok,
+                    output.clone(),
+                    error.clone(),
+                ) {
+                    self.plugin_manager
+                        .read()
+                        .unwrap()
+                        .unload_plugin_request(&plugin_name);
+                } else {
+                    tracing::warn!(
+                        request_id,
+                        "rejected forged or stale agent-script completion"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    request_id,
+                    plugin = %context.plugin_name,
+                    "rejected command completion outside its exact agent-script instance"
+                );
+            }
+            return;
+        }
+        let instance_is_active = self
+            .plugin_manager
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_plugin_instance_active(context.plugin_instance_id);
+        if !plugin_context_may_dispatch(&context, instance_is_active) {
+            tracing::warn!(
+                plugin = %context.plugin_name,
+                ?context.plugin_instance_id,
+                command = VariantNameSink::of(&command).as_str(),
+                "dropping command from an unloaded or replaced plugin instance"
+            );
+            self.reject_dropped_async_command(
+                &command,
+                &context,
+                "plugin instance was unloaded or replaced",
+            );
+            return;
+        }
+
+        let trusted_orchestrator =
+            context.window_scope.is_none() && context.is_trusted_orchestrator();
+        let requested_scope = context.window_scope.or(context.source_window);
+        let source_closed = context
+            .source_window
+            .is_some_and(|source| !self.windows.contains_key(&source));
+        // Lifecycle hooks may finish after their source window is gone. Their
+        // editor-global state publication and completion bookkeeping remain
+        // valid, but no window-scoped command may fall through to another window.
+        if source_closed
+            && matches!(
+                command,
+                PluginCommand::SetGlobalState { .. } | PluginCommand::HookCompleted { .. }
+            )
+        {
+            self.dispatch_plugin_command_measured(command, &context);
+            return;
+        }
+        let scope = match requested_scope {
+            None => {
+                self.dispatch_plugin_command_measured(command, &context);
+                return;
+            }
+            Some(scope) if self.windows.contains_key(&scope) => scope,
+            Some(_)
+                if trusted_orchestrator
+                    && source_closed
+                    && self.windows.contains_key(&self.active_window) =>
+            {
+                self.active_window
+            }
+            Some(scope) => {
+                if let PluginCommand::SyncSnapshot { request_id } = &command {
+                    if let Some(snapshot) = &context.state_snapshot {
+                        *snapshot.write().unwrap() = EditorStateSnapshot::new();
+                    }
+                    self.send_plugin_response(fresh_core::api::PluginResponse::SnapshotSynced {
+                        request_id: *request_id,
+                    });
+                } else {
+                    tracing::warn!(?scope, "dropping command for a closed source window");
+                }
+                if !matches!(command, PluginCommand::SyncSnapshot { .. }) {
+                    self.reject_dropped_async_command(
+                        &command,
+                        &context,
+                        "plugin command source window is closed",
+                    );
+                }
+                return;
+            }
+        };
+        let using_trusted_fallback =
+            trusted_orchestrator && source_closed && context.source_window != Some(scope);
+
+        // The completion sentinel is bookkeeping rather than a window mutation;
+        // dispatch it before authority checks while its source window is live.
+        if matches!(command, PluginCommand::HookCompleted { .. }) {
+            self.dispatch_plugin_command_measured(command, &context);
+            return;
+        }
+
+        if !using_trusted_fallback {
+            if let Some(expected) = context.source_authority {
+                let actual = self
+                    .windows
+                    .get(&scope)
+                    .map(|window| window.authority().stamp());
+                if actual != Some(expected) {
+                    tracing::warn!(
+                        ?scope,
+                        ?expected,
+                        ?actual,
+                        "dropping command from a replaced source authority"
+                    );
+                    self.reject_dropped_async_command(
+                        &command,
+                        &context,
+                        "plugin command source authority was replaced",
+                    );
+                    return;
+                }
+            }
+        }
+
+        if let PluginCommand::SyncSnapshot { request_id } = &command {
+            let previous = self.active_window;
+            self.switch_active_window_pointer(scope);
+            if let Some(snapshot) = &context.state_snapshot {
+                self.update_plugin_state_snapshot_to(
+                    Some(Arc::clone(snapshot)),
+                    context.window_scope,
+                );
+            }
+            self.send_plugin_response(fresh_core::api::PluginResponse::SnapshotSynced {
+                request_id: *request_id,
+            });
+            self.switch_active_window_pointer(previous);
+            return;
+        }
+
+        let allowed = if context.is_agent_script() {
+            self.scoped_plugin_command_allowed(scope, &command)
+        } else {
+            self.source_plugin_command_allowed(scope, &command, trusted_orchestrator)
+        };
+        if !allowed {
+            tracing::warn!(
+                ?scope,
+                command = VariantNameSink::of(&command).as_str(),
+                "denied plugin command outside its immutable source window"
+            );
+            self.reject_dropped_async_command(
+                &command,
+                &context,
+                "plugin command is denied outside its immutable source window",
+            );
+            return;
+        }
+
+        let requested_active_target = match &command {
+            PluginCommand::SetActiveWindow { id }
+            | PluginCommand::ActivateWindow { id, .. }
+            | PluginCommand::SetActiveWindowAnimated { id, .. } => Some(*id),
+            _ => None,
+        };
+        let creates_active_window = matches!(
+            &command,
+            PluginCommand::CreateWindowWithTerminal { activate: true, .. }
+        );
+        let closes_source_window =
+            matches!(&command, PluginCommand::CloseWindow { id } if *id == scope);
+        let previous = self.active_window;
+        if requested_active_target.is_none() && !closes_source_window {
+            self.switch_active_window_pointer(scope);
+        }
+        self.dispatch_plugin_command_measured(command, &context);
+        let resulting_active = self.active_window;
+        if self.windows.contains_key(&scope) {
+            self.switch_active_window_pointer(scope);
+            if let Some(snapshot) = &context.state_snapshot {
+                self.update_plugin_state_snapshot_to(
+                    Some(Arc::clone(snapshot)),
+                    context.window_scope,
+                );
+            }
+            self.switch_active_window_pointer(resulting_active);
+        }
+        let active_change_committed = requested_active_target
+            .is_some_and(|target| resulting_active == target)
+            || (creates_active_window && resulting_active != scope);
+        if !active_change_committed && self.windows.contains_key(&previous) {
+            self.switch_active_window_pointer(previous);
+        }
+        if self.windows.contains_key(&self.active_window) {
+            self.update_plugin_state_snapshot();
+        }
     }
 
     /// Dispatch one plugin command, timing the handler and reporting any that
@@ -389,11 +1034,15 @@ impl Editor {
     /// e2e hostile-plugin test judges a *median* dispatch latency instead. That
     /// test is where a regression actually fails the build; this is how you
     /// find out which handler caused it.
-    pub(crate) fn dispatch_plugin_command_measured(&mut self, command: PluginCommand) {
+    pub(crate) fn dispatch_plugin_command_measured(
+        &mut self,
+        command: PluginCommand,
+        context: &PluginCommandContext,
+    ) {
         let label = VariantNameSink::of(&command);
         let label = label.as_str();
         let started = std::time::Instant::now();
-        if let Err(e) = self.handle_plugin_command(command) {
+        if let Err(e) = self.handle_plugin_command_with_context(command, context) {
             tracing::error!("Error handling plugin command {}: {}", label, e);
         }
         let elapsed = started.elapsed();
@@ -416,8 +1065,114 @@ impl Editor {
         }
     }
 
-    /// Handle a plugin command - dispatches to specialized handlers in plugin_commands module
+    /// Handle a host-internal command. Plugin-thread commands must enter through
+    /// [`Self::dispatch_plugin_command_envelope`] so their loader-owned context
+    /// cannot be separated from the payload.
     pub fn handle_plugin_command(&mut self, command: PluginCommand) -> AnyhowResult<()> {
+        let context = PluginCommandContext {
+            source_window: Some(self.active_window),
+            ..PluginCommandContext::default()
+        };
+        self.handle_plugin_command_with_context(command, &context)
+    }
+    fn context_may_use_privileged_terminal_options(&self, context: &PluginCommandContext) -> bool {
+        if context.provenance == fresh_core::api::PluginLoadProvenance::Internal {
+            return true;
+        }
+        context.is_trusted_orchestrator()
+            && self
+                .plugin_manager
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_plugin_instance_active(context.plugin_instance_id)
+    }
+
+    fn context_may_manage_bundled_plugins(context: &PluginCommandContext) -> bool {
+        context.provenance == fresh_core::api::PluginLoadProvenance::Internal
+    }
+
+    fn resolve_bool_for_context(
+        &self,
+        context: &PluginCommandContext,
+        request_id: u64,
+        value: bool,
+    ) {
+        let manager = self.plugin_manager.read().unwrap();
+        let callback_id = JsCallbackId::from(request_id);
+        let json = if value { "true" } else { "false" }.to_string();
+        if context.provenance == fresh_core::api::PluginLoadProvenance::Internal {
+            manager.resolve_callback(callback_id, json);
+        } else {
+            manager.resolve_callback_for(context.plugin_instance_id, callback_id, json);
+        }
+    }
+
+    fn resolve_json_for_context(
+        &self,
+        context: &PluginCommandContext,
+        callback_id: JsCallbackId,
+        json: String,
+    ) {
+        let manager = self.plugin_manager.read().unwrap();
+        if context.provenance == fresh_core::api::PluginLoadProvenance::Internal {
+            manager.resolve_callback(callback_id, json);
+        } else {
+            manager.resolve_callback_for(context.plugin_instance_id, callback_id, json);
+        }
+    }
+
+    fn context_may_manage_workspace_persistence(&self, context: &PluginCommandContext) -> bool {
+        context.window_scope.is_none()
+            && context.is_trusted_orchestrator()
+            && self
+                .plugin_manager
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_plugin_instance_active(context.plugin_instance_id)
+    }
+
+    fn workspace_persistence_is_owned(
+        &self,
+        root: &std::path::Path,
+        stable_id: Option<&str>,
+    ) -> bool {
+        let target = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let same_root = |candidate: &std::path::Path| {
+            candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.to_path_buf())
+                == target
+                || candidate == root
+        };
+        self.windows.values().any(|window| {
+            same_root(&window.root) && stable_id.is_none_or(|expected| window.stable_id == expected)
+        }) || self.closing_windows.values().any(|window| {
+            same_root(&window.root) && stable_id.is_none_or(|expected| window.stable_id == expected)
+        }) || self.dormant_remote.values().any(|window| {
+            same_root(&window.root)
+                && stable_id.is_none_or(|expected| window.stable_id.as_deref() == Some(expected))
+        })
+    }
+
+    fn reject_callback_for_context(
+        &self,
+        context: &PluginCommandContext,
+        callback_id: JsCallbackId,
+        error: String,
+    ) {
+        let manager = self.plugin_manager.read().unwrap();
+        if context.provenance == fresh_core::api::PluginLoadProvenance::Internal {
+            manager.reject_callback(callback_id, error);
+        } else {
+            manager.reject_callback_for(context.plugin_instance_id, callback_id, error);
+        }
+    }
+
+    fn handle_plugin_command_with_context(
+        &mut self,
+        command: PluginCommand,
+        context: &PluginCommandContext,
+    ) -> AnyhowResult<()> {
         match command {
             // ==================== Text Editing Commands ====================
             PluginCommand::InsertText {
@@ -778,11 +1533,16 @@ impl Editor {
                 self.handle_set_global_state(plugin_name, key, value);
             }
             PluginCommand::SetWindowState {
-                plugin_name,
+                window_id,
                 key,
                 value,
             } => {
-                self.handle_set_session_state(plugin_name, key, value);
+                self.handle_set_session_state(
+                    window_id,
+                    context.plugin_name.to_string(),
+                    key,
+                    value,
+                );
             }
             PluginCommand::RefreshLines { buffer_id } => {
                 self.handle_refresh_lines(buffer_id);
@@ -790,8 +1550,9 @@ impl Editor {
             PluginCommand::RefreshAllLines => {
                 self.handle_refresh_all_lines();
             }
-            PluginCommand::HookCompleted { .. } => {
-                // Sentinel processed in render loop; no-op if encountered elsewhere.
+            PluginCommand::HookCompleted { hook_name } => {
+                self.complete_terminal_output_hook(&hook_name);
+                self.complete_omp_companion_hook(&hook_name);
             }
             PluginCommand::SetLineIndicator {
                 buffer_id,
@@ -989,10 +1750,15 @@ impl Editor {
                 label,
                 cwd,
                 command,
+                relaunch,
                 title,
                 resume,
                 env,
+                companion,
                 allow_script,
+                selected_agent,
+                activate,
+                initial_state,
                 request_id,
             } => {
                 self.handle_create_window_with_terminal(
@@ -1000,13 +1766,45 @@ impl Editor {
                     label,
                     cwd,
                     command,
+                    relaunch,
                     title,
                     resume,
                     env,
                     allow_script,
+                    companion,
+                    selected_agent,
+                    activate,
+                    initial_state,
                     request_id,
+                    context,
                 );
             }
+            PluginCommand::RestoreWorkspaceWindow {
+                root,
+                label,
+                stable_id,
+                activate,
+                callback_id,
+            } => self.handle_restore_workspace_window(
+                root,
+                label,
+                stable_id,
+                activate,
+                callback_id,
+                context,
+            ),
+            PluginCommand::SendOmpCompanionCommand {
+                terminal_id,
+                command_type,
+                target,
+                request_id,
+            } => self.handle_send_omp_companion_command(
+                terminal_id,
+                command_type,
+                target,
+                request_id,
+                context,
+            ),
             PluginCommand::SetActiveWindow { id } => {
                 // Diving into a dormant remote session starts its backend
                 // connect AND commits the switch immediately: the dive lands
@@ -1029,6 +1827,18 @@ impl Editor {
                     self.set_active_window(id);
                 }
             }
+            PluginCommand::ActivateWindow { id, request_id } => {
+                if self.windows.contains_key(&id) || self.dormant_remote.contains_key(&id) {
+                    if self.dormant_remote.contains_key(&id) {
+                        self.ensure_dormant_shell(id);
+                        self.set_active_window(id);
+                        self.bring_dormant_remote_online(id);
+                    } else {
+                        self.set_active_window(id);
+                    }
+                }
+                self.resolve_bool_for_context(context, request_id, self.active_window == id);
+            }
             PluginCommand::SetActiveWindowAnimated { id, from_edge } => {
                 // See `SetActiveWindow`: the dive commits into the session's
                 // shell while its backend connects.
@@ -1048,16 +1858,236 @@ impl Editor {
             PluginCommand::CloseWindow { id } => {
                 let _ = self.close_window(id);
             }
-            PluginCommand::DeleteWorkspace { root } => {
-                // Permanently forget this directory's persisted session so
-                // boot-time discovery can't rediscover it. Best-effort, like
-                // discovery's own GC: a failed unlink just leaves the file to
-                // be retried next launch rather than aborting the delete.
-                if let Err(e) = crate::workspace::Workspace::delete(&root) {
-                    tracing::warn!(
-                        "DeleteWorkspace: could not forget workspace for {:?}: {e}",
-                        root
+            PluginCommand::InspectWorkspacePersistence { root, callback_id } => {
+                if !self.context_may_manage_workspace_persistence(context) {
+                    self.reject_callback_for_context(
+                        context,
+                        callback_id,
+                        "only the bundled unscoped Orchestrator may inspect workspace persistence"
+                            .to_string(),
                     );
+                } else {
+                    match crate::workspace::inspect_workspace_persistence_in(
+                        &self.dir_context,
+                        &root,
+                    )
+                    .and_then(|files| serde_json::to_string(&files).map_err(Into::into))
+                    {
+                        Ok(json) => self.resolve_json_for_context(context, callback_id, json),
+                        Err(error) => self.reject_callback_for_context(
+                            context,
+                            callback_id,
+                            error.to_string(),
+                        ),
+                    }
+                }
+            }
+            PluginCommand::InspectWorkspaceCreateAttempt {
+                attempt_id,
+                root_hint,
+                workspace_id_hint,
+                callback_id,
+            } => {
+                if !self.context_may_manage_workspace_persistence(context) {
+                    self.reject_callback_for_context(
+                        context,
+                        callback_id,
+                        "only the bundled unscoped Orchestrator may inspect workspace create attempts"
+                            .to_string(),
+                    );
+                } else {
+                    let inventory = crate::workspace::inspect_workspace_create_attempt_in(
+                        &self.dir_context,
+                        &attempt_id,
+                        root_hint.as_deref(),
+                        workspace_id_hint.as_deref(),
+                    );
+                    match serde_json::to_string(&inventory) {
+                        Ok(json) => self.resolve_json_for_context(context, callback_id, json),
+                        Err(error) => self.reject_callback_for_context(
+                            context,
+                            callback_id,
+                            error.to_string(),
+                        ),
+                    }
+                }
+            }
+            PluginCommand::ForgetWorkspacePersistence {
+                root,
+                stable_id,
+                callback_id,
+            } => {
+                let result = if !self.context_may_manage_workspace_persistence(context) {
+                    Err(
+                        "only the bundled unscoped Orchestrator may forget workspace persistence"
+                            .to_string(),
+                    )
+                } else if stable_id.as_deref() == Some("") {
+                    Err("workspace stable id must not be empty".to_string())
+                } else if self.workspace_persistence_is_owned(&root, stable_id.as_deref()) {
+                    Err(
+                        "workspace persistence is still owned by a live or draining session"
+                            .to_string(),
+                    )
+                } else {
+                    crate::workspace::lock_workspace_root(&self.dir_context, &root)
+                        .map_err(|error| error.to_string())
+                        .and_then(|_root_lock| {
+                            if let Some(stable_id) = stable_id.as_deref() {
+                                crate::workspace::Workspace::delete_by_id_in(
+                                    &self.dir_context,
+                                    &root,
+                                    stable_id,
+                                )
+                                .map_err(|error| error.to_string())
+                                .and_then(|()| {
+                                    crate::workspace::delete_terminal_artifacts_by_id(
+                                        &self.dir_context,
+                                        &root,
+                                        stable_id,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                })
+                            } else {
+                                crate::workspace::Workspace::delete_in(&self.dir_context, &root)
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|()| {
+                                        crate::workspace::delete_terminal_artifacts_for_root(
+                                            &self.dir_context,
+                                            &root,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                    })
+                            }
+                        })
+                };
+                match result {
+                    Ok(()) => {
+                        self.resolve_json_for_context(context, callback_id, "null".to_string())
+                    }
+                    Err(error) => self.reject_callback_for_context(context, callback_id, error),
+                }
+            }
+            PluginCommand::AcquireWorkspaceRootOwnership {
+                root,
+                owner_id,
+                callback_id,
+            } => {
+                let result = if self.context_may_manage_workspace_persistence(context) {
+                    crate::workspace::acquire_workspace_root_ownership(
+                        &self.dir_context,
+                        &root,
+                        &owner_id,
+                    )
+                    .map_err(|error| error.to_string())
+                } else {
+                    Err(
+                        "only the bundled unscoped Orchestrator may own workspace roots"
+                            .to_string(),
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        self.resolve_json_for_context(context, callback_id, "null".to_string())
+                    }
+                    Err(error) => self.reject_callback_for_context(context, callback_id, error),
+                }
+            }
+            PluginCommand::ReleaseWorkspaceRootOwnership {
+                owner_id,
+                callback_id,
+            } => {
+                let result = if self.context_may_manage_workspace_persistence(context) {
+                    crate::workspace::release_workspace_root_ownership(&owner_id)
+                        .map_err(|error| error.to_string())
+                } else {
+                    Err(
+                        "only the bundled unscoped Orchestrator may own workspace roots"
+                            .to_string(),
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        self.resolve_json_for_context(context, callback_id, "null".to_string())
+                    }
+                    Err(error) => self.reject_callback_for_context(context, callback_id, error),
+                }
+            }
+            PluginCommand::QuarantineWorkspaceArtifacts {
+                root,
+                stable_id,
+                owner_id,
+                callback_id,
+            } => {
+                let result = if self.context_may_manage_workspace_persistence(context) {
+                    crate::workspace::quarantine_workspace_artifacts(
+                        &self.dir_context,
+                        &root,
+                        stable_id.as_deref(),
+                        &owner_id,
+                    )
+                    .map_err(|error| error.to_string())
+                } else {
+                    Err(
+                        "only the bundled unscoped Orchestrator may quarantine workspace artifacts"
+                            .to_string(),
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        self.resolve_json_for_context(context, callback_id, "null".to_string())
+                    }
+                    Err(error) => self.reject_callback_for_context(context, callback_id, error),
+                }
+            }
+            PluginCommand::RestoreWorkspaceArtifacts {
+                target_root,
+                stable_id,
+                owner_id,
+                callback_id,
+            } => {
+                let result = if self.context_may_manage_workspace_persistence(context) {
+                    crate::workspace::restore_workspace_artifacts(
+                        &self.dir_context,
+                        &target_root,
+                        stable_id.as_deref(),
+                        &owner_id,
+                    )
+                    .map_err(|error| error.to_string())
+                } else {
+                    Err(
+                        "only the bundled unscoped Orchestrator may restore workspace artifacts"
+                            .to_string(),
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        self.resolve_json_for_context(context, callback_id, "null".to_string())
+                    }
+                    Err(error) => self.reject_callback_for_context(context, callback_id, error),
+                }
+            }
+            PluginCommand::PurgeWorkspaceArtifactQuarantine {
+                owner_id,
+                callback_id,
+            } => {
+                let result = if self.context_may_manage_workspace_persistence(context) {
+                    crate::workspace::purge_workspace_artifact_quarantine(
+                        &self.dir_context,
+                        &owner_id,
+                    )
+                    .map_err(|error| error.to_string())
+                } else {
+                    Err(
+                        "only the bundled unscoped Orchestrator may purge workspace artifacts"
+                            .to_string(),
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        self.resolve_json_for_context(context, callback_id, "null".to_string())
+                    }
+                    Err(error) => self.reject_callback_for_context(context, callback_id, error),
                 }
             }
             PluginCommand::PrewarmWindow { id } => {
@@ -1070,10 +2100,10 @@ impl Editor {
                 recursive,
                 request_id,
             } => {
-                self.handle_watch_path(path, recursive, request_id);
+                self.handle_watch_path(path, recursive, request_id, context);
             }
             PluginCommand::UnwatchPath { handle } => {
-                self.file_watcher_manager.unwatch(handle);
+                self.handle_unwatch_path(handle, context);
             }
 
             PluginCommand::PreviewWindowInRect { id } => {
@@ -1201,68 +2231,102 @@ impl Editor {
 
             // ==================== Async Plugin Commands ====================
             PluginCommand::SpawnProcess {
+                window_id,
                 command,
                 args,
                 cwd,
                 stdout_to,
                 callback_id,
             } => {
-                self.handle_spawn_process(command, args, cwd, stdout_to, callback_id);
+                self.handle_spawn_process(window_id, command, args, cwd, stdout_to, callback_id);
             }
 
             PluginCommand::SpawnHostProcess {
+                window_id,
                 command,
                 args,
                 cwd,
                 callback_id,
             } => {
-                self.handle_spawn_host_process(command, args, cwd, callback_id);
+                self.handle_spawn_host_process(window_id, command, args, cwd, callback_id);
             }
 
-            PluginCommand::KillHostProcess { process_id } => {
-                self.handle_kill_host_process(process_id);
+            PluginCommand::KillHostProcess {
+                window_id,
+                process_id,
+            } => {
+                self.handle_kill_host_process(window_id, process_id);
             }
 
-            PluginCommand::SetAuthority { payload } => {
-                self.handle_set_authority(payload);
+            PluginCommand::SetAuthority { window_id, payload } => {
+                self.handle_set_authority(window_id, payload);
             }
 
             PluginCommand::AttachRemoteAgent {
+                window_id,
                 payload,
                 request_id,
             } => {
-                self.handle_attach_remote_agent(payload, request_id);
+                if context
+                    .source_window
+                    .is_some_and(|source_window| source_window != window_id)
+                {
+                    self.reject_remote_attach(
+                        context.plugin_instance_id,
+                        request_id,
+                        "remote attach window does not match its command context".to_string(),
+                    );
+                } else {
+                    self.handle_attach_remote_agent(
+                        context.plugin_instance_id,
+                        context.plugin_name.to_string(),
+                        window_id,
+                        payload,
+                        request_id,
+                    );
+                }
             }
 
-            PluginCommand::CancelRemoteAttach => {
-                self.cancel_remote_attaches();
+            PluginCommand::CancelRemoteAttach { request_id } => {
+                self.cancel_plugin_remote_attach(context.plugin_instance_id, request_id);
             }
 
-            PluginCommand::ClearAuthority => {
-                self.handle_clear_authority();
+            PluginCommand::CancelRemoteAttaches => {
+                self.cancel_plugin_remote_attaches(context.plugin_instance_id);
             }
 
-            PluginCommand::SetEnv { snippet, dir } => {
-                self.handle_set_env(snippet, dir);
+            PluginCommand::ClearAuthority { window_id } => {
+                self.handle_clear_authority(window_id);
             }
 
-            PluginCommand::ClearEnv => {
-                self.handle_clear_env();
+            PluginCommand::SetEnv {
+                window_id,
+                snippet,
+                dir,
+            } => {
+                self.handle_set_env(window_id, snippet, dir);
             }
 
-            PluginCommand::SetRemoteIndicatorState { state } => {
-                self.handle_set_remote_indicator_state(state);
+            PluginCommand::ClearEnv { window_id } => {
+                self.handle_clear_env(window_id);
             }
 
-            PluginCommand::ClearRemoteIndicatorState => {
-                self.remote_indicator_override = None;
+            PluginCommand::SetRemoteIndicatorState { window_id, state } => {
+                self.handle_set_remote_indicator_state(window_id, state);
+            }
+
+            PluginCommand::ClearRemoteIndicatorState { window_id } => {
+                if let Some(window) = self.windows.get_mut(&window_id) {
+                    window.remote_indicator_override = None;
+                }
             }
 
             PluginCommand::SpawnProcessWait {
+                window_id,
                 process_id,
                 callback_id,
             } => {
-                self.handle_spawn_process_wait(process_id, callback_id);
+                self.handle_spawn_process_wait(window_id, process_id, callback_id);
             }
 
             PluginCommand::Delay {
@@ -1281,17 +2345,28 @@ impl Editor {
             }
 
             PluginCommand::SpawnBackgroundProcess {
+                window_id,
                 process_id,
                 command,
                 args,
                 cwd,
                 callback_id,
             } => {
-                self.handle_spawn_background_process(process_id, command, args, cwd, callback_id);
+                self.handle_spawn_background_process(
+                    window_id,
+                    process_id,
+                    command,
+                    args,
+                    cwd,
+                    callback_id,
+                );
             }
 
-            PluginCommand::KillBackgroundProcess { process_id } => {
-                self.handle_kill_background_process(process_id);
+            PluginCommand::KillBackgroundProcess {
+                window_id,
+                process_id,
+            } => {
+                self.handle_kill_background_process(window_id, process_id);
             }
 
             // ==================== Virtual Buffer Commands (complex, kept inline) ====================
@@ -1412,17 +2487,12 @@ impl Editor {
             PluginCommand::ExecuteAction { action_name } => {
                 self.handle_execute_action(action_name);
             }
-            PluginCommand::CompleteCommand {
-                request_id,
-                ok,
-                output,
-                error,
-            } => {
-                // A command dispatched over the agent channel has settled.
-                // Park the outcome where the host loop (daemon or in-process
-                // control socket) picks it up and answers the caller waiting on
-                // this request id.
-                crate::server::command_access::complete(request_id, ok, output, error);
+            PluginCommand::CompleteCommand { request_id, .. } => {
+                tracing::warn!(
+                    request_id,
+                    plugin = %context.plugin_name,
+                    "rejected completion outside the envelope dispatch boundary"
+                );
             }
             PluginCommand::ExecuteActions { actions } => {
                 self.handle_execute_actions(actions);
@@ -1648,11 +2718,11 @@ impl Editor {
             }
             #[cfg(feature = "plugins")]
             PluginCommand::UnloadPlugin { name, callback_id } => {
-                self.handle_unload_plugin(name, callback_id);
+                self.handle_unload_plugin(name, callback_id, context);
             }
             #[cfg(feature = "plugins")]
             PluginCommand::ReloadPlugin { name, callback_id } => {
-                self.handle_reload_plugin(name, callback_id);
+                self.handle_reload_plugin(name, callback_id, context);
             }
             #[cfg(feature = "plugins")]
             PluginCommand::ListPlugins { callback_id } => {
@@ -1711,10 +2781,13 @@ impl Editor {
                 persistent,
                 window_id,
                 command,
+                relaunch,
                 title,
                 resume,
                 env,
+                companion,
                 allow_script,
+                selected_agent,
                 request_id,
             } => {
                 self.handle_create_terminal(
@@ -1725,11 +2798,15 @@ impl Editor {
                     persistent,
                     window_id,
                     command,
+                    relaunch,
                     title,
                     resume,
                     env,
+                    companion,
                     allow_script,
+                    selected_agent,
                     request_id,
+                    context,
                 );
             }
 
@@ -1743,6 +2820,9 @@ impl Editor {
 
             PluginCommand::SignalWindow { id, signal } => {
                 self.handle_signal_window(id, &signal);
+            }
+            PluginCommand::StopWindow { id, grace_ms } => {
+                self.handle_stop_window(id, grace_ms);
             }
 
             PluginCommand::RegisterDiffBaseline {
@@ -1944,14 +3024,55 @@ impl Editor {
 
     // ── Delegated handlers extracted from the dispatch match ─────────────
 
-    fn handle_watch_path(&mut self, path: std::path::PathBuf, recursive: bool, request_id: u64) {
-        let result = if let Some(ref bridge) = self.async_bridge {
-            self.file_watcher_manager.watch(bridge, &path, recursive)
-        } else {
-            Err(
-                "watchPath: no async bridge — file watching is unavailable in this build"
-                    .to_string(),
-            )
+    fn watch_owner_for_context(
+        &self,
+        context: &PluginCommandContext,
+    ) -> Option<crate::services::file_watcher::WatchOwner> {
+        let window_id = context
+            .window_scope
+            .or(context.source_window)
+            .unwrap_or(self.active_window);
+        let authority = self.windows.get(&window_id)?.authority().stamp();
+        let plugin_instance_id = (context.provenance
+            != fresh_core::api::PluginLoadProvenance::Internal)
+            .then_some(context.plugin_instance_id);
+        Some(crate::services::file_watcher::WatchOwner {
+            window_id,
+            authority,
+            plugin_instance_id,
+        })
+    }
+
+    fn handle_watch_path(
+        &mut self,
+        path: std::path::PathBuf,
+        recursive: bool,
+        request_id: u64,
+        context: &PluginCommandContext,
+    ) {
+        let result = match self.watch_owner_for_context(context) {
+            Some(owner)
+                if self.windows.get(&owner.window_id).is_some_and(|window| {
+                    matches!(
+                        &window.authority_spec,
+                        crate::services::authority::SessionAuthoritySpec::RemoteAgent(_)
+                    )
+                }) => Err(
+                    "watchPath is unavailable for remote authorities; refusing to reinterpret a remote path on the host"
+                        .to_string(),
+                ),
+            Some(owner) => {
+                if let Some(ref bridge) = self.async_bridge {
+                    self.file_watcher_manager
+                        .watch(bridge, &path, recursive, owner)
+                } else {
+                    Err(
+                        "watchPath: no async bridge — file watching is unavailable in this build"
+                            .to_string(),
+                    )
+                }
+            }
+            None => Err("watchPath source window is closed".to_string()),
         };
         self.last_watch_response_for_test = Some((request_id, result.clone()));
         self.send_plugin_response(fresh_core::api::PluginResponse::WatchPathRegistered {
@@ -1960,70 +3081,76 @@ impl Editor {
         });
     }
 
-    fn handle_set_env(&mut self, snippet: String, dir: Option<String>) {
-        // Activation runs repo-controlled code, so it's only honored in
-        // a Trusted workspace — defense in depth even though the plugin
-        // already gates on `workspaceTrustLevel()`.
+    fn handle_unwatch_path(&mut self, handle: u64, context: &PluginCommandContext) {
+        let Some(owner) = self.watch_owner_for_context(context) else {
+            return;
+        };
+        if !self.file_watcher_manager.unwatch_owned(handle, owner) {
+            tracing::warn!(
+                handle,
+                ?owner.window_id,
+                "denied unwatchPath outside its immutable plugin/window authority"
+            );
+        }
+    }
+
+    fn handle_set_env(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        snippet: String,
+        dir: Option<String>,
+    ) {
         use crate::services::workspace_trust::TrustLevel;
-        if self.authority().workspace_trust.level() == TrustLevel::Trusted {
-            self.authority()
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            tracing::warn!(?window_id, "SetEnv targeted a closed window");
+            return;
+        };
+        if window.authority().workspace_trust.level() == TrustLevel::Trusted {
+            window
+                .authority()
                 .env_provider
                 .set(snippet, dir.map(std::path::PathBuf::from));
-            // Re-evaluate already-running tooling under the new env — scoped to
-            // THIS window only.
-            self.refresh_active_window_lsp_for_env();
+            self.refresh_window_lsp_for_env(window_id);
         } else {
-            self.active_window_mut().status_message =
+            window.status_message =
                 Some("Workspace not trusted — cannot activate environment".to_string());
         }
     }
 
-    fn handle_clear_env(&mut self) {
-        let was_active = self.authority().env_provider.is_active();
-        self.authority().env_provider.clear();
+    fn handle_clear_env(&mut self, window_id: fresh_core::WindowId) {
+        let Some(window) = self.windows.get(&window_id) else {
+            tracing::warn!(?window_id, "ClearEnv targeted a closed window");
+            return;
+        };
+        let was_active = window.authority().env_provider.is_active();
+        window.authority().env_provider.clear();
         if was_active {
-            self.refresh_active_window_lsp_for_env();
+            self.refresh_window_lsp_for_env(window_id);
         }
     }
 
-    /// Re-launch the *active window's* already-running language servers so they
-    /// pick up a just-changed environment (`editor.setEnv` / `clearEnv`),
-    /// WITHOUT a process-wide editor rebuild.
-    ///
-    /// The window's `EnvProvider` is updated in place (see
-    /// `services::env_provider` — "the plugin sets the recipe in place […] and
-    /// there is no authority rebuild"), so every *new* spawn — new terminals,
-    /// servers started later — already inherits the change. Only servers that
-    /// were spawned under the old env need a re-launch, and only this window's:
-    /// each `Window` owns its own LSP, terminals, and authority, so a single
-    /// workspace's env activation must not touch the others. The previous
-    /// `request_restart` here rebuilt the whole editor — tearing down every
-    /// other orchestrator session's terminals and closing the dock — which is
-    /// the "Trust restarted everything" bug. Already-open terminals keep
-    /// running and only adopt the new env when reopened (matching the env
-    /// subsystem's lazy, capture-at-spawn model).
-    fn refresh_active_window_lsp_for_env(&mut self) {
-        let active_id = self.active_window;
+    /// Re-launch one exact window's already-running language servers so they
+    /// pick up its changed environment without rebuilding any sibling window.
+    fn refresh_window_lsp_for_env(&mut self, window_id: fresh_core::WindowId) {
         let running: Vec<String> = self
             .windows
-            .get(&active_id)
+            .get(&window_id)
             .map(|w| w.lsp.running_servers())
             .unwrap_or_default();
         if running.is_empty() {
             return;
         }
-        let file_path = self
-            .active_window()
-            .buffer_metadata
-            .get(&self.active_buffer())
-            .and_then(|meta| meta.file_path().cloned());
+        let file_path = self.windows.get(&window_id).and_then(|window| {
+            window
+                .buffer_metadata
+                .get(&window.active_buffer())
+                .and_then(|meta| meta.file_path().cloned())
+        });
         for language in &running {
-            if let Some(w) = self.windows.get_mut(&active_id) {
-                let _ = w.lsp.manual_restart(language, file_path.as_deref());
+            if let Some(window) = self.windows.get_mut(&window_id) {
+                let _ = window.lsp.manual_restart(language, file_path.as_deref());
             }
-            // Re-send didOpen for this language's buffers so the fresh server
-            // (now under the new env) sees the open documents.
-            self.reopen_buffers_for_language(language);
+            self.reopen_buffers_for_language_in_window(window_id, language);
         }
     }
 
@@ -2125,6 +3252,115 @@ impl Editor {
         }
     }
 
+    fn handle_restore_workspace_window(
+        &mut self,
+        root: std::path::PathBuf,
+        label: String,
+        stable_id: Option<String>,
+        activate: bool,
+        callback_id: JsCallbackId,
+        context: &PluginCommandContext,
+    ) {
+        if !self.context_may_manage_workspace_persistence(context) {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                "only the bundled unscoped Orchestrator may restore workspace windows".into(),
+            );
+            return;
+        }
+        if !root.is_absolute() || stable_id.as_deref() == Some("") {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                "workspace root must be absolute and stable id must be non-empty when present"
+                    .into(),
+            );
+            return;
+        }
+
+        let requested_id = stable_id.as_deref().unwrap_or("");
+        let root_key = crate::app::orchestrator_persistence::canonical_key(&root);
+        if let Some(existing) = self.windows.iter().find_map(|(id, window)| {
+            (crate::app::orchestrator_persistence::canonical_key(&window.root) == root_key
+                && window.stable_id == requested_id)
+                .then_some(*id)
+        }) {
+            if activate {
+                self.set_active_window(existing);
+            }
+            let stable_id = self
+                .windows
+                .get(&existing)
+                .map(|window| window.stable_id.clone())
+                .unwrap_or_default();
+            self.resolve_json_for_context(
+                context,
+                callback_id,
+                serde_json::json!({ "windowId": existing.0, "stableId": stable_id }).to_string(),
+            );
+            return;
+        }
+
+        let persisted = if let Some(stable_id) = stable_id.as_deref() {
+            crate::workspace::Workspace::load_by_id_in(&self.dir_context, &root, stable_id)
+        } else {
+            crate::workspace::Workspace::load_in(&self.dir_context, &root)
+        };
+        match persisted {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.reject_callback_for_context(
+                    context,
+                    callback_id,
+                    "the exact workspace persistence is missing".into(),
+                );
+                return;
+            }
+            Err(error) => {
+                self.reject_callback_for_context(context, callback_id, error.to_string());
+                return;
+            }
+        }
+
+        let authority = self.local_session_authority(&root);
+        let id = self.create_window_with_authority_and_stable_id(
+            root,
+            label,
+            authority,
+            Some(stable_id.unwrap_or_default()),
+        );
+        let restored = self.restore_window(id, false);
+        if !matches!(&restored, Ok(true)) {
+            self.handle_signal_window(id, "SIGKILL");
+            self.windows.remove(&id);
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .run_hook("window_closed", HookArgs::WindowClosed { id: id.0 });
+            let error = match restored {
+                Ok(false) => "the exact workspace persistence could not be restored".into(),
+                Err(error) => error.to_string(),
+                Ok(true) => unreachable!(),
+            };
+            self.reject_callback_for_context(context, callback_id, error);
+            return;
+        }
+        if activate {
+            self.set_active_window(id);
+        }
+        let stable_id = self
+            .windows
+            .get(&id)
+            .map(|window| window.stable_id.clone())
+            .unwrap_or_default();
+        self.resolve_json_for_context(
+            context,
+            callback_id,
+            serde_json::json!({ "windowId": id.0, "stableId": stable_id }).to_string(),
+        );
+    }
+
     fn handle_preview_window_in_rect(&mut self, id: Option<fresh_core::WindowId>) {
         // Only honour if the session exists and is not the active one
         // (no point previewing the session whose UI is already on screen).
@@ -2161,9 +3397,28 @@ impl Editor {
             .cancel(crate::view::animation::AnimationId::from_raw(id));
     }
 
-    fn handle_clear_authority(&mut self) {
-        tracing::info!("Plugin cleared authority; restoring local");
-        self.clear_authority();
+    fn handle_clear_authority(&mut self, window_id: fresh_core::WindowId) {
+        let Some(root) = self
+            .windows
+            .get(&window_id)
+            .map(|window| window.root.clone())
+        else {
+            tracing::warn!(?window_id, "ClearAuthority targeted a closed window");
+            return;
+        };
+        tracing::info!(?window_id, "Plugin cleared authority; restarting locally");
+        let authority = self.local_session_authority(&root);
+        self.session_keepalives.remove(&window_id);
+        self.set_session_authority_spec(
+            window_id,
+            crate::services::authority::SessionAuthoritySpec::Local,
+        );
+        // A cross-backend pointer swap cannot synchronously fence every live
+        // PTY, LSP, plugin task, and process. Make the exact target active only
+        // for restart routing, then let the established full-editor cutover
+        // drop the old runtime before publishing the local authority.
+        self.switch_active_window_pointer(window_id);
+        self.install_authority(authority);
     }
 
     fn handle_set_review_diff_hunks(&mut self, hunks: Vec<fresh_core::api::ReviewHunk>) {
@@ -2431,7 +3686,20 @@ impl Editor {
 
     /// Unload a plugin by name
     #[cfg(feature = "plugins")]
-    fn handle_unload_plugin(&mut self, name: String, callback_id: JsCallbackId) {
+    fn handle_unload_plugin(
+        &mut self,
+        name: String,
+        callback_id: JsCallbackId,
+        context: &PluginCommandContext,
+    ) {
+        if name == "orchestrator" && !Self::context_may_manage_bundled_plugins(context) {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                "bundled built-in plugins may only be unloaded by the host".to_string(),
+            );
+            return;
+        }
         // Drop the write guard before the read lock below (match-scrutinee
         // temporaries would otherwise live until end-of-match).
         let result = self.plugin_manager.write().unwrap().unload_plugin(&name);
@@ -2458,19 +3726,31 @@ impl Editor {
 
     /// Reload a plugin by name
     #[cfg(feature = "plugins")]
-    fn handle_reload_plugin(&mut self, name: String, callback_id: JsCallbackId) {
-        // Capture the plugin's path before reloading so we can refresh its
-        // schema sidecar too. `list_plugins` is cheap (one channel
-        // round-trip).
-        let path = self
-            .plugin_manager
-            .read()
-            .unwrap()
-            .list_plugins()
-            .into_iter()
-            .find(|p| p.name == name)
-            .map(|p| p.path);
-        let _ = path; // schema is now re-registered by plugin code on reload
+    fn handle_reload_plugin(
+        &mut self,
+        name: String,
+        callback_id: JsCallbackId,
+        context: &PluginCommandContext,
+    ) {
+        if name == "orchestrator" {
+            if !Self::context_may_manage_bundled_plugins(context) {
+                self.reject_callback_for_context(
+                    context,
+                    callback_id,
+                    "bundled built-in plugins may only be reloaded by the host".to_string(),
+                );
+                return;
+            }
+            #[cfg(feature = "embed-plugins")]
+            if crate::services::plugins::embedded::get_embedded_plugins_dir().is_none() {
+                self.reject_callback_for_context(
+                    context,
+                    callback_id,
+                    "bundled plugin integrity verification failed".to_string(),
+                );
+                return;
+            }
+        }
         let reload_result = self.plugin_manager.read().unwrap().reload_plugin(&name);
         match reload_result {
             Ok(()) => {
@@ -2500,7 +3780,7 @@ impl Editor {
             .map(|p| {
                 serde_json::json!({
                     "name": p.name,
-                    "path": p.path.to_string_lossy(),
+                    "path": if p.name == "orchestrator" { "<bundled>".into() } else { p.path.to_string_lossy().into_owned() },
                     "enabled": p.enabled
                 })
             })
@@ -3213,6 +4493,7 @@ impl Editor {
 
     fn handle_spawn_host_process(
         &mut self,
+        window_id: fresh_core::WindowId,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
@@ -3232,15 +4513,23 @@ impl Editor {
         // child. This lets a plugin cancel a long-running
         // spawn (e.g. "Cancel Startup" on the Remote
         // Indicator popup during `devcontainer up`).
+        let Some(window) = self.windows.get(&window_id) else {
+            self.plugin_manager.read().unwrap().reject_callback(
+                callback_id,
+                format!(
+                    "spawnHostProcess: window {} is no longer available",
+                    window_id.0
+                ),
+            );
+            return;
+        };
+        let default_cwd = window.root.to_string_lossy().into_owned();
+        let workspace_trust = std::sync::Arc::clone(&window.authority().workspace_trust);
         if let (Some(runtime), Some(bridge)) = (&self.tokio_runtime, &self.async_bridge) {
             use tokio::io::{AsyncReadExt, BufReader};
             use tokio::process::Command as TokioCommand;
 
-            let effective_cwd = cwd.or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .ok()
-            });
+            let effective_cwd = cwd.or(Some(default_cwd));
             let sender = bridge.sender();
             let process_id = callback_id.as_u64();
 
@@ -3250,10 +4539,8 @@ impl Editor {
             // fails every host spawn; Restricted refuses repo-local
             // executables. Without this, Blocked wouldn't actually block
             // everything.
-            if let crate::services::workspace_trust::SpawnDecision::Deny(reason) = self
-                .authority()
-                .workspace_trust
-                .decide(&command, effective_cwd.as_deref())
+            if let crate::services::workspace_trust::SpawnDecision::Deny(reason) =
+                workspace_trust.decide(&command, effective_cwd.as_deref())
             {
                 #[allow(clippy::let_underscore_must_use)]
                 let _ = sender.send(AsyncMessage::PluginProcessOutput {
@@ -3266,7 +4553,8 @@ impl Editor {
             }
 
             let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
-            self.host_process_handles.insert(process_id, kill_tx);
+            self.host_process_handles
+                .insert(process_id, (window_id, kill_tx));
 
             runtime.spawn(async move {
                 use crate::services::process_hidden::HideWindow;
@@ -3355,42 +4643,43 @@ impl Editor {
 
     fn handle_spawn_background_process(
         &mut self,
+        window_id: fresh_core::WindowId,
         process_id: u64,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
         callback_id: JsCallbackId,
     ) {
-        // Spawn background process with streaming output via tokio
+        let Some(window) = self.windows.get(&window_id) else {
+            self.plugin_manager.read().unwrap().reject_callback(
+                callback_id,
+                format!(
+                    "spawnBackgroundProcess: window {} is no longer available",
+                    window_id.0
+                ),
+            );
+            return;
+        };
+        let spawner = std::sync::Arc::clone(&window.authority().long_running_spawner);
+        let effective_cwd = cwd
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| window.root.clone());
+
         if let (Some(runtime), Some(bridge)) = (&self.tokio_runtime, &self.async_bridge) {
             use tokio::io::{AsyncBufReadExt, BufReader};
-            use tokio::process::Command as TokioCommand;
-
-            let effective_cwd = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            });
 
             let sender = bridge.sender();
             let sender_stdout = sender.clone();
             let sender_stderr = sender.clone();
             let callback_id_u64 = callback_id.as_u64();
 
-            // Receiver may be dropped if editor is shutting down
-            #[allow(clippy::let_underscore_must_use)]
             let handle = runtime.spawn(async move {
-                use crate::services::process_hidden::HideWindow;
-                let mut child = match TokioCommand::new(&command)
-                    .args(&args)
-                    .current_dir(&effective_cwd)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .hide_window()
-                    .spawn()
+                let mut child = match spawner
+                    .spawn_stdio(&command, &args, Vec::new(), Some(&effective_cwd), None)
+                    .await
                 {
                     Ok(child) => child,
-                    Err(e) => {
+                    Err(error) => {
                         let _ = sender.send(crate::services::async_bridge::AsyncMessage::Plugin(
                             fresh_core::api::PluginAsyncMessage::ProcessExit {
                                 process_id,
@@ -3398,58 +4687,54 @@ impl Editor {
                                 exit_code: -1,
                             },
                         ));
-                        tracing::error!("Failed to spawn background process: {}", e);
+                        tracing::error!(?window_id, "Failed to spawn background process: {error}");
                         return;
                     }
                 };
 
-                // Stream stdout
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
-                let pid = process_id;
+                let stdout = child.take_stdout();
+                let stderr = child.take_stderr();
 
-                // Spawn stdout reader
                 if let Some(stdout) = stdout {
-                    let sender = sender_stdout;
                     tokio::spawn(async move {
                         let reader = BufReader::new(stdout);
                         let mut lines = reader.lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            let _ =
-                                sender.send(crate::services::async_bridge::AsyncMessage::Plugin(
+                            let _ = sender_stdout.send(
+                                crate::services::async_bridge::AsyncMessage::Plugin(
                                     fresh_core::api::PluginAsyncMessage::ProcessStdout {
-                                        process_id: pid,
+                                        process_id,
                                         data: line + "\n",
                                     },
-                                ));
+                                ),
+                            );
                         }
                     });
                 }
 
-                // Spawn stderr reader
                 if let Some(stderr) = stderr {
-                    let sender = sender_stderr;
                     tokio::spawn(async move {
                         let reader = BufReader::new(stderr);
                         let mut lines = reader.lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            let _ =
-                                sender.send(crate::services::async_bridge::AsyncMessage::Plugin(
+                            let _ = sender_stderr.send(
+                                crate::services::async_bridge::AsyncMessage::Plugin(
                                     fresh_core::api::PluginAsyncMessage::ProcessStderr {
-                                        process_id: pid,
+                                        process_id,
                                         data: line + "\n",
                                     },
-                                ));
+                                ),
+                            );
                         }
                     });
                 }
 
-                // Wait for process to complete
-                let exit_code = match child.wait().await {
-                    Ok(status) => status.code().unwrap_or(-1),
-                    Err(_) => -1,
-                };
-
+                let exit_code = child
+                    .wait()
+                    .await
+                    .ok()
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
                 let _ = sender.send(crate::services::async_bridge::AsyncMessage::Plugin(
                     fresh_core::api::PluginAsyncMessage::ProcessExit {
                         process_id,
@@ -3459,11 +4744,9 @@ impl Editor {
                 ));
             });
 
-            // Store abort handle for potential kill
             self.background_process_handles
-                .insert(process_id, handle.abort_handle());
+                .insert(process_id, (window_id, handle.abort_handle()));
         } else {
-            // No runtime - reject immediately
             self.plugin_manager
                 .read()
                 .unwrap()
@@ -4179,6 +5462,38 @@ impl Editor {
         self.refresh_lsp_status_popup_if_open();
     }
 
+    fn handle_send_omp_companion_command(
+        &mut self,
+        terminal_id: fresh_core::WindowTerminalId,
+        command_type: fresh_core::api::OmpCompanionCommandType,
+        target: fresh_core::api::OmpCompanionCommandTargetV1,
+        request_id: u64,
+        context: &PluginCommandContext,
+    ) {
+        if !self.context_may_use_privileged_terminal_options(context) {
+            tracing::warn!(
+                plugin = %context.plugin_name,
+                "rejected OMP companion control from an untrusted plugin"
+            );
+            self.resolve_bool_for_context(context, request_id, false);
+            return;
+        }
+        let sent = self.windows.get(&terminal_id.window).is_some_and(|window| {
+            window.terminal_companions.get(&terminal_id.terminal)
+                == Some(&fresh_core::api::TerminalCompanion::Omp)
+                && window
+                    .terminal_manager
+                    .get(terminal_id.terminal)
+                    .is_some_and(|handle| {
+                        handle.is_alive()
+                            && handle.companion_kind()
+                                == Some(fresh_core::api::TerminalCompanion::Omp)
+                            && handle.enqueue_omp_companion_command(command_type, &target)
+                    })
+        });
+        self.resolve_bool_for_context(context, request_id, sent);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_create_window_with_terminal(
         &mut self,
@@ -4186,75 +5501,87 @@ impl Editor {
         label: String,
         cwd: Option<String>,
         command: Option<Vec<String>>,
+        relaunch: Option<Vec<String>>,
         title: Option<String>,
         resume: Option<Vec<String>>,
         env: Option<std::collections::HashMap<String, String>>,
         allow_script: bool,
+        companion: Option<fresh_core::api::TerminalCompanion>,
+        selected_agent: bool,
+        activate: bool,
+        initial_state: std::collections::HashMap<String, serde_json::Value>,
         request_id: u64,
+        context: &PluginCommandContext,
     ) {
         let callback_id = JsCallbackId::from(request_id);
+        if (allow_script || companion.is_some() || selected_agent)
+            && !self.context_may_use_privileged_terminal_options(context)
+        {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                "createWindowWithTerminal: privileged terminal options require the trusted bundled Orchestrator"
+                    .to_string(),
+            );
+            return;
+        }
         if !root.is_absolute() {
-            let msg = format!(
+            let error = format!(
                 "createWindowWithTerminal: root must be absolute, got {:?}",
                 root
             );
-            tracing::warn!("{}", msg);
-            self.plugin_manager
-                .read()
-                .unwrap()
-                .reject_callback(callback_id, msg);
+            tracing::warn!("{error}");
+            self.reject_callback_for_context(context, callback_id, error);
             return;
         }
-        let cwd_buf = cwd.map(std::path::PathBuf::from);
-        // The Orchestrator's "New Session (Local)" flow births its own local
-        // backend rather than inheriting the active window's (which may be a
-        // container/SSH/k8s session). Remote sessions take the
-        // `attachRemoteAgent` → `create_remote_session_window` path, which
-        // passes its connected authority. `resume` is the agent-resume argv
-        // carried through to the new session's terminal. The new local
-        // session gets its own per-session trust scoped to its root.
-        let new_authority = self.local_session_authority(&root);
+
+        let cwd = cwd.map(std::path::PathBuf::from);
+        let authority = self.local_session_authority(&root);
         match self.create_window_with_terminal(
             root,
             label,
-            cwd_buf,
+            cwd,
             command,
+            relaunch,
             title,
-            new_authority,
+            authority,
             resume,
             env,
             allow_script,
+            companion,
+            selected_agent,
+            activate,
+            Some((context.plugin_name.to_string(), initial_state)),
         ) {
             Ok((window_id, terminal_id, buffer_id)) => {
-                let api_result = fresh_core::api::SessionWithTerminalResult {
+                let result = fresh_core::api::SessionWithTerminalResult {
                     window_id: window_id.0,
-                    // The durable id is minted with the window, so a caller
-                    // gets it in the same breath as the create — no lookup,
-                    // and nothing to miss if the window is closed later.
                     stable_id: self
                         .windows
                         .get(&window_id)
-                        .map(|w| w.stable_id.clone())
+                        .map(|window| window.stable_id.clone())
                         .unwrap_or_default(),
-                    terminal_id: terminal_id.0 as u64,
+                    terminal_id: fresh_core::WindowTerminalId::new(window_id, terminal_id),
                     buffer_id: buffer_id.0 as u64,
                 };
-                self.plugin_manager.read().unwrap().resolve_callback(
-                    callback_id,
-                    serde_json::to_string(&api_result).unwrap_or_default(),
+                self.send_plugin_response(
+                    fresh_core::api::PluginResponse::WindowWithTerminalCreated {
+                        request_id,
+                        result,
+                    },
                 );
             }
-            Err(e) => {
-                tracing::error!("createWindowWithTerminal failed: {e}");
-                self.plugin_manager
-                    .read()
-                    .unwrap()
-                    .reject_callback(callback_id, format!("createWindowWithTerminal: {e}"));
+            Err(error) => {
+                tracing::error!("createWindowWithTerminal failed: {error}");
+                self.reject_callback_for_context(
+                    context,
+                    callback_id,
+                    format!("createWindowWithTerminal: {error}"),
+                );
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn handle_create_terminal(
         &mut self,
@@ -4263,118 +5590,155 @@ impl Editor {
         ratio: Option<f32>,
         focus: Option<bool>,
         persistent: bool,
-        target_session_id: Option<fresh_core::WindowId>,
+        target_id: fresh_core::WindowId,
         command: Option<Vec<String>>,
+        relaunch: Option<Vec<String>>,
         title: Option<String>,
         resume: Option<Vec<String>>,
         env: Option<std::collections::HashMap<String, String>>,
+        companion: Option<fresh_core::api::TerminalCompanion>,
         allow_script: bool,
+        selected_agent: bool,
         request_id: u64,
+        context: &PluginCommandContext,
     ) {
-        // Resolve target window. Explicit `windowId` wins when the
-        // window exists; otherwise we operate on the active window.
-        // Both cases route through `Window::create_plugin_terminal`
-        // so spawning into an inactive session reuses the same code
-        // path — no separate migration helper, no half-state leaks
-        // between windows.
-        let target_id = target_session_id
-            .filter(|id| self.windows.contains_key(id))
-            .unwrap_or(self.active_window);
-        let is_active_target = target_id == self.active_window;
+        let callback_id = fresh_core::api::JsCallbackId::from(request_id);
+        if (allow_script || companion.is_some() || selected_agent)
+            && !self.context_may_use_privileged_terminal_options(context)
+        {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                "createTerminal: privileged terminal options require the trusted bundled Orchestrator"
+                    .to_string(),
+            );
+            return;
+        }
+        // Host-internal commands are intentionally not loader-scoped. Every
+        // runtime plugin envelope must still target the exact source window.
+        if context.provenance != fresh_core::api::PluginLoadProvenance::Internal
+            && context
+                .source_window
+                .is_some_and(|source_window| source_window != target_id)
+        {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                "createTerminal: target window does not match its command context".to_string(),
+            );
+            return;
+        }
+        if !self.windows.contains_key(&target_id) {
+            self.reject_callback_for_context(
+                context,
+                callback_id,
+                format!(
+                    "createTerminal: window {} is no longer available",
+                    target_id.0
+                ),
+            );
+            return;
+        }
 
-        let cwd_buf = cwd.map(std::path::PathBuf::from);
-        let split_direction = direction.as_deref().map(|d| match d {
+        let terminal_env =
+            match crate::app::terminal::agent_command_env(target_id, env, allow_script) {
+                Ok(env) => env,
+                Err(error) => {
+                    self.reject_callback_for_context(
+                        context,
+                        callback_id,
+                        format!("createTerminal: {error}"),
+                    );
+                    return;
+                }
+            };
+        let is_active_target = target_id == self.active_window;
+        let previous_active_buffer = is_active_target.then(|| self.active_window().active_buffer());
+        let direction = direction.as_deref().map(|direction| match direction {
             "horizontal" => crate::model::event::SplitDirection::Horizontal,
             _ => crate::model::event::SplitDirection::Vertical,
         });
-
-        // Capture the editor-active buffer before the spawn so we
-        // can detect whether `Window::create_plugin_terminal`'s
-        // per-window mutations also flipped the editor-active buffer
-        // (only possible when `is_active_target`). If it did, the
-        // `buffer_activated` plugin hook needs to fire here at the
-        // Editor level — the Window method only mutates per-window
-        // state.
-        let prev_active = if is_active_target {
-            Some(self.active_window().active_buffer())
-        } else {
-            None
-        };
-
-        // Assemble the extra env injected into the spawned terminal's child:
-        // `FRESH_BIN` plus, when `allow_script` is given, a capability
-        // token bound to the TARGET window + that allowlist (with
-        // `FRESH_SESSION`). This is what lets an agent spawned into an
-        // *existing* window drive the editor exactly like one born via
-        // `createWindowWithTerminal` — both paths share the same helper.
-        let terminal_env = crate::app::terminal::agent_command_env(target_id, env, allow_script);
-
-        let result = {
-            let target = self
-                .windows
-                .get_mut(&target_id)
-                .expect("target window present (existence checked above)");
-            let spec = crate::app::terminal::PluginTerminalSpec {
-                cwd: cwd_buf,
-                direction: split_direction,
+        let restore_command = relaunch.or_else(|| command.clone());
+        let result = self
+            .windows
+            .get_mut(&target_id)
+            .expect("target window existence checked above")
+            .create_plugin_terminal(crate::app::terminal::PluginTerminalSpec {
+                cwd: cwd.map(std::path::PathBuf::from),
+                direction,
                 ratio,
                 focus: focus.unwrap_or(true),
                 persistent,
-                command: command.clone(),
-                title: title.filter(|t| !t.is_empty()),
-                env: terminal_env.clone(),
-            };
-            let spawned = target.create_plugin_terminal(spec);
-            // Record the launch/resume argv exactly as `create_window_with_terminal`
-            // does. Without this, an agent spawned into an *existing* window (the
-            // Run-Agent "current workspace" path) was not a restorable session
-            // terminal at all: it vanished on workspace save, and a restart
-            // respawned a bare shell instead of the agent.
-            if let Ok((terminal_id, _, _)) = &spawned {
-                target.mark_terminal_restorable(*terminal_id, command, resume);
-                // File the token this terminal's child was handed, so workspace
-                // capture persists the grant and a restore re-mints it.
-                target.record_terminal_script_token(*terminal_id, &terminal_env);
-            }
-            spawned
-        };
+                command,
+                title: title.filter(|title| !title.is_empty()),
+                env: terminal_env.vars.clone(),
+                companion,
+                script_capability: terminal_env.script_capability(),
+            });
+
         match result {
             Ok((terminal_id, buffer_id, created_split_id)) => {
-                if is_active_target {
-                    let new_active = self.active_window().active_buffer();
-                    if prev_active != Some(new_active) {
-                        #[cfg(feature = "plugins")]
-                        self.update_plugin_state_snapshot();
-                        #[cfg(feature = "plugins")]
-                        self.plugin_manager.read().unwrap().run_hook(
-                            "buffer_activated",
-                            crate::services::plugins::hooks::HookArgs::BufferActivated {
-                                buffer_id: new_active,
-                            },
-                        );
+                let new_active_buffer = {
+                    let target = self
+                        .windows
+                        .get_mut(&target_id)
+                        .expect("spawned terminal's window must still exist");
+                    target.mark_terminal_restorable(terminal_id, restore_command, resume);
+                    target.record_terminal_script_token(
+                        terminal_id,
+                        terminal_env.script_token.as_deref(),
+                    );
+                    if selected_agent {
+                        target.tracked_agent_terminal = Some(terminal_id);
                     }
-                }
-                let api_result = fresh_core::api::TerminalResult {
-                    buffer_id: buffer_id.0 as u64,
-                    terminal_id: terminal_id.0 as u64,
-                    split_id: created_split_id.map(|s| s.0 .0 as u64),
+                    if let Some(pid) = target
+                        .terminal_manager
+                        .get(terminal_id)
+                        .and_then(|handle| handle.pid())
+                    {
+                        target
+                            .process_groups
+                            .register(pid, format!("terminal #{}", terminal_id.0));
+                    }
+                    target.active_buffer()
                 };
-                self.plugin_manager.read().unwrap().resolve_callback(
-                    fresh_core::api::JsCallbackId::from(request_id),
-                    serde_json::to_string(&api_result).unwrap_or_default(),
-                );
-                tracing::info!(
-                    "Plugin created terminal {:?} with buffer {:?} in window {:?}",
-                    terminal_id,
+                if let Err(error) = self.save_workspace_for(target_id) {
+                    terminal_env.revoke();
+                    self.handle_close_terminal(fresh_core::WindowTerminalId::new(
+                        target_id,
+                        terminal_id,
+                    ));
+                    self.reject_callback_for_context(
+                        context,
+                        callback_id,
+                        format!("Failed to publish created terminal: {error}"),
+                    );
+                    return;
+                }
+                if is_active_target && previous_active_buffer != Some(new_active_buffer) {
+                    #[cfg(feature = "plugins")]
+                    self.update_plugin_state_snapshot();
+                    #[cfg(feature = "plugins")]
+                    self.plugin_manager.read().unwrap().run_hook(
+                        "buffer_activated",
+                        crate::services::plugins::hooks::HookArgs::BufferActivated {
+                            buffer_id: new_active_buffer,
+                        },
+                    );
+                }
+                self.send_plugin_response(fresh_core::api::PluginResponse::TerminalCreated {
+                    request_id,
                     buffer_id,
-                    target_id
-                );
+                    terminal_id: fresh_core::WindowTerminalId::new(target_id, terminal_id),
+                    split_id: created_split_id.map(|split| split.0),
+                });
             }
-            Err(e) => {
-                tracing::error!("Failed to create terminal for plugin: {e}");
-                self.plugin_manager.read().unwrap().reject_callback(
-                    fresh_core::api::JsCallbackId::from(request_id),
-                    format!("Failed to create terminal: {e}"),
+            Err(error) => {
+                terminal_env.revoke();
+                self.reject_callback_for_context(
+                    context,
+                    callback_id,
+                    format!("Failed to create terminal: {error}"),
                 );
             }
         }
@@ -4432,9 +5796,6 @@ impl Editor {
     }
 
     fn handle_await_next_key(&mut self, callback_id: fresh_core::api::JsCallbackId) {
-        // If keys arrived during a key-capture window while no callback was
-        // pending, drain the front-most buffered key and resolve immediately.
-        // Otherwise enqueue the callback for the next live keypress.
         if let Some(payload) = self
             .active_window_mut()
             .pending_key_capture_buffer
@@ -4454,54 +5815,47 @@ impl Editor {
 
     fn handle_spawn_process(
         &mut self,
+        window_id: fresh_core::WindowId,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
         stdout_to: Option<std::path::PathBuf>,
         callback_id: fresh_core::api::JsCallbackId,
     ) {
+        let Some(window) = self.windows.get(&window_id) else {
+            self.plugin_manager.read().unwrap().reject_callback(
+                callback_id,
+                format!(
+                    "spawnProcess: window {} is no longer available",
+                    window_id.0
+                ),
+            );
+            return;
+        };
+        let effective_cwd = cwd.or_else(|| Some(window.root.to_string_lossy().into_owned()));
+        let spawner = std::sync::Arc::clone(&window.authority().process_spawner);
         if let (Some(runtime), Some(bridge)) = (&self.tokio_runtime, &self.async_bridge) {
-            let effective_cwd = cwd.or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .ok()
-            });
             let sender = bridge.sender();
-            let spawner = self.authority().process_spawner.clone();
-
-            // Kill plumbing: register a oneshot keyed by process_id, same
-            // pattern as handle_spawn_host_process. JS calls
-            // `_killHostProcess(id)` → `handle_kill_host_process` fires
-            // the tx; the spawner's `spawn_cancellable` races against rx.
             let process_id = callback_id.as_u64();
             let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-            self.host_process_handles.insert(process_id, kill_tx);
+            self.host_process_handles
+                .insert(process_id, (window_id, kill_tx));
 
             runtime.spawn(async move {
-                #[allow(clippy::let_underscore_must_use)]
                 let outcome = spawner
                     .spawn_cancellable(command, args, effective_cwd, stdout_to, kill_rx)
                     .await;
-                match outcome {
-                    Ok(result) => {
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = sender.send(AsyncMessage::PluginProcessOutput {
-                            process_id,
-                            stdout: result.stdout,
-                            stderr: result.stderr,
-                            exit_code: result.exit_code,
-                        });
-                    }
-                    Err(e) => {
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = sender.send(AsyncMessage::PluginProcessOutput {
-                            process_id,
-                            stdout: String::new(),
-                            stderr: e.to_string(),
-                            exit_code: -1,
-                        });
-                    }
-                }
+                let (stdout, stderr, exit_code) = match outcome {
+                    Ok(result) => (result.stdout, result.stderr, result.exit_code),
+                    Err(error) => (String::new(), error.to_string(), -1),
+                };
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = sender.send(AsyncMessage::PluginProcessOutput {
+                    process_id,
+                    stdout,
+                    stderr,
+                    exit_code,
+                });
             });
         } else {
             self.plugin_manager
@@ -4511,53 +5865,77 @@ impl Editor {
         }
     }
 
-    fn handle_kill_host_process(&mut self, process_id: u64) {
-        // Removing from the map gives us the oneshot sender. Firing it signals
-        // the spawn task to start_kill() the child and reap. Unknown IDs are
-        // intentionally silent — the process may have already exited.
-        if let Some(tx) = self.host_process_handles.remove(&process_id) {
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = tx.send(());
-            tracing::debug!("KillHostProcess: sent kill for process_id={}", process_id);
-        } else {
-            tracing::debug!(
-                "KillHostProcess: unknown process_id={} (already exited?)",
-                process_id
-            );
+    fn handle_kill_host_process(&mut self, window_id: fresh_core::WindowId, process_id: u64) {
+        match self
+            .host_process_handles
+            .get(&process_id)
+            .map(|(owner, _)| *owner)
+        {
+            Some(owner) if owner == window_id => {
+                let (_, tx) = self
+                    .host_process_handles
+                    .remove(&process_id)
+                    .expect("owner checked above");
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = tx.send(());
+                tracing::debug!(?window_id, process_id, "sent process kill");
+            }
+            Some(owner) => tracing::warn!(
+                ?window_id,
+                ?owner,
+                process_id,
+                "refused cross-window process kill"
+            ),
+            None => tracing::debug!(
+                ?window_id,
+                process_id,
+                "process already exited or was unknown"
+            ),
         }
     }
 
-    fn handle_set_authority(&mut self, payload: serde_json::Value) {
-        // Payload is opaque at the fresh-core layer; the concrete schema lives
-        // in services::authority::AuthorityPayload so core stays ignorant of backend kinds.
-        match serde_json::from_value::<crate::services::authority::AuthorityPayload>(payload) {
-            Ok(parsed) => {
-                // The new authority shares the editor's live trust + env
-                // handles, so its spawners are gated and env'd identically.
-                let trust = std::sync::Arc::clone(&self.authority().workspace_trust);
-                let env = std::sync::Arc::clone(&self.authority().env_provider);
-                // Record the spec on the active session *before* the restart
-                // so it persists (save-on-restart) and the rebuilt editor
-                // restores this session under the same backend instead of
-                // degrading it to local. The payload is cloned because
-                // `from_plugin_payload` consumes it.
-                let spec = crate::services::authority::SessionAuthoritySpec::Plugin(parsed.clone());
-                match crate::services::authority::Authority::from_plugin_payload(parsed, trust, env)
-                {
-                    Ok(auth) => {
-                        tracing::info!("Plugin installed new authority");
-                        self.active_window_mut().authority_spec = spec;
-                        self.install_authority(auth);
+    fn handle_set_authority(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        payload: serde_json::Value,
+    ) {
+        let Some(window) = self.windows.get(&window_id) else {
+            tracing::warn!(?window_id, "SetAuthority targeted a closed window");
+            return;
+        };
+        let trust = std::sync::Arc::clone(&window.authority().workspace_trust);
+        let env = std::sync::Arc::clone(&window.authority().env_provider);
+        let parsed =
+            match serde_json::from_value::<crate::services::authority::AuthorityPayload>(payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    tracing::warn!(?window_id, "setAuthority: failed to parse payload: {error}");
+                    if let Some(window) = self.windows.get_mut(&window_id) {
+                        window.status_message = Some(format!("setAuthority rejected: {error}"));
                     }
-                    Err(e) => {
-                        tracing::warn!("setAuthority: invalid payload: {}", e);
-                        self.set_status_message(format!("setAuthority rejected: {}", e));
-                    }
+                    return;
                 }
+            };
+        let spec = crate::services::authority::SessionAuthoritySpec::Plugin(parsed.clone());
+        match crate::services::authority::Authority::from_plugin_payload(parsed, trust, env) {
+            Ok(authority) => {
+                tracing::info!(
+                    ?window_id,
+                    "Plugin installed new authority; restarting editor"
+                );
+                self.session_keepalives.remove(&window_id);
+                self.set_session_authority_spec(window_id, spec);
+                // Route the destructive authority restart through the exact
+                // addressed window. The old editor remains wholly on its old
+                // authority until it is dropped; no live resource is hot-swapped.
+                self.switch_active_window_pointer(window_id);
+                self.install_authority(authority);
             }
-            Err(e) => {
-                tracing::warn!("setAuthority: failed to parse payload: {}", e);
-                self.set_status_message(format!("setAuthority rejected: {}", e));
+            Err(error) => {
+                tracing::warn!(?window_id, "setAuthority: invalid payload: {error}");
+                if let Some(window) = self.windows.get_mut(&window_id) {
+                    window.status_message = Some(format!("setAuthority rejected: {error}"));
+                }
             }
         }
     }
@@ -4606,29 +5984,28 @@ impl Editor {
     /// spec and, for a remote-agent session, kick off the async connect tagged
     /// with this window so its result re-points *this* window.
     fn start_remote_reconnect(&mut self, window_id: fresh_core::WindowId) {
+        if self.remote_reconnect_inflight(window_id) {
+            return;
+        }
         let Some(spec) = self
             .windows
             .get(&window_id)
-            .map(|w| w.authority_spec.clone())
+            .map(|window| window.authority_spec.clone())
         else {
             return;
         };
         match spec {
             crate::services::authority::SessionAuthoritySpec::Local => {}
             crate::services::authority::SessionAuthoritySpec::RemoteAgent(agent_spec) => {
-                // Synthetic, window-derived request id (well clear of the
-                // low-numbered JS callback ids) so the in-flight/cancel
-                // tracking works and a repeated switch doesn't double-connect.
-                let request_id = u64::MAX - window_id.0;
-                if self.remote_attach_inflight.contains(&request_id) {
-                    return;
+                if let Some(window) = self.windows.get_mut(&window_id) {
+                    window.remote_reconnect_error = None;
                 }
-                // Clear any prior FailedAttach so the indicator shows
-                // "Connecting" (not a stale error) while this retry runs.
-                if let Some(w) = self.windows.get_mut(&window_id) {
-                    w.remote_reconnect_error = None;
-                }
-                self.start_remote_connect(agent_spec, Some(window_id), request_id);
+                self.start_remote_connect(
+                    agent_spec,
+                    crate::app::RemoteAttachOwner::Reconnect { window_id },
+                    true,
+                    None,
+                );
             }
             crate::services::authority::SessionAuthoritySpec::Plugin(_) => {
                 // Container: only the owning plugin can rebuild the backend
@@ -4639,131 +6016,221 @@ impl Editor {
         }
     }
 
-    fn handle_attach_remote_agent(&mut self, payload: serde_json::Value, request_id: u64) {
+    fn handle_attach_remote_agent(
+        &mut self,
+        plugin_instance_id: fresh_core::api::PluginInstanceId,
+        plugin_name: String,
+        window_id: fresh_core::WindowId,
+        payload: serde_json::Value,
+        request_id: u64,
+    ) {
+        if !self.windows.contains_key(&window_id) {
+            self.reject_remote_attach(
+                plugin_instance_id,
+                request_id,
+                "target window closed".to_string(),
+            );
+            return;
+        }
+        // Activation and initial plugin state belong to this attach operation,
+        // not to the persisted backend reconnect spec.
+        let activate = payload
+            .get("activate")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let initial_state = match payload.get("initialState") {
+            None => None,
+            Some(serde_json::Value::Object(values)) => Some((
+                plugin_name,
+                values
+                    .clone()
+                    .into_iter()
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )),
+            Some(_) => {
+                self.reject_remote_attach(
+                    plugin_instance_id,
+                    request_id,
+                    "initialState must be an object".to_string(),
+                );
+                return;
+            }
+        };
         // Opaque at the fresh-core boundary; the concrete schema lives in
         // services::authority so core stays backend-agnostic.
         let spec =
             match serde_json::from_value::<crate::services::authority::RemoteAgentSpec>(payload) {
                 Ok(spec) => spec,
-                Err(e) => {
-                    tracing::warn!("attachRemoteAgent: invalid payload: {}", e);
-                    self.reject_remote_attach(request_id, format!("invalid attach spec: {e}"));
+                Err(error) => {
+                    tracing::warn!("attachRemoteAgent: invalid payload: {error}");
+                    self.reject_remote_attach(
+                        plugin_instance_id,
+                        request_id,
+                        format!("invalid attach spec: {error}"),
+                    );
                     return;
                 }
             };
-        // A plugin attach: spawn a born-attached window or restart (per
-        // `spec.window`), not a reconnect of an existing one.
-        self.start_remote_connect(spec, None, request_id);
+        self.start_remote_connect(
+            spec,
+            crate::app::RemoteAttachOwner::Plugin {
+                plugin_instance_id,
+                request_id,
+                window_id,
+            },
+            activate,
+            initial_state,
+        );
     }
 
-    /// Spawn the async remote connect (carrier + agent bootstrap) for `spec`
-    /// and report the result back via the bridge. Shared by the plugin
-    /// `attachRemoteAgent` op and the reconnect-on-activate path:
-    /// `reconnect_window = Some(id)` re-points *that dormant window's*
-    /// authority on success (no new window / no restart); `None` follows
-    /// `spec.window` (born-attached window vs. global restart).
+    /// Spawn one async remote connection attempt for an exact plugin request
+    /// or reconnecting window. Host attempt ids are independent of JS callback
+    /// ids, so equal numeric ids in separate plugin runtimes cannot collide.
     pub(crate) fn start_remote_connect(
         &mut self,
         spec: crate::services::authority::RemoteAgentSpec,
-        reconnect_window: Option<fresh_core::WindowId>,
-        request_id: u64,
+        owner: crate::app::RemoteAttachOwner,
+        activate: bool,
+        initial_state: Option<(String, std::collections::HashMap<String, serde_json::Value>)>,
     ) {
-        // Take owned handles up front so the immutable borrows of `self`
-        // end before the mutable `set_status_message` / spawn below.
+        let owner_window = match owner {
+            crate::app::RemoteAttachOwner::Plugin { window_id, .. }
+            | crate::app::RemoteAttachOwner::Reconnect { window_id }
+            | crate::app::RemoteAttachOwner::Switch { window_id } => window_id,
+        };
+        if matches!(owner, crate::app::RemoteAttachOwner::Plugin { .. })
+            && !self.windows.contains_key(&owner_window)
+        {
+            if let crate::app::RemoteAttachOwner::Plugin {
+                plugin_instance_id,
+                request_id,
+                ..
+            } = owner
+            {
+                self.reject_remote_attach(
+                    plugin_instance_id,
+                    request_id,
+                    "target window closed".to_string(),
+                );
+            }
+            return;
+        }
+
         let runtime = self.tokio_runtime.clone();
-        let sender = self.async_bridge.as_ref().map(|b| b.sender());
+        let sender = self.async_bridge.as_ref().map(|bridge| bridge.sender());
         let (Some(runtime), Some(sender)) = (runtime, sender) else {
-            self.reject_remote_attach(request_id, "async runtime not available".to_string());
+            let error = "async runtime not available".to_string();
+            match owner {
+                crate::app::RemoteAttachOwner::Plugin {
+                    plugin_instance_id,
+                    request_id,
+                    ..
+                } => self.reject_remote_attach(plugin_instance_id, request_id, error),
+                crate::app::RemoteAttachOwner::Reconnect { window_id } => {
+                    if self.dormant_remote.contains_key(&window_id)
+                        && !self.windows.contains_key(&window_id)
+                    {
+                        self.ensure_dormant_shell(window_id);
+                    }
+                    if let Some(window) = self.windows.get_mut(&window_id) {
+                        window.remote_reconnect_error = Some(error.clone());
+                        window.set_status_message(format!("Connection failed: {error}"));
+                    }
+                }
+                crate::app::RemoteAttachOwner::Switch { window_id } => {
+                    if let Some(window) = self.windows.get_mut(&window_id) {
+                        window.set_status_message(format!("Project switch failed: {error}"));
+                    }
+                }
+            }
             return;
         };
-
-        // Track this connect as in-flight so a plugin can cancel it (the
-        // New-Session dialog's Cancel) before it resolves. The cancel sender is
-        // handed to the connect via its `select!`; signalling it tears down the
-        // in-flight carrier child.
-        self.remote_attach_inflight.insert(request_id);
+        let Some(attempt_id) = self.begin_remote_attach_attempt(owner) else {
+            return;
+        };
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        self.remote_attach_cancels.insert(request_id, cancel_tx);
+        self.remote_attach_cancels.insert(attempt_id, cancel_tx);
 
-        // Window-mode opts captured before `spec` is consumed — when `window`
-        // is set the main loop spawns a born-attached new window instead of
-        // restarting the whole editor.
         let window_mode = spec.window;
         let window_label = spec.label.clone();
         let window_command = spec.command.clone();
-        // A remote session gets its **own** fresh trust + env handles — never
-        // a clone of the launching session's `Arc`s — so a born-attached
-        // remote window can't share (and leak) trust/env with the window it
-        // was launched from. The trust *level* is copied by value from the
-        // launching context (independent handle thereafter); env starts
-        // inactive (the remote's env rides the spawner's captured probe).
-        let trust = std::sync::Arc::new(crate::services::workspace_trust::WorkspaceTrust::new(
-            None,
-            self.authority().workspace_trust.level(),
-        ));
-        let env = std::sync::Arc::new(crate::services::env_provider::EnvProvider::inactive());
-
-        // The connect (spawn the carrier, bootstrap the agent, await `ready`)
-        // is async and can take seconds, so run it on the runtime and report
-        // back via the bridge instead of blocking the event loop. On success
-        // the main loop installs the authority + keepalive (restart or new
-        // window); on failure it surfaces the error. Both transports converge
-        // on the same `RemoteAttachReady`; only the connect future differs.
-        use crate::services::authority::RemoteTransportSpec;
-        let base_env = spec.base_env.clone();
-        // The reconnect spec persisted on the session (so a restart can bring
-        // this remote backend back). Cloned before `spec` is consumed below.
-        let session_spec =
-            crate::services::authority::SessionAuthoritySpec::RemoteAgent(spec.clone());
-        let mode_for = |label: &str| {
-            if let Some(window_id) = reconnect_window {
+        let window_initial_state = initial_state.clone();
+        let mode_for = |label: &str| match owner {
+            crate::app::RemoteAttachOwner::Reconnect { window_id } => {
                 crate::services::async_bridge::RemoteAttachMode::Reconnect { window_id }
-            } else if window_mode {
+            }
+            crate::app::RemoteAttachOwner::Switch { window_id } => {
+                crate::services::async_bridge::RemoteAttachMode::Switch { window_id }
+            }
+            crate::app::RemoteAttachOwner::Plugin { .. } if window_mode => {
                 crate::services::async_bridge::RemoteAttachMode::Window {
                     label: window_label.clone().unwrap_or_else(|| label.to_string()),
                     command: window_command.clone(),
+                    activate,
+                    initial_state: window_initial_state.clone(),
                 }
-            } else {
+            }
+            crate::app::RemoteAttachOwner::Plugin { .. } => {
                 crate::services::async_bridge::RemoteAttachMode::Restart
             }
         };
 
-        match spec.transport {
+        use crate::services::authority::RemoteTransportSpec;
+        if spec.has_identity_claim() && spec.verified_identity().is_none() {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = sender.send(AsyncMessage::RemoteAttachFailed {
+                error: "saved remote tenant identity is incomplete or invalid".to_string(),
+                attempt_id,
+            });
+            return;
+        }
+        match spec.transport.clone() {
             RemoteTransportSpec::KubectlExec { .. } => {
-                let (target, base_env) = spec.into_kube_target();
+                let expected_identity = spec.verified_identity();
+                let (target, base_env) = spec.clone().into_kube_target();
                 let label = target.display();
-                // Pod-side workspace to re-root at (e.g. `/workspace`).
-                let workspace = target.workspace.clone().map(std::path::PathBuf::from);
                 let mode = mode_for(&label);
-                self.set_status_message(format!("Connecting to {label}…"));
+                let dir_context = self.dir_context.clone();
+                let expected_spec = spec;
+                if let Some(window) = self.windows.get_mut(&owner_window) {
+                    window.set_status_message(format!("Connecting to {label}…"));
+                }
                 runtime.spawn(async move {
                     let outcome = crate::services::authority::connect_kube_authority(
                         target,
                         base_env,
-                        trust,
-                        env,
+                        expected_identity,
+                        dir_context,
                         Some(cancel_rx),
                     )
                     .await;
-                    let msg = match outcome {
-                        Ok((authority, keepalive)) => AsyncMessage::RemoteAttachReady(
-                            crate::services::async_bridge::RemoteAttachReady {
-                                authority,
-                                keepalive: Box::new(keepalive),
-                                working_dir: workspace,
-                                mode,
-                                spec: session_spec,
-                                request_id,
-                            },
-                        ),
-                        Err(e) => AsyncMessage::RemoteAttachFailed {
-                            error: e.to_string(),
-                            request_id,
-                            reconnect_window,
+                    let message = match outcome {
+                        Ok((mut authority, keepalive, identity)) => {
+                            let restore_allowed = expected_spec.identity_matches(&identity);
+                            let mut verified_spec = expected_spec;
+                            verified_spec.set_verified_identity(&identity);
+                            authority.set_remote_session_spec(verified_spec.clone());
+                            AsyncMessage::RemoteAttachReady(
+                                crate::services::async_bridge::RemoteAttachReady {
+                                    authority,
+                                    keepalive: Box::new(keepalive),
+                                    working_dir: Some(identity.canonical_root),
+                                    mode,
+                                    spec: crate::services::authority::SessionAuthoritySpec::RemoteAgent(
+                                        verified_spec,
+                                    ),
+                                    restore_allowed,
+                                    attempt_id,
+                                },
+                            )
+                        }
+                        Err(error) => AsyncMessage::RemoteAttachFailed {
+                            error: error.to_string(),
+                            attempt_id,
                         },
                     };
                     #[allow(clippy::let_underscore_must_use)]
-                    let _ = sender.send(msg);
+                    let _ = sender.send(message);
                 });
             }
             RemoteTransportSpec::Ssh {
@@ -4774,85 +6241,107 @@ impl Editor {
                 remote_path,
                 extra_args,
             } => {
-                let _ = base_env; // SSH probes its own env on the remote host.
+                let expected_identity = spec.verified_identity();
                 let params = crate::services::remote::ConnectionParams {
-                    user: user.clone().filter(|u| !u.is_empty()),
-                    host: host.clone(),
+                    user: user.filter(|value| !value.is_empty()),
+                    host,
                     port,
                     identity_file: identity_file.map(std::path::PathBuf::from),
                     extra_args,
                 };
-                // Label: `user@host` when a user was given, else bare `host`.
                 let target = params.ssh_target();
                 let label = match port {
-                    Some(p) => format!("ssh:{target}:{p}"),
+                    Some(port) => format!("ssh:{target}:{port}"),
                     None => format!("ssh:{target}"),
                 };
-                let workspace = remote_path.clone().map(std::path::PathBuf::from);
                 let mode = mode_for(&label);
-                self.set_status_message(format!("Connecting to {label}…"));
+                let dir_context = self.dir_context.clone();
+                let expected_spec = spec;
+                if let Some(window) = self.windows.get_mut(&owner_window) {
+                    window.set_status_message(format!("Connecting to {label}…"));
+                }
                 runtime.spawn(async move {
                     let outcome = crate::services::authority::connect_ssh_authority(
                         params,
                         remote_path,
-                        trust,
-                        env,
+                        expected_identity,
+                        dir_context,
                         Some(cancel_rx),
                     )
                     .await;
-                    let msg = match outcome {
-                        Ok((authority, keepalive)) => AsyncMessage::RemoteAttachReady(
-                            crate::services::async_bridge::RemoteAttachReady {
-                                authority,
-                                keepalive: Box::new(keepalive),
-                                working_dir: workspace,
-                                mode,
-                                spec: session_spec,
-                                request_id,
-                            },
-                        ),
-                        Err(e) => AsyncMessage::RemoteAttachFailed {
-                            error: e.to_string(),
-                            request_id,
-                            reconnect_window,
+                    let message = match outcome {
+                        Ok((mut authority, keepalive, identity)) => {
+                            let restore_allowed = expected_spec.identity_matches(&identity);
+                            let mut verified_spec = expected_spec;
+                            verified_spec.set_verified_identity(&identity);
+                            authority.set_remote_session_spec(verified_spec.clone());
+                            AsyncMessage::RemoteAttachReady(
+                                crate::services::async_bridge::RemoteAttachReady {
+                                    authority,
+                                    keepalive: Box::new(keepalive),
+                                    working_dir: Some(identity.canonical_root),
+                                    mode,
+                                    spec: crate::services::authority::SessionAuthoritySpec::RemoteAgent(
+                                        verified_spec,
+                                    ),
+                                    restore_allowed,
+                                    attempt_id,
+                                },
+                            )
+                        }
+                        Err(error) => AsyncMessage::RemoteAttachFailed {
+                            error: error.to_string(),
+                            attempt_id,
                         },
                     };
                     #[allow(clippy::let_underscore_must_use)]
-                    let _ = sender.send(msg);
+                    let _ = sender.send(message);
                 });
             }
         }
     }
 
-    fn handle_set_remote_indicator_state(&mut self, state: serde_json::Value) {
-        // Opaque JSON at the fresh-core boundary; the concrete schema
-        // (RemoteIndicatorOverride) lives in the view crate.
-        match serde_json::from_value::<crate::view::ui::status_bar::RemoteIndicatorOverride>(state)
-        {
-            Ok(over) => {
-                self.remote_indicator_override = Some(over);
+    fn handle_set_remote_indicator_state(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        state: serde_json::Value,
+    ) {
+        let parsed =
+            serde_json::from_value::<crate::view::ui::status_bar::RemoteIndicatorOverride>(state);
+        match (self.windows.get_mut(&window_id), parsed) {
+            (Some(window), Ok(override_state)) => {
+                window.remote_indicator_override = Some(override_state);
             }
-            Err(e) => {
-                tracing::warn!("setRemoteIndicatorState: invalid payload: {}", e);
-                self.set_status_message(format!("setRemoteIndicatorState rejected: {}", e));
+            (Some(window), Err(error)) => {
+                tracing::warn!(
+                    ?window_id,
+                    "setRemoteIndicatorState: invalid payload: {error}"
+                );
+                window.status_message = Some(format!("setRemoteIndicatorState rejected: {error}"));
             }
+            (None, _) => tracing::warn!(
+                ?window_id,
+                "SetRemoteIndicatorState targeted a closed window"
+            ),
         }
     }
 
     fn handle_spawn_process_wait(
         &mut self,
+        window_id: fresh_core::WindowId,
         process_id: u64,
         callback_id: fresh_core::api::JsCallbackId,
     ) {
         tracing::warn!(
-            "SpawnProcessWait not fully implemented - process_id={}",
-            process_id
+            ?window_id,
+            process_id,
+            "SpawnProcessWait is not implemented"
         );
         self.plugin_manager.read().unwrap().reject_callback(
             callback_id,
             format!(
-                "SpawnProcessWait not yet fully implemented for process_id={}",
-                process_id
+                "SpawnProcessWait is not implemented for window {} process {}",
+                window_id.0, process_id
             ),
         );
     }
@@ -4923,10 +6412,31 @@ impl Editor {
         }
     }
 
-    fn handle_kill_background_process(&mut self, process_id: u64) {
-        if let Some(handle) = self.background_process_handles.remove(&process_id) {
-            handle.abort();
-            tracing::debug!("Killed background process {}", process_id);
+    fn handle_kill_background_process(&mut self, window_id: fresh_core::WindowId, process_id: u64) {
+        match self
+            .background_process_handles
+            .get(&process_id)
+            .map(|(owner, _)| *owner)
+        {
+            Some(owner) if owner == window_id => {
+                let (_, handle) = self
+                    .background_process_handles
+                    .remove(&process_id)
+                    .expect("owner checked above");
+                handle.abort();
+                tracing::debug!(?window_id, process_id, "killed background process");
+            }
+            Some(owner) => tracing::warn!(
+                ?window_id,
+                ?owner,
+                process_id,
+                "refused cross-window background process kill"
+            ),
+            None => tracing::debug!(
+                ?window_id,
+                process_id,
+                "background process already exited or was unknown"
+            ),
         }
     }
 
@@ -5435,6 +6945,11 @@ impl Editor {
         } else {
             super::PanelSlot::Floating
         };
+        if !as_dock {
+            // A modal becomes the new input owner as soon as it is published.
+            // Retire gestures captured by the outgoing surface first.
+            self.cancel_active_mouse_gesture();
+        }
         let buffer_id = slot.buffer_id();
         // A centered modal owns the keyboard: blur a focused dock so the
         // two slots never both claim input. Without this, a dock key
@@ -5473,6 +6988,7 @@ impl Editor {
             scrollbar_tracks: Vec::new(),
             scrollbar_mouse: Default::default(),
             scrollbar_drag_key: None,
+            last_outer_rect: None,
             last_inner_rect: None,
             scrollbar_hover_zones: Vec::new(),
             scrollbar_zone_hovered: false,
@@ -5997,42 +7513,63 @@ impl Editor {
         }
     }
 
-    fn handle_send_terminal_input(
-        &mut self,
-        terminal_id: crate::services::terminal::TerminalId,
-        data: String,
-    ) {
-        if let Some(handle) = self.active_window().terminal_manager.get(terminal_id) {
+    fn handle_send_terminal_input(&mut self, terminal: fresh_core::WindowTerminalId, data: String) {
+        if let Some(handle) = self
+            .windows
+            .get(&terminal.window)
+            .and_then(|window| window.terminal_manager.get(terminal.terminal))
+        {
             handle.write(data.as_bytes());
-            tracing::trace!(
-                "Plugin sent {} bytes to terminal {:?}",
-                data.len(),
-                terminal_id
-            );
+            tracing::trace!(?terminal, bytes = data.len(), "plugin sent terminal input");
         } else {
-            tracing::warn!(
-                "Plugin tried to send input to non-existent terminal {:?}",
-                terminal_id
-            );
+            tracing::warn!(?terminal, "plugin targeted a missing terminal for input");
         }
     }
 
-    fn handle_close_terminal(&mut self, terminal_id: crate::services::terminal::TerminalId) {
-        let buffer_to_close = self
-            .active_window()
+    fn handle_close_terminal(&mut self, terminal: fresh_core::WindowTerminalId) {
+        let Some(window) = self.windows.get(&terminal.window) else {
+            tracing::warn!(?terminal, "plugin targeted a closed window terminal");
+            return;
+        };
+        let buffer_to_close = window
             .terminal_buffers
             .iter()
-            .find(|(_, tb)| tb.terminal_id == terminal_id)
-            .map(|(&bid, _)| bid);
-        if let Some(buffer_id) = buffer_to_close {
-            if let Err(e) = self.close_buffer(buffer_id) {
-                tracing::warn!("Failed to close terminal buffer: {}", e);
-            }
-            tracing::info!("Plugin closed terminal {:?}", terminal_id);
-        } else {
-            self.active_window_mut().terminal_manager.close(terminal_id);
-            tracing::info!("Plugin closed terminal {:?} (no buffer found)", terminal_id);
+            .find(|(_, binding)| binding.terminal_id == terminal.terminal)
+            .map(|(&buffer_id, _)| buffer_id);
+
+        self.terminal_stop_tombstones.insert(terminal);
+        let remove_pending_window = self
+            .pending_remote_reattach
+            .get_mut(&terminal.window)
+            .is_some_and(|pending| {
+                pending.remove(&terminal.terminal);
+                pending.is_empty()
+            });
+        if remove_pending_window {
+            self.pending_remote_reattach.remove(&terminal.window);
         }
+
+        if let Some(buffer_id) = buffer_to_close {
+            let previous = self.active_window;
+            self.switch_active_window_pointer(terminal.window);
+            if let Err(error) = self.close_buffer(buffer_id) {
+                tracing::warn!(?terminal, "failed to close terminal buffer: {error}");
+            }
+            self.switch_active_window_pointer(previous);
+            #[cfg(feature = "plugins")]
+            self.update_plugin_state_snapshot();
+            return;
+        }
+
+        self.purge_omp_companion_terminal(terminal);
+        if let Some(window) = self.windows.get_mut(&terminal.window) {
+            if window.tracked_agent_terminal == Some(terminal.terminal) {
+                window.tracked_agent_terminal = None;
+            }
+            window.terminal_companions.remove(&terminal.terminal);
+            window.terminal_manager.close(terminal.terminal);
+        }
+        tracing::info!(?terminal, "plugin closed terminal without a buffer");
     }
 
     /// Fan `signal` out to every process group the window
@@ -6043,11 +7580,52 @@ impl Editor {
     /// failure surfaces without aborting the rest of the
     /// stop flow.
     fn handle_signal_window(&mut self, id: fresh_core::WindowId, signal: &str) {
-        let Some(window) = self.windows.get_mut(&id) else {
+        let Some(window) = self.windows.get(&id) else {
             tracing::warn!("Plugin SignalWindow targeted unknown window {:?}", id);
             return;
         };
-        let results = window.process_groups.signal_all(signal);
+        let terminal_ids: std::collections::HashSet<_> = window
+            .terminal_manager
+            .tracked_terminal_ids()
+            .into_iter()
+            .chain(
+                window
+                    .terminal_buffers
+                    .values()
+                    .map(|binding| binding.terminal_id),
+            )
+            .collect();
+        let terminating = matches!(signal, "SIGTERM" | "SIGKILL");
+
+        if terminating {
+            self.cancel_remote_reconnect(id);
+            self.pending_remote_reattach.remove(&id);
+            for terminal_id in &terminal_ids {
+                let terminal = fresh_core::WindowTerminalId::new(id, *terminal_id);
+                self.terminal_stop_tombstones.insert(terminal);
+                self.purge_omp_companion_terminal(terminal);
+            }
+        }
+
+        let results = {
+            let window = self
+                .windows
+                .get_mut(&id)
+                .expect("window identity was checked above");
+            let results = window.process_groups.signal_all(signal);
+            if terminating {
+                for terminal_id in &terminal_ids {
+                    window.revoke_terminal_script_token(*terminal_id, false);
+                    window.terminal_commands.remove(terminal_id);
+                    window.terminal_resume_commands.remove(terminal_id);
+                    window.terminal_companions.remove(terminal_id);
+                    window.ephemeral_terminals.remove(terminal_id);
+                    window.terminal_manager.close(*terminal_id);
+                }
+                window.tracked_agent_terminal = None;
+            }
+            results
+        };
         for (entry, result) in results {
             match result {
                 Ok(true) => tracing::info!(
@@ -6069,6 +7647,79 @@ impl Editor {
                     entry.leader_pid,
                     entry.label,
                     e
+                ),
+            }
+        }
+    }
+
+    fn handle_stop_window(&mut self, id: fresh_core::WindowId, grace_ms: u64) {
+        let Some(targets) = self
+            .windows
+            .get(&id)
+            .map(|window| window.process_groups.entries().to_vec())
+        else {
+            tracing::warn!(?id, "Plugin StopWindow targeted unknown window");
+            return;
+        };
+
+        // Terminal ids and process incarnations are both captured and retired
+        // synchronously by this one command. Only the exact process snapshot is
+        // carried across the grace period.
+        self.handle_signal_window(id, "SIGTERM");
+        if targets.is_empty() {
+            return;
+        }
+        let Some(bridge) = self.async_bridge.as_ref() else {
+            self.handle_window_stop_escalation(id, targets);
+            return;
+        };
+        let sender = bridge.sender();
+        if let Some(runtime) = self.tokio_runtime.clone() {
+            runtime.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                let _ = sender.send(AsyncMessage::WindowStopEscalation {
+                    window_id: id,
+                    targets,
+                });
+            });
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(grace_ms));
+                let _ = sender.send(AsyncMessage::WindowStopEscalation {
+                    window_id: id,
+                    targets,
+                });
+            });
+        }
+    }
+
+    pub(super) fn handle_window_stop_escalation(
+        &mut self,
+        id: fresh_core::WindowId,
+        targets: Vec<crate::app::window::ProcessGroupEntry>,
+    ) {
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        for (entry, result) in window.process_groups.signal_targets("SIGKILL", &targets) {
+            match result {
+                Ok(true) => tracing::info!(
+                    ?id,
+                    pid = entry.leader_pid,
+                    incarnation = entry.incarnation,
+                    "StopWindow escalated exact process group"
+                ),
+                Ok(false) => tracing::debug!(
+                    ?id,
+                    pid = entry.leader_pid,
+                    incarnation = entry.incarnation,
+                    "StopWindow escalation skipped retired process group"
+                ),
+                Err(error) => tracing::warn!(
+                    ?id,
+                    pid = entry.leader_pid,
+                    incarnation = entry.incarnation,
+                    "StopWindow escalation failed: {error}"
                 ),
             }
         }
@@ -6108,6 +7759,38 @@ mod tests {
     use tokio::io::{AsyncReadExt, BufReader};
     use tokio::process::Command as TokioCommand;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn async_command_ids_are_recoverable_for_rejection() {
+        let callback = fresh_core::api::JsCallbackId::from(41);
+        assert_eq!(
+            super::Editor::async_command_callback_id(&fresh_core::api::PluginCommand::Delay {
+                callback_id: callback,
+                duration_ms: 1,
+            }),
+            Some(callback)
+        );
+        assert_eq!(
+            super::Editor::async_command_callback_id(&fresh_core::api::PluginCommand::WatchPath {
+                path: std::path::PathBuf::from("owned"),
+                recursive: false,
+                request_id: 42,
+            }),
+            Some(fresh_core::api::JsCallbackId::from(42))
+        );
+        assert_eq!(
+            super::Editor::async_command_callback_id(
+                &fresh_core::api::PluginCommand::SyncSnapshot { request_id: 43 }
+            ),
+            Some(fresh_core::api::JsCallbackId::from(43))
+        );
+        assert_eq!(
+            super::Editor::async_command_callback_id(&fresh_core::api::PluginCommand::SetStatus {
+                message: "synchronous".to_string(),
+            }),
+            None
+        );
+    }
 
     /// A long-sleep child that runs `tokio::select! { wait | kill_rx }`
     /// terminates when the kill channel fires, and the terminal exit
@@ -6228,7 +7911,11 @@ mod tests {
         }
     }
 
-    use super::clamp_buffer_text_range;
+    use super::{clamp_buffer_text_range, plugin_context_may_dispatch};
+    use fresh_core::api::{
+        PluginCommandContext, PluginCommandPurpose, PluginInstanceId, PluginLoadProvenance,
+        TrustedBuiltinPlugin,
+    };
 
     #[test]
     fn clamp_text_range_passes_through_in_bounds() {
@@ -6250,6 +7937,33 @@ mod tests {
     fn clamp_text_range_pins_overlarge_start_to_empty() {
         // start beyond the live length must not yield start > end.
         assert_eq!(clamp_buffer_text_range(200, 250, 165), (165, 165));
+    }
+    #[test]
+    fn unloaded_trusted_instance_cannot_dispatch_queued_privileged_action() {
+        let context = PluginCommandContext {
+            plugin_name: "orchestrator".into(),
+            plugin_instance_id: PluginInstanceId::fresh(),
+            provenance: PluginLoadProvenance::Bundled,
+            trusted_builtin: Some(TrustedBuiltinPlugin::Orchestrator),
+            ..PluginCommandContext::default()
+        };
+
+        assert!(plugin_context_may_dispatch(&context, true));
+        assert!(!plugin_context_may_dispatch(&context, false));
+    }
+
+    #[test]
+    fn inactive_instance_allows_loader_owned_compensating_cleanup() {
+        let context = PluginCommandContext {
+            plugin_name: "orchestrator".into(),
+            plugin_instance_id: PluginInstanceId::fresh(),
+            provenance: PluginLoadProvenance::Bundled,
+            trusted_builtin: Some(TrustedBuiltinPlugin::Orchestrator),
+            purpose: PluginCommandPurpose::CompensatingCleanup,
+            ..PluginCommandContext::default()
+        };
+
+        assert!(plugin_context_may_dispatch(&context, false));
     }
 }
 
@@ -6618,10 +8332,6 @@ impl Window {
             let open_bids: Vec<_> = snapshot.buffers.keys().copied().collect();
             snapshot
                 .plugin_view_states
-                .retain(|bid, _| open_bids.contains(bid));
-            // Plugin markers live only in the snapshot; drop closed buffers'.
-            snapshot
-                .plugin_markers
                 .retain(|bid, _| open_bids.contains(bid));
         }
 

@@ -2,13 +2,16 @@
 //!
 //! Handles spawning SSH process and bootstrapping the Python agent.
 
+use crate::services::authority::RemoteTenantIdentity;
 use crate::services::process_hidden::HideWindow;
 use crate::services::remote::channel::AgentChannel;
-use crate::services::remote::protocol::AgentResponse;
+use crate::services::remote::protocol::{AgentRequest, AgentResponse};
 use crate::services::remote::AGENT_SOURCE;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::{Child, ChildStderr, Command};
 
 /// Error type for SSH connection
@@ -28,6 +31,9 @@ pub enum SshError {
 
     #[error("Authentication failed")]
     AuthenticationFailed,
+
+    #[error("Remote tenant identity mismatch: {0}")]
+    IdentityMismatch(String),
 }
 
 /// SSH connection parameters
@@ -46,28 +52,68 @@ pub struct ConnectionParams {
     pub extra_args: Vec<String>,
 }
 
-impl ConnectionParams {
-    /// Parse a connection string like `host`, `user@host`, or `user@host:port`
-    /// (a leading `ssh://` is tolerated). The user is optional.
-    pub fn parse(s: &str) -> Option<Self> {
-        let s = s.strip_prefix("ssh://").unwrap_or(s);
-        let (user_host, port) = if let Some((uh, p)) = s.rsplit_once(':') {
-            if let Ok(port) = p.parse::<u16>() {
-                (uh, Some(port))
-            } else {
-                (s, None)
-            }
-        } else {
-            (s, None)
-        };
-
-        let (user, host) = match user_host.split_once('@') {
-            Some((u, h)) => (Some(u.to_string()), h),
-            None => (None, user_host),
-        };
-        if host.is_empty() || user.as_deref() == Some("") {
+fn parse_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        if host.is_empty() || host.contains('[') || host.contains(']') {
             return None;
         }
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')?
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p > 0)?,
+            )
+        };
+        Some((host, port))
+    } else {
+        if authority.matches(':').count() > 1 {
+            return None;
+        }
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port.parse::<u16>().ok().filter(|p| *p > 0)?)),
+            None => (authority, None),
+        };
+        if host.is_empty()
+            || host.contains(char::is_whitespace)
+            || host.contains('[')
+            || host.contains(']')
+        {
+            return None;
+        }
+        Some((host, port))
+    }
+}
+
+impl ConnectionParams {
+    /// Parse a connection string like `host`, `user@host`,
+    /// `user@host:port`, or `user@[2001:db8::1]:port` (a leading `ssh://`
+    /// is tolerated). The user is optional.
+    pub fn parse(s: &str) -> Option<Self> {
+        let authority = s.strip_prefix("ssh://").unwrap_or(s);
+        if authority.is_empty()
+            || authority.contains('/')
+            || authority.contains('?')
+            || authority.contains('#')
+        {
+            return None;
+        }
+        let (user, host_port) = match authority.split_once('@') {
+            Some((user, host_port))
+                if !user.is_empty() && !host_port.is_empty() && !host_port.contains('@') =>
+            {
+                (Some(user.to_string()), host_port)
+            }
+            Some(_) => return None,
+            None => (None, authority),
+        };
+        let (host, port) = parse_host_port(host_port)?;
 
         Some(Self {
             user,
@@ -79,11 +125,17 @@ impl ConnectionParams {
     }
 
     /// The ssh target argument: `user@host` when a user is set, else bare
-    /// `host` (ssh then resolves the user itself).
+    /// `host` (ssh then resolves the user itself). IPv6 literals retain the
+    /// brackets required to keep the target unambiguous.
     pub fn ssh_target(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         match &self.user {
-            Some(user) if !user.is_empty() => format!("{user}@{}", self.host),
-            _ => self.host.clone(),
+            Some(user) if !user.is_empty() => format!("{user}@{host}"),
+            _ => host,
         }
     }
 }
@@ -276,6 +328,9 @@ const DEFAULT_RECONNECT_INITIAL_INTERVAL: std::time::Duration = std::time::Durat
 const DEFAULT_RECONNECT_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often to poll a live link for a drop.
 const DEFAULT_RECONNECT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// A candidate that sent `ready` but cannot answer identity probes must not
+/// strand reconnect forever or retain its carrier process indefinitely.
+const RECONNECT_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Configuration for the reconnect task.
 pub struct ReconnectConfig {
@@ -307,21 +362,28 @@ fn next_backoff(current: std::time::Duration, max: std::time::Duration) -> std::
 /// Spawn a background task that automatically reconnects when the channel
 /// disconnects.
 ///
-/// The task monitors `channel.is_connected()` and, when false, attempts to
-/// establish a new SSH connection using the given `params`. On success, it
-/// calls `channel.replace_transport()` to hot-swap the underlying reader/writer.
-///
-/// The task runs until the channel is dropped (write_tx closed) or the
-/// returned `tokio::task::JoinHandle` is aborted.
+/// Every candidate transport proves the immutable tenant anchor and canonical
+/// workspace root before it can replace the live channel. A mismatch is a
+/// terminal fence: the old session stays disconnected and no restore event is
+/// published against the new tenant.
 pub fn spawn_reconnect_task(
     channel: std::sync::Arc<AgentChannel>,
     params: ConnectionParams,
+    expected_identity: RemoteTenantIdentity,
 ) -> tokio::task::JoinHandle<()> {
     let connect_fn = move || {
         let params = params.clone();
+        let expected_identity = expected_identity.clone();
         async move {
-            let (reader, writer, _child) = establish_ssh_transport(&params).await?;
-            // Box the reader/writer so they have a uniform type
+            let (mut reader, mut writer, mut child) = establish_ssh_transport(&params).await?;
+            if let Err(error) =
+                verify_reconnect_identity(&mut reader, &mut writer, &expected_identity).await
+            {
+                kill_carrier_and_group(&mut child);
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = child.wait().await;
+                return Err(error);
+            }
             let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = Box::new(reader);
             let writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(writer);
             Ok::<_, SshError>((reader, writer))
@@ -389,6 +451,12 @@ where
                         tracing::info!("{label}: reconnected successfully");
                         channel.replace_transport(reader, writer).await;
                         break;
+                    }
+                    Err(SshError::IdentityMismatch(error)) => {
+                        tracing::error!(
+                            "{label}: refusing reconnect to a different tenant: {error}"
+                        );
+                        return;
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -622,6 +690,97 @@ fn kill_carrier_and_group(child: &mut Child) {
     // signal raced a just-exec'd child that hadn't set up its group yet).
     // Best-effort: nothing actionable if it already exited.
     if let Ok(()) = child.start_kill() {}
+}
+
+async fn reconnect_probe<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, SshError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let request = AgentRequest::new(id, method, params);
+    writer.write_all(request.to_json_line().as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            return Err(SshError::ConnectionClosed);
+        }
+        let response: AgentResponse = serde_json::from_str(&line).map_err(|error| {
+            SshError::AgentStartFailed(format!(
+                "invalid reconnect identity response '{}': {error}",
+                line.trim()
+            ))
+        })?;
+        if response.id != id {
+            return Err(SshError::AgentStartFailed(format!(
+                "reconnect identity response id {} did not match request {id}",
+                response.id
+            )));
+        }
+        if let Some(error) = response.error {
+            return Err(SshError::AgentStartFailed(format!(
+                "reconnect identity probe {method} failed: {error}"
+            )));
+        }
+        if let Some(result) = response.result {
+            return Ok(result);
+        }
+    }
+}
+
+/// Prove that a fresh carrier still reaches the exact tenant and canonical
+/// workspace root bound to the live authority. This runs on the raw candidate
+/// transport before `AgentChannel::replace_transport`, so a mismatch can never
+/// publish a reconnect generation or revive prior terminal state.
+pub(crate) async fn verify_reconnect_identity<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    expected: &RemoteTenantIdentity,
+) -> Result<(), SshError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(RECONNECT_IDENTITY_TIMEOUT, async {
+        let info = reconnect_probe(reader, writer, 1, "info", serde_json::json!({})).await?;
+        let actual_anchor = info.get("tenant_anchor").and_then(|value| value.as_str());
+        if actual_anchor != Some(expected.anchor.digest.as_str()) {
+            return Err(SshError::IdentityMismatch(format!(
+                "tenant anchor changed (expected {}, got {})",
+                expected.anchor.digest,
+                actual_anchor.unwrap_or("missing")
+            )));
+        }
+
+        let root = expected.canonical_root.to_string_lossy().into_owned();
+        let realpath = reconnect_probe(
+            reader,
+            writer,
+            2,
+            "realpath",
+            serde_json::json!({"path": root}),
+        )
+        .await?;
+        let actual_root = realpath.get("path").and_then(|value| value.as_str());
+        if actual_root.map(PathBuf::from).as_ref() != Some(&expected.canonical_root) {
+            return Err(SshError::IdentityMismatch(format!(
+                "canonical root changed (expected {}, got {})",
+                expected.canonical_root.display(),
+                actual_root.unwrap_or("missing")
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| SshError::AgentStartFailed("reconnect identity probe timed out".to_string()))?
 }
 
 /// This is the lower-level function used by both `SshConnection::connect` and
@@ -858,6 +1017,105 @@ pub async fn spawn_local_agent_transport() -> Result<
 mod tests {
     use super::*;
 
+    fn tenant_identity(root: &str) -> RemoteTenantIdentity {
+        RemoteTenantIdentity {
+            anchor: crate::services::authority::RemoteTenantAnchor {
+                digest: "a".repeat(64),
+            },
+            canonical_root: PathBuf::from(root),
+        }
+    }
+
+    async fn serve_identity_probe(stream: tokio::io::DuplexStream, anchor: char, root: &str) {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+
+        reader.read_line(&mut line).await.unwrap();
+        let info: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(info["m"], "info");
+        let info_id = info["id"].as_u64().unwrap();
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "id": info_id,
+                        "r": {"tenant_anchor": anchor.to_string().repeat(64)}
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        line.clear();
+        if reader.read_line(&mut line).await.unwrap() == 0 {
+            return;
+        }
+        let realpath: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(realpath["m"], "realpath");
+        let realpath_id = realpath["id"].as_u64().unwrap();
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({"id": realpath_id, "r": {"path": root}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_identity_probe_accepts_exact_anchor_and_root() {
+        let expected = tenant_identity("/workspace");
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_identity_probe(server, 'a', "/workspace"));
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+
+        verify_reconnect_identity(&mut reader, &mut writer, &expected)
+            .await
+            .expect("exact tenant identity is accepted");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_identity_probe_rejects_changed_canonical_root() {
+        let expected = tenant_identity("/workspace");
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_identity_probe(server, 'a', "/other-tenant"));
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+
+        let error = verify_reconnect_identity(&mut reader, &mut writer, &expected)
+            .await
+            .expect_err("different canonical root is rejected");
+        assert!(matches!(error, SshError::IdentityMismatch(_)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_identity_probe_rejects_changed_tenant_anchor() {
+        let expected = tenant_identity("/workspace");
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_identity_probe(server, 'b', "/workspace"));
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+
+        let error = verify_reconnect_identity(&mut reader, &mut writer, &expected)
+            .await
+            .expect_err("different tenant anchor is rejected");
+        assert!(matches!(error, SshError::IdentityMismatch(_)));
+        drop(reader);
+        drop(writer);
+        server.await.unwrap();
+    }
+
     #[test]
     fn test_parse_connection_params() {
         let params = ConnectionParams::parse("user@host").unwrap();
@@ -884,6 +1142,18 @@ mod tests {
         // Empty user / empty host are still rejected.
         assert!(ConnectionParams::parse("@host").is_none());
         assert!(ConnectionParams::parse("user@").is_none());
+
+        let params = ConnectionParams::parse("ssh://alice@[2001:db8::7]:2200").unwrap();
+        assert_eq!(params.user.as_deref(), Some("alice"));
+        assert_eq!(params.host, "2001:db8::7");
+        assert_eq!(params.port, Some(2200));
+        assert_eq!(params.ssh_target(), "alice@[2001:db8::7]");
+        assert_eq!(params.to_string(), "alice@[2001:db8::7]:2200");
+
+        assert!(ConnectionParams::parse("ssh://2001:db8::7").is_none());
+        assert!(ConnectionParams::parse("ssh://[2001:db8::7").is_none());
+        assert!(ConnectionParams::parse("ssh://[2001:db8::7]:0").is_none());
+        assert!(ConnectionParams::parse("ssh://host:not-a-port").is_none());
     }
 
     #[test]

@@ -194,3 +194,93 @@ editor.on("terminal_exit", function(payload) {
 
     harness.assert_no_plugin_errors();
 }
+
+#[test]
+fn closing_window_waits_for_already_shutting_down_terminal_exit() {
+    init_tracing_from_env();
+    let Some(mut harness) = harness_or_skip(120, 24) else {
+        return;
+    };
+    let plugin = r#"
+const editor = getEditor();
+const events = [];
+function publish() {
+    editor.setGlobalState("window-close-events", events.slice());
+}
+editor.on("terminal_exit", function(payload) {
+    const code = payload.exit_code === null || payload.exit_code === undefined
+        ? "none"
+        : String(payload.exit_code);
+    events.push("exit:" + payload.window_id + ":" + code);
+    publish();
+});
+editor.on("window_closed", function(payload) {
+    events.push("closed:" + payload.id);
+    publish();
+});
+"#;
+    load_plugin(&mut harness, plugin, "window_close_terminal_observer.ts");
+
+    let base = harness.editor().active_session_id();
+    let root = harness.project_dir().unwrap().join("closing-window");
+    std::fs::create_dir(&root).unwrap();
+    let closing = harness
+        .editor_mut()
+        .create_window_at(root, "closing-window".into());
+    harness.editor_mut().set_active_window(closing);
+    harness.editor_mut().open_terminal();
+    for _ in 0..10 {
+        harness.process_async_and_render().unwrap();
+        harness.sleep(Duration::from_millis(25));
+    }
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .terminal_ids()[0];
+    assert!(harness
+        .editor_mut()
+        .active_window_mut()
+        .terminal_manager
+        .close(terminal_id));
+    assert!(harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .terminal_ids()
+        .is_empty());
+    assert!(harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .tracked_terminal_ids()
+        .contains(&terminal_id));
+    harness.editor_mut().set_active_window(base);
+
+    assert!(harness.editor_mut().close_window(closing));
+    let recorded_events = |h: &EditorTestHarness| -> Vec<String> {
+        h.editor()
+            .plugin_global_state()
+            .values()
+            .find_map(|state| state.get("window-close-events"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect()
+    };
+    assert!(
+        pump_until(&mut harness, 120, |h| recorded_events(h).len() == 2),
+        "window close hooks did not settle; events: {:?}",
+        recorded_events(&harness)
+    );
+    let events = recorded_events(&harness);
+    assert!(events[0].starts_with(&format!("exit:{}:", closing.0)));
+    assert_eq!(events[1], format!("closed:{}", closing.0));
+    assert_ne!(
+        events[0],
+        format!("exit:{}:none", closing.0),
+        "terminal_exit must carry the reaped status"
+    );
+    harness.assert_no_plugin_errors();
+}

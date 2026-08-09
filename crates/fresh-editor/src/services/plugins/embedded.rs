@@ -6,8 +6,10 @@
 //!
 //! The plugins are extracted to a temporary directory at runtime and loaded from there.
 
+use fresh_core::api::TrustedBuiltinPlugin;
+use fresh_plugin_runtime::runtime::{TrustedBuiltinManifest, TrustedBuiltinSpec};
 use include_dir::{include_dir, Dir};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The plugins directory embedded at compile time
@@ -15,6 +17,38 @@ static EMBEDDED_PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/plugins");
 
 /// Cached path to the extracted plugins directory
 static EXTRACTED_PLUGINS_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Bind trusted built-in authority to the exact bytes compiled into this binary.
+pub fn trusted_builtin_manifest(root: &Path) -> TrustedBuiltinManifest {
+    let mut files = Vec::with_capacity(count_files(&EMBEDDED_PLUGINS) + 1);
+    collect_manifest_files(&EMBEDDED_PLUGINS, Path::new(""), &mut files);
+    files.push((PathBuf::from(".extracted"), b"".as_slice()));
+
+    let orchestrator = TrustedBuiltinSpec::from_embedded_files(
+        TrustedBuiltinPlugin::Orchestrator,
+        root.to_path_buf(),
+        PathBuf::from("orchestrator.ts"),
+        files,
+    )
+    .expect("embedded Orchestrator manifest must be valid");
+    TrustedBuiltinManifest::new([("orchestrator".to_string(), orchestrator)])
+}
+
+fn collect_manifest_files<'a>(dir: &'a Dir<'a>, prefix: &Path, out: &mut Vec<(PathBuf, &'a [u8])>) {
+    for file in dir.files() {
+        let name = file
+            .path()
+            .file_name()
+            .expect("embedded plugin file must have a name");
+        out.push((prefix.join(name), file.contents()));
+    }
+    for subdir in dir.dirs() {
+        let name = subdir
+            .path()
+            .file_name()
+            .expect("embedded plugin directory must have a name");
+        collect_manifest_files(subdir, &prefix.join(name), out);
+    }
+}
 
 /// Get the path to the embedded plugins directory.
 ///
@@ -32,16 +66,78 @@ pub fn get_embedded_plugins_dir() -> Option<&'static PathBuf> {
     });
 
     let path = EXTRACTED_PLUGINS_DIR.get()?;
-    if path.exists()
-        && path
-            .read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false)
-    {
-        Some(path)
-    } else {
-        None
+    if path.as_os_str().is_empty() {
+        return None;
     }
+    if embedded_plugins_dir_matches(path) {
+        return Some(path);
+    }
+
+    tracing::warn!(
+        "Embedded plugin cache failed integrity verification; re-extracting: {:?}",
+        path
+    );
+    match extract_plugins() {
+        Ok(repaired) if repaired == *path && embedded_plugins_dir_matches(path) => Some(path),
+        Ok(_) => {
+            tracing::error!("Embedded plugin cache repair produced an unexpected path");
+            None
+        }
+        Err(error) => {
+            tracing::error!("Failed to repair embedded plugin cache: {error}");
+            None
+        }
+    }
+}
+
+fn embedded_plugins_dir_matches(path: &Path) -> bool {
+    embedded_dir_matches(&EMBEDDED_PLUGINS, path, true)
+}
+
+fn embedded_dir_matches(embedded: &Dir<'_>, disk: &Path, root: bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(disk) else {
+        return false;
+    };
+    let entries: Vec<_> = entries.flatten().collect();
+    let expected_entries = embedded.files().count() + embedded.dirs().count() + usize::from(root);
+    if entries.len() != expected_entries {
+        return false;
+    }
+
+    if root {
+        let marker = disk.join(".extracted");
+        let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
+            return false;
+        };
+        if !metadata.file_type().is_file()
+            || !std::fs::read(&marker).is_ok_and(|contents| contents.is_empty())
+        {
+            return false;
+        }
+    }
+
+    for file in embedded.files() {
+        let Some(name) = file.path().file_name() else {
+            return false;
+        };
+        let path = disk.join(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file()
+            || !std::fs::read(path).is_ok_and(|contents| contents == file.contents())
+        {
+            return false;
+        }
+    }
+    embedded.dirs().all(|dir| {
+        let Some(name) = dir.path().file_name() else {
+            return false;
+        };
+        let path = disk.join(name);
+        std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir())
+            && embedded_dir_matches(dir, &path, false)
+    })
 }
 
 /// Content hash of embedded plugins, computed at build time
@@ -74,20 +170,29 @@ fn extract_plugins() -> Result<PathBuf, std::io::Error> {
     let content_hash = PLUGINS_CONTENT_HASH.trim();
     let cache_dir = cache_base.join(content_hash);
     let marker = cache_dir.join(".extracted");
-
-    if marker.exists() {
-        tracing::info!("Using cached embedded plugins from: {:?}", cache_dir);
-        return Ok(cache_dir);
-    }
-
-    tracing::info!("Extracting embedded plugins to: {:?}", cache_dir);
-    std::fs::create_dir_all(&cache_base)?;
-
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+
+    if marker.exists() {
+        if embedded_plugins_dir_matches(&cache_dir) {
+            tracing::info!(
+                "Using verified cached embedded plugins from: {:?}",
+                cache_dir
+            );
+            return Ok(cache_dir);
+        }
+        let stale = cache_base.join(format!(".stale.{}.{}", pid, nanos));
+        std::fs::rename(&cache_dir, &stale)?;
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = std::fs::remove_dir_all(stale);
+    }
+
+    tracing::info!("Extracting embedded plugins to: {:?}", cache_dir);
+    std::fs::create_dir_all(&cache_base)?;
+
     // tmp_dir name includes the current nanosecond timestamp, so it
     // can't collide with any prior invocation — no pre-existing dir
     // to clean up here.
@@ -229,5 +334,34 @@ mod tests {
         // Check that some plugin files exist
         let entries: Vec<_> = std::fs::read_dir(path).unwrap().collect();
         assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn embedded_cache_integrity_rejects_modified_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        extract_dir_recursive(&EMBEDDED_PLUGINS, temp.path()).unwrap();
+        std::fs::write(temp.path().join(".extracted"), b"").unwrap();
+        assert!(embedded_plugins_dir_matches(temp.path()));
+        let manifest = trusted_builtin_manifest(temp.path());
+        assert_eq!(
+            manifest
+                .verify("orchestrator", &temp.path().join("orchestrator.ts"))
+                .unwrap(),
+            Some(TrustedBuiltinPlugin::Orchestrator)
+        );
+
+        let file = EMBEDDED_PLUGINS
+            .files()
+            .next()
+            .expect("embedded plugin directory has a top-level file");
+        std::fs::write(
+            temp.path().join(file.path().file_name().unwrap()),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(!embedded_plugins_dir_matches(temp.path()));
+        assert!(manifest
+            .verify("orchestrator", &temp.path().join("orchestrator.ts"))
+            .is_err());
     }
 }

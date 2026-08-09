@@ -5067,6 +5067,8 @@ impl Pool {
                     ]),
                     title: Some(agent.to_string()),
                     env: std::collections::HashMap::new(),
+                    companion: None,
+                    script_capability: None,
                 })
                 .expect("agent terminal should spawn");
             h.tick_and_render().unwrap();

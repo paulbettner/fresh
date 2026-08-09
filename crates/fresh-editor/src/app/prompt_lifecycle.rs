@@ -523,23 +523,80 @@ impl Editor {
 
     /// Change the active window's project root to a new path (Switch Project).
     ///
-    /// Re-roots ONLY the active window — opens the new project in a fresh
-    /// window, dives into it, and closes the window it was invoked from. It
-    /// deliberately does **not** restart the editor: the previous
-    /// implementation requested a full process restart that tore down and
-    /// rebuilt *every* window from disk, which discarded the live state of all
-    /// other open workspaces (terminals, agents, LSP) and silently downgraded
-    /// remote siblings to a local backend. With the create→dive→close flow,
-    /// every other window and the Orchestrator dock are left untouched.
-    ///
-    /// A remote active window carries its connected backend (and connection
-    /// keepalive) onto the new project so the new root opens on the same
-    /// container / SSH host; a local window gets a fresh local authority
-    /// scoped to the new root.
+    /// Re-roots only the active session and leaves every sibling window and
+    /// the Orchestrator dock untouched. Local sessions use the existing
+    /// create→dive→close flow with a fresh local scope. Remote sessions keep
+    /// the current window visible while a replacement carrier connects, then
+    /// atomically replace that window after the agent proves its immutable
+    /// tenant identity and canonical root. No buffers, terminals, plugin
+    /// state, trust, or environment cross that remote authority boundary.
     pub fn change_working_dir(&mut self, new_path: PathBuf) {
-        // Canonicalize the path to resolve symlinks and normalize
-        let new_path = new_path.canonicalize().unwrap_or(new_path);
         let old_id = self.active_window;
+
+        // A path selected through a remote file browser exists only inside
+        // that authority. Never canonicalize it on the host or carry the old
+        // authority/scope into the new root. Connect first, verify the agent's
+        // immutable tenant + canonical root, then atomically replace this
+        // window with a blank session under the newly-minted scope.
+        if let Some(crate::services::authority::SessionAuthoritySpec::RemoteAgent(spec)) = self
+            .windows
+            .get(&old_id)
+            .map(|window| window.authority_spec.clone())
+        {
+            if !crate::services::remote::is_remote_absolute_path(
+                new_path.to_string_lossy().as_ref(),
+            ) {
+                self.active_window_mut().set_status_message(
+                    "Remote project path must be absolute; project was not switched".to_string(),
+                );
+                return;
+            }
+            if self
+                .windows
+                .get(&old_id)
+                .is_some_and(|window| window.root == new_path)
+            {
+                return;
+            }
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = self.save_workspace_for(old_id);
+
+            let mut replacement = spec;
+            match &mut replacement.transport {
+                crate::services::authority::RemoteTransportSpec::KubectlExec {
+                    workspace, ..
+                } => *workspace = Some(new_path.to_string_lossy().into_owned()),
+                crate::services::authority::RemoteTransportSpec::Ssh { remote_path, .. } => {
+                    *remote_path = Some(new_path.to_string_lossy().into_owned())
+                }
+            }
+            replacement.verified_anchor = None;
+            replacement.canonical_root = None;
+            replacement.base_env.clear();
+            replacement.window = false;
+            replacement.label = None;
+            replacement.command = None;
+            // A user-initiated project switch supersedes an automatic
+            // reconnect or an older switch for this window. Cancelling first
+            // advances the attempt identity, so a late completion cannot
+            // publish the retired root.
+            self.cancel_remote_reconnect(old_id);
+
+            #[cfg(feature = "plugins")]
+            self.start_remote_connect(
+                replacement,
+                crate::app::RemoteAttachOwner::Switch { window_id: old_id },
+                true,
+                None,
+            );
+            #[cfg(not(feature = "plugins"))]
+            self.active_window_mut()
+                .set_status_message("Remote project switching requires plugin support".to_string());
+            return;
+        }
+
+        // Local paths are host-owned and may be canonicalized normally.
+        let new_path = new_path.canonicalize().unwrap_or(new_path);
 
         // Already showing this root in the active window — nothing to do.
         if self
@@ -564,38 +621,9 @@ impl Editor {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| new_path.to_string_lossy().into_owned());
 
-            if self
-                .windows
-                .get(&old_id)
-                .is_some_and(|w| w.authority_spec.is_remote())
-            {
-                // Carry the active window's connected backend onto the new
-                // project so it opens on the same container / SSH host (the
-                // Switch Project browser listed that backend's filesystem, so
-                // the picked path lives there). `Authority` is non-`Clone`
-                // (one per window, issue #2280), so move it out of the old
-                // window — which is closed moments later — and move the
-                // connection keepalive across so closing the old window can't
-                // tear the backend down.
-                let spec = self
-                    .windows
-                    .get(&old_id)
-                    .map(|w| w.authority_spec.clone())
-                    .unwrap_or_default();
-                let authority = self.take_active_authority();
-                let id = self.create_window_with_authority(new_path.clone(), label, authority);
-                if let Some(w) = self.windows.get_mut(&id) {
-                    w.authority_spec = spec;
-                }
-                if let Some(keepalive) = self.session_keepalives.remove(&old_id) {
-                    self.session_keepalives.insert(id, keepalive);
-                }
-                id
-            } else {
-                // Local window: the new project gets its own fresh local
-                // authority scoped to the new root (its own per-session trust).
-                self.create_window_at(new_path.clone(), label)
-            }
+            // Local window: the new project gets its own fresh local
+            // authority scoped to the new root (its own per-session trust).
+            self.create_window_at(new_path.clone(), label)
         };
 
         if new_id == old_id {

@@ -86,7 +86,7 @@ impl std::fmt::Display for TerminalId {
 /// "session" concepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, TS)]
 #[ts(export)]
-pub struct WindowId(pub u64);
+pub struct WindowId(#[ts(type = "number")] pub u64);
 
 impl std::fmt::Display for WindowId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,9 +104,16 @@ impl std::fmt::Display for WindowId {
 /// `(window, terminal)` pair. Resolving by bare `TerminalId` across
 /// windows is ambiguous: it silently attributes output to whichever
 /// window happens to hold the same local id first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
 pub struct WindowTerminalId {
+    #[serde(rename = "windowId")]
+    #[ts(rename = "windowId", type = "number")]
     pub window: WindowId,
+    #[serde(rename = "terminalId")]
+    #[ts(rename = "terminalId", type = "number")]
     pub terminal: TerminalId,
 }
 

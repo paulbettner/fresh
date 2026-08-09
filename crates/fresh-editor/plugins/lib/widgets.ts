@@ -57,7 +57,7 @@ type OverlayOptions = globalThis.OverlayOptions;
 /** Horizontal layout. Children laid out left-to-right; inline-sized
  * children collapse into a single line. See §3 of the design doc. */
 export function row(...children: WidgetSpec[]): WidgetSpec {
-  return { kind: "row", children };
+  return { kind: "row", children, wrap: false };
 }
 
 /** Horizontal layout that **wraps**: children that don't fit on one line
@@ -124,10 +124,14 @@ export function styledRow(
   // the key entirely lets serde fall back to `#[serde(default)]`.
   const entry: TextPropertyEntry = { text: "", segments };
   if (options?.padToChars !== undefined) entry.padToChars = options.padToChars;
-  if (options?.truncateToChars !== undefined) entry.truncateToChars = options.truncateToChars;
+  if (options?.truncateToChars !== undefined) {
+    entry.truncateToChars = options.truncateToChars;
+  }
   if (options?.properties !== undefined) entry.properties = options.properties;
   if (options?.style !== undefined) entry.style = options.style;
-  if (options?.inlineOverlays !== undefined) entry.inlineOverlays = options.inlineOverlays;
+  if (options?.inlineOverlays !== undefined) {
+    entry.inlineOverlays = options.inlineOverlays;
+  }
   return entry;
 }
 
@@ -198,6 +202,9 @@ export function number(
     label: options?.label ?? "",
     focused: options?.focused ?? false,
     labelWidth: options?.labelWidth ?? 0,
+    editCursor: -1,
+    editSelStart: -1,
+    editSelEnd: -1,
     key: options?.key,
   };
 }
@@ -229,6 +236,8 @@ export function dropdown(
     label: options_?.label ?? "",
     focused: options_?.focused ?? false,
     labelWidth: options_?.labelWidth ?? 0,
+    open: false,
+    scrollOffset: 0,
     key: options_?.key,
   };
 }
@@ -582,6 +591,8 @@ export function text(
      * `WidgetSpec::Text.completions` (Rust) for the rendering
      * + keyboard semantics. */
     completions?: string[];
+    /** Maximum visible completion rows. `0` uses the host default. */
+    completionsVisibleRows?: number;
     /** Paint the caret as a REVERSED block cell (modal surfaces
      * without a hardware cursor). Default false. */
     blockCaret?: boolean;
@@ -619,6 +630,7 @@ export function text(
     maxVisibleChars: options.maxVisibleChars ?? 0,
     fullWidth: options.fullWidth ?? false,
     completions: options.completions ?? [],
+    completionsVisibleRows: options.completionsVisibleRows ?? 0,
     blockCaret: options.blockCaret ?? false,
     selStart: options.selStart ?? -1,
     selEnd: options.selEnd ?? -1,

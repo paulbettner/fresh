@@ -14,14 +14,12 @@
 //! ## Mode Switching Methods
 //!
 //! - [`Window::sync_terminal_to_buffer`]: Terminal → Scrollback mode
-//!   - Appends visible screen (~50 lines) to backing file
-//!   - Loads backing file as read-only buffer
-//!   - Performance: O(screen_size) ≈ 5ms
+//!   - Flushes append-only rendered history
+//!   - Atomically replaces a separate visible-screen checkpoint
+//!   - Loads that checkpoint as a read-only buffer
 //!
 //! - [`Editor::enter_terminal_mode`]: Scrollback → Terminal mode
-//!   - Truncates backing file to remove visible screen tail
-//!   - Resumes live terminal rendering
-//!   - Performance: O(1) ≈ 1ms
+//!   - Resumes live terminal rendering without mutating terminal history
 
 use super::window::{ExitedTerminal, TerminalBuffer, Window};
 use super::{BufferId, BufferMetadata, Editor};
@@ -35,26 +33,307 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Filesystem for terminal scrollback backing/log files.
+/// Filesystem for terminal history/checkpoint/log files.
 ///
 /// The integrated terminal's PTY is always spawned on the **local** host —
-/// even an SSH terminal runs `ssh` as a *local* child process — and the PTY
-/// read loop renders scrollback into the backing file on the local disk via
-/// `std::fs` (`services/terminal/manager.rs`). Those files therefore always
-/// live on the local machine, at a path under the local `data_dir`,
-/// independent of the session's (possibly remote) authority filesystem.
-///
-/// Routing their create / append / truncate / read through the *remote*
-/// authority filesystem (issue #2424) made every scrollback-mode toggle do a
-/// blocking SSH round-trip against a path that only exists locally: it hung
-/// the UI for the round-trip and failed with "Failed to truncate terminal
-/// backing file", leaving the scrollback view empty. Always use this local
-/// handle for terminal backing/log files so it stays consistent with the read
-/// loop. This honours the "use the `FileSystem` trait" rule (it returns a
-/// trait object, never raw `std::fs` at the call site) while pinning the
-/// backend to local — the correct backend for a local artifact.
+/// even an SSH terminal runs `ssh` as a *local* child process — and its
+/// artifacts therefore always live on the local machine under `data_dir`,
+/// independent of the session's possibly remote authority filesystem.
+/// Pinning this filesystem prevents scrollback mode from blocking on a remote
+/// round trip for paths that exist only on the host.
 pub(crate) fn terminal_backing_fs() -> Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> {
     Arc::new(crate::model::filesystem::StdFileSystem)
+}
+/// Derive the mutable scrollback-view file beside an append-only history.
+/// Immutable save-generation checkpoints must never be reused for this view.
+pub(crate) fn mutable_terminal_backing_path(history_path: &std::path::Path) -> PathBuf {
+    let Some(name) = history_path.file_name().and_then(|name| name.to_str()) else {
+        return history_path.with_extension("view.txt");
+    };
+    history_path.with_file_name(match name.strip_suffix(".history.txt") {
+        Some(stem) => format!("{stem}.txt"),
+        None => format!("{name}.view.txt"),
+    })
+}
+
+/// Durably append every complete scrollback line currently pending in `state`.
+/// The state owns any rollback fence, so all production flush paths recover the
+/// same partial write before advancing the cursor.
+pub(crate) fn durably_flush_terminal_scrollback(
+    history_path: &std::path::Path,
+    state: &mut crate::services::terminal::TerminalState,
+) -> std::io::Result<u64> {
+    let parent = history_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("terminal history has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut writer = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path)?;
+    state.persist_new_scrollback(&mut writer)?;
+    Ok(state.backing_file_history_end())
+}
+
+/// Publish a fully synced temp file under its durable checkpoint name.
+fn publish_terminal_checkpoint_file(
+    temp: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+) -> std::io::Result<()> {
+    crate::workspace::durable_rename(temp, checkpoint_path)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalCheckpointPublication {
+    pub checkpoint_path: PathBuf,
+    pub history_end: u64,
+    pub generation: String,
+}
+
+/// Artifact lengths observed while the terminal parser lock still fences new
+/// output. Delayed close cleanup may delete recovery sources only if these
+/// lengths still match after the reader-drained exit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TerminalCheckpointFence {
+    pub history_len: u64,
+    pub log_len: Option<u64>,
+}
+
+/// Publish one immutable, bounded visible-screen delta for a workspace save.
+/// The append-only history boundary is recorded separately, so publication
+/// never copies history and may run after releasing the terminal parser lock.
+pub(crate) fn write_terminal_checkpoint_generation(
+    history_path: &std::path::Path,
+    history_end: u64,
+    visible_screen: &[u8],
+) -> std::io::Result<TerminalCheckpointPublication> {
+    use std::io::Write;
+
+    let generation = uuid::Uuid::new_v4().simple().to_string();
+    let name = history_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("terminal.history.txt");
+    let checkpoint_path =
+        history_path.with_file_name(format!("{name}.checkpoint-{generation}.txt"));
+    let parent = checkpoint_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("terminal checkpoint has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".{name}.{generation}.tmp"));
+    let publication = (|| -> std::io::Result<()> {
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        writer.write_all(visible_screen)?;
+        writer.sync_all()?;
+        drop(writer);
+        publish_terminal_checkpoint_file(&temp, &checkpoint_path)
+    })();
+    if let Err(error) = publication {
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(TerminalCheckpointPublication {
+        checkpoint_path,
+        history_end,
+        generation,
+    })
+}
+
+pub(crate) fn remove_terminal_checkpoint(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(not(windows))]
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn migrate_legacy_terminal_history(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    if source == target || target.exists() {
+        return Ok(());
+    }
+    let _source_lock = crate::services::terminal::manager::try_lock_terminal_artifact(source)?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "terminal source is live")
+        })?;
+    let _target_lock = crate::services::terminal::manager::try_lock_terminal_artifact(target)?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "terminal target is live")
+        })?;
+    if target.exists() {
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("terminal history has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("terminal.history.txt");
+    let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let publication = (|| -> std::io::Result<()> {
+        let mut reader = std::fs::File::open(source)?;
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        std::io::copy(&mut reader, &mut writer)?;
+        writer.sync_all()?;
+        drop(writer);
+        crate::workspace::durable_rename(&temp, target)
+    })();
+    if publication.is_err() {
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = std::fs::remove_file(&temp);
+    }
+    publication
+}
+/// Flush the current visible screen into a separate, atomically replaced view
+/// checkpoint. The rendered history source is copied but never truncated or
+/// rewritten; only the checkpoint path is replaced.
+pub(crate) fn write_terminal_checkpoint(
+    history_path: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+    state: &crate::services::terminal::TerminalState,
+) -> std::io::Result<(u64, crate::services::terminal::PrependedHead)> {
+    let fs = terminal_backing_fs();
+    let parent = checkpoint_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("terminal checkpoint has no parent"))?;
+    fs.create_dir_all(parent)?;
+    let name = checkpoint_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("terminal.txt");
+    let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let publication = (|| -> std::io::Result<_> {
+        let mut writer = fs.create_file(&temp)?;
+        let history_end = match fs.open_file(history_path) {
+            Ok(mut history) => std::io::copy(&mut history, &mut writer)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        let prepended = state.append_visible_screen(&mut writer)?;
+        writer.sync_all()?;
+        drop(writer);
+
+        publish_terminal_checkpoint_file(&temp, checkpoint_path)?;
+        Ok((history_end, prepended))
+    })();
+
+    if publication.is_err() {
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = fs.remove_file(&temp);
+    }
+    publication
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::{
+        migrate_legacy_terminal_history, write_terminal_checkpoint,
+        write_terminal_checkpoint_generation,
+    };
+    use crate::services::terminal::TerminalState;
+
+    #[test]
+    fn checkpoint_replaces_stale_view_without_rewriting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("terminal.history.txt");
+        let checkpoint = dir.path().join("terminal.txt");
+        std::fs::write(&history, b"durable-history\n").unwrap();
+        std::fs::write(&checkpoint, b"stale-checkpoint\n").unwrap();
+
+        let mut state = TerminalState::new(40, 2);
+        state.process_output(b"visible-screen");
+        let (history_end, _) = write_terminal_checkpoint(&history, &checkpoint, &state).unwrap();
+
+        assert_eq!(history_end, b"durable-history\n".len() as u64);
+        assert_eq!(std::fs::read(&history).unwrap(), b"durable-history\n");
+        let published = std::fs::read_to_string(&checkpoint).unwrap();
+        assert!(published.starts_with("durable-history\n"));
+        assert!(published.contains("visible-screen"));
+        assert!(!published.contains("stale-checkpoint"));
+        assert_eq!(published.matches("durable-history").count(), 1);
+    }
+
+    #[test]
+    fn checkpoint_generations_are_bounded_immutable_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("terminal.history.txt");
+        let durable_history = b"durable-history\n";
+        std::fs::write(&history, durable_history).unwrap();
+
+        let first = write_terminal_checkpoint_generation(
+            &history,
+            durable_history.len() as u64,
+            b"first-visible-screen",
+        )
+        .unwrap();
+        let first_bytes = std::fs::read(&first.checkpoint_path).unwrap();
+        let second = write_terminal_checkpoint_generation(
+            &history,
+            durable_history.len() as u64,
+            b"second-visible-screen",
+        )
+        .unwrap();
+
+        assert_eq!(first.history_end, durable_history.len() as u64);
+        assert_ne!(first.generation, second.generation);
+        assert_ne!(first.checkpoint_path, second.checkpoint_path);
+        assert!(first
+            .checkpoint_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(&format!("checkpoint-{}.txt", first.generation)));
+        assert_eq!(std::fs::read(&first.checkpoint_path).unwrap(), first_bytes);
+        assert_eq!(first_bytes, b"first-visible-screen");
+        assert_eq!(
+            std::fs::read(&second.checkpoint_path).unwrap(),
+            b"second-visible-screen"
+        );
+        assert_eq!(std::fs::read(&history).unwrap(), durable_history);
+    }
+
+    #[test]
+    fn legacy_history_migration_copies_exact_bytes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.txt");
+        let target = dir.path().join("stable").join("terminal.history.txt");
+        let bytes = b"first line\n\x00last line\n";
+        std::fs::write(&source, bytes).unwrap();
+
+        migrate_legacy_terminal_history(&source, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+
+        std::fs::write(&source, b"newer legacy bytes").unwrap();
+        migrate_legacy_terminal_history(&source, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    }
+    #[test]
+    fn failed_legacy_history_migration_does_not_publish_an_empty_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_source = dir.path().join("missing-checkpoint.txt");
+        let target = dir.path().join("terminal.history.txt");
+
+        assert!(migrate_legacy_terminal_history(&missing_source, &target).is_err());
+        assert!(!target.exists());
+    }
 }
 
 /// How often [`Window::sync_terminal_titles`] polls each terminal's
@@ -101,6 +380,8 @@ pub struct PluginTerminalSpec {
     /// process, on top of the inherited + activated env. Applied after
     /// the control vars (`TERM`, `FRESH_SESSION`). Empty adds nothing.
     pub env: HashMap<String, String>,
+    pub companion: Option<fresh_core::api::TerminalCompanion>,
+    pub script_capability: Option<crate::services::terminal::manager::TerminalScriptCapability>,
 }
 
 /// Assemble the extra env for a terminal that hosts an agent which may drive
@@ -125,59 +406,710 @@ pub struct PluginTerminalSpec {
 /// `handle_create_terminal` (agents spawned into an existing window) so both
 /// paths mint and inject identically. `base_env` seeds the map (plugin-supplied
 /// env, empty when omitted).
+#[derive(Clone)]
+pub(crate) struct AgentCommandEnv {
+    pub(crate) vars: HashMap<String, String>,
+    pub(crate) script_token: Option<String>,
+}
+
+impl AgentCommandEnv {
+    pub(crate) fn revoke(&self) {
+        if let Some(token) = &self.script_token {
+            crate::server::command_access::revoke(token);
+        }
+    }
+
+    pub(crate) fn script_capability(
+        &self,
+    ) -> Option<crate::services::terminal::manager::TerminalScriptCapability> {
+        self.script_token
+            .as_ref()
+            .cloned()
+            .map(crate::services::terminal::manager::TerminalScriptCapability::new)
+    }
+}
+
 pub(crate) fn agent_command_env(
     window: fresh_core::WindowId,
     base_env: Option<HashMap<String, String>>,
     allow_script: bool,
-) -> HashMap<String, String> {
+) -> Result<AgentCommandEnv, String> {
     let mut env = base_env.unwrap_or_default();
+    let windows = cfg!(windows);
+    if let Some(key) = env
+        .keys()
+        .find(|key| {
+            env_key_matches(key, "FRESH_CMD_TOKEN", windows)
+                || env_key_matches(key, "FRESH_SESSION", windows)
+        })
+        .cloned()
+    {
+        return Err(format!(
+            "terminal env key '{key}' is reserved by the Fresh host"
+        ));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe) = exe.to_str() {
             env.insert("FRESH_BIN".to_string(), exe.to_string());
         }
     }
-    if allow_script {
-        match crate::server::local_control::start() {
-            Ok(session_id) => {
-                env.insert("FRESH_SESSION".to_string(), session_id.to_string());
-            }
-            // The token still ships (it is what authorizes the agent), but with
-            // no socket to present it to every `fresh --cmd …` the agent runs
-            // fails with "not inside a Fresh session". Silently swallowing that
-            // made it look like the CLI itself was broken, so say what happened
-            // — the cause is environmental (e.g. a socket path over the
-            // platform's `sun_path` limit), not something the agent can fix.
-            Err(e) => tracing::warn!(
-                "Local control socket unavailable ({}); the agent terminal gets a \
-                 command token but no FRESH_SESSION to use it with",
-                e
-            ),
-        }
+
+    let script_token = if allow_script {
+        let session_id = crate::server::local_control::start()
+            .map_err(|error| format!("local control socket unavailable: {error}"))?;
+        env.insert("FRESH_SESSION".to_string(), session_id.to_string());
         let token = crate::server::command_access::mint(crate::server::command_access::Grant::new(
             Some(window.0),
             true,
         ));
-        env.insert("FRESH_CMD_TOKEN".to_string(), token);
+        env.insert("FRESH_CMD_TOKEN".to_string(), token.clone());
+        Some(token)
+    } else {
+        None
+    };
+
+    Ok(AgentCommandEnv {
+        vars: env,
+        script_token,
+    })
+}
+const OMP_COMPANION_ENV: &str = "FRESH_OMP_COMPANION";
+const OMP_COMPANION_ENDPOINT_ENV: &str = "FRESH_OMP_COMPANION_ENDPOINT";
+// Legacy name remains reserved so stale or caller-controlled tokens cannot
+// reach a child after the transport moves to the one-shot local channel.
+const OMP_COMPANION_TOKEN_ENV: &str = "FRESH_OMP_COMPANION_TOKEN";
+const OMP_COMPANION_ARG: &str = "--fresh-omp-companion";
+const OMP_TRUSTED_EXECUTABLE_ENV: &str = "FRESH_OMP_EXECUTABLE";
+
+pub(crate) fn insert_omp_companion_arg(args: &mut Vec<String>) {
+    let option_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    if args[..option_end]
+        .iter()
+        .any(|arg| arg == OMP_COMPANION_ARG)
+    {
+        return;
     }
-    env
+    args.insert(option_end, OMP_COMPANION_ARG.to_string());
+}
+
+pub(crate) fn remove_omp_companion_arg(args: &mut Vec<String>) {
+    let mut option_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut index = 0;
+    while index < option_end {
+        if args[index] == OMP_COMPANION_ARG {
+            args.remove(index);
+            option_end -= 1;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn env_key_matches(key: &str, expected: &str, windows: bool) -> bool {
+    if windows {
+        key.eq_ignore_ascii_case(expected)
+    } else {
+        key == expected
+    }
+}
+
+fn is_reserved_omp_companion_key(key: &str, windows: bool) -> bool {
+    env_key_matches(key, OMP_COMPANION_ENV, windows)
+        || env_key_matches(key, OMP_COMPANION_ENDPOINT_ENV, windows)
+        || env_key_matches(key, OMP_COMPANION_TOKEN_ENV, windows)
+}
+fn reject_reserved_omp_companion_env(
+    extra_env: &HashMap<String, String>,
+    windows: bool,
+) -> Result<(), String> {
+    if extra_env
+        .keys()
+        .any(|key| is_reserved_omp_companion_key(key, windows))
+    {
+        Err("reserved OMP companion environment key".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectOmpInvocation {
+    Launch,
+    Continue,
+    ExactResume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectOmpCommand {
+    executable: String,
+    resume_prefix: Vec<String>,
+    invocation: DirectOmpInvocation,
+}
+
+/// The result of attempting to attach the optional OMP capability to a
+/// terminal spawn. `Unsupported` is intentionally distinct from an entropy
+/// failure: the former retains a descriptive workspace marker so the next
+/// authoritative spawn can retry, whereas the latter must not persist one.
+pub(crate) enum OmpCompanionPreparation {
+    Active(crate::services::terminal::manager::OmpCompanionSpawn),
+    Unsupported,
+    EntropyUnavailable,
+}
+
+impl OmpCompanionPreparation {
+    pub(crate) fn preserves_marker(&self) -> bool {
+        matches!(self, Self::Active(_) | Self::Unsupported)
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+
+    pub(crate) fn into_spawn(
+        self,
+    ) -> Option<crate::services::terminal::manager::OmpCompanionSpawn> {
+        match self {
+            Self::Active(spawn) => Some(spawn),
+            Self::Unsupported | Self::EntropyUnavailable => None,
+        }
+    }
+}
+
+/// Commit the persisted companion disposition for a successfully spawned
+/// initial terminal. A descriptive OMP marker is independent of whether this
+/// PTY got a live companion: `Unsupported` deliberately has no live protocol
+/// state but must remain eligible for a later authoritative retry.
+fn persist_initial_companion_marker(
+    terminal_companions: &mut HashMap<TerminalId, fresh_core::api::TerminalCompanion>,
+    terminal_id: TerminalId,
+    companion: Option<fresh_core::api::TerminalCompanion>,
+    preserves_marker: bool,
+) {
+    let Some(companion) = companion else {
+        return;
+    };
+    if preserves_marker {
+        terminal_companions.insert(terminal_id, companion);
+    } else {
+        terminal_companions.remove(&terminal_id);
+    }
+}
+
+/// Mint the live companion capability after eligibility and reserved-key
+/// policy have been resolved. Entropy backs only the optional capability: a
+/// failure leaves the PTY launch as an ordinary terminal.
+fn mint_omp_companion_spawn<E>(
+    kind: fresh_core::api::TerminalCompanion,
+    command: DirectOmpCommand,
+    extra_env: &mut HashMap<String, String>,
+    fill_entropy: impl FnOnce(&mut [u8; 32]) -> Result<(), E>,
+) -> Result<crate::services::terminal::manager::OmpCompanionSpawn, ()> {
+    let mut spawn = crate::services::terminal::manager::OmpCompanionSpawn::new(
+        kind,
+        command.executable,
+        command.resume_prefix,
+    );
+    if fill_entropy(&mut spawn.secret).is_err() {
+        tracing::warn!("OMP companion unavailable: entropy source failed");
+        return Err(());
+    }
+    let endpoint = spawn.arm_launch_channel().map_err(|error| {
+        tracing::warn!("OMP companion unavailable: secret channel failed: {error}");
+    })?;
+    extra_env.insert(OMP_COMPANION_ENV.to_string(), "1".to_string());
+    extra_env.insert(OMP_COMPANION_ENDPOINT_ENV.to_string(), endpoint);
+    Ok(spawn)
+}
+
+fn preparation_after_mint(
+    minted: Result<crate::services::terminal::manager::OmpCompanionSpawn, ()>,
+) -> OmpCompanionPreparation {
+    match minted {
+        Ok(spawn) => OmpCompanionPreparation::Active(spawn),
+        Err(()) => OmpCompanionPreparation::EntropyUnavailable,
+    }
+}
+
+fn omp_companion_supported(
+    direct_local: bool,
+    multiplexer_active: bool,
+    command: Option<&[String]>,
+    windows: bool,
+) -> bool {
+    direct_local
+        && !multiplexer_active
+        && command
+            .and_then(|argv| parse_direct_omp_argv(argv, windows))
+            .is_some()
+}
+
+fn omp_executable_literal(executable: &str, windows: bool) -> bool {
+    if windows {
+        executable.eq_ignore_ascii_case("omp") || executable.eq_ignore_ascii_case("omp.exe")
+    } else {
+        executable == "omp" || executable == "omp.exe"
+    }
+}
+
+fn resolved_omp_executable(executable: &str, windows: bool) -> bool {
+    let absolute = if windows {
+        let bytes = executable.as_bytes();
+        (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+            || executable.starts_with("\\\\")
+    } else {
+        executable.starts_with('/')
+    };
+    if !absolute {
+        return false;
+    }
+    let basename = if windows {
+        executable.rsplit(['/', '\\']).next().unwrap_or(executable)
+    } else {
+        executable.rsplit('/').next().unwrap_or(executable)
+    };
+    if windows {
+        basename.eq_ignore_ascii_case("omp") || basename.eq_ignore_ascii_case("omp.exe")
+    } else {
+        basename == "omp" || basename == "omp.exe"
+    }
+}
+
+fn omp_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--profile"
+            | "--alias"
+            | "--cwd"
+            | "--config"
+            | "--add-dir"
+            | "--mode"
+            | "--provider"
+            | "--model"
+            | "--smol"
+            | "--slow"
+            | "--plan"
+            | "--prewalk-into"
+            | "--plan-yolo-into"
+            | "--max-time"
+            | "--service-tier"
+            | "--api-key"
+            | "--system-prompt"
+            | "--append-system-prompt"
+            | "--provider-session-id"
+            | "--prompt-cache-key"
+            | "--session-dir"
+            | "--models"
+            | "--tools"
+            | "--thinking"
+            | "--export"
+            | "--hook"
+            | "--extension"
+            | "-e"
+            | "--trusted-extension"
+            | "--plugin-dir"
+            | "--skills"
+            | "--approval-mode"
+    )
+}
+
+fn collect_omp_resume_options(
+    args: &[String],
+    start: usize,
+    end: usize,
+) -> Option<(Vec<String>, Option<DirectOmpInvocation>)> {
+    let mut resume_prefix = Vec::new();
+    let mut invocation = None;
+    let mut seen_profile = false;
+    let mut seen_session_dir = false;
+    let mut index = start;
+    while index < end {
+        let arg = args.get(index)?;
+        let scope = if arg == "--profile" || arg.starts_with("--profile=") {
+            Some(("--profile", "--profile=", &mut seen_profile))
+        } else if arg == "--session-dir" || arg.starts_with("--session-dir=") {
+            Some(("--session-dir", "--session-dir=", &mut seen_session_dir))
+        } else {
+            None
+        };
+        if let Some((key, value_prefix, seen)) = scope {
+            if *seen {
+                return None;
+            }
+            *seen = true;
+            if arg == key {
+                let value = args.get(index + 1)?;
+                if value.is_empty() || value == "--" {
+                    return None;
+                }
+                resume_prefix.extend([arg.clone(), value.clone()]);
+                index += 2;
+            } else {
+                if arg.strip_prefix(value_prefix)?.is_empty() {
+                    return None;
+                }
+                resume_prefix.push(arg.clone());
+                index += 1;
+            }
+            continue;
+        }
+        if arg == "--no-session" || arg.starts_with("--no-session=") {
+            return None;
+        }
+        if arg == "--fork" || arg.starts_with("--fork=") {
+            return None;
+        }
+        if arg == OMP_COMPANION_ARG {
+            index += 1;
+            continue;
+        }
+        if arg == "--continue" || arg == "-c" {
+            if invocation.is_some() {
+                return None;
+            }
+            if args
+                .get(index + 1)
+                .is_some_and(|value| omp_session_uuid(value))
+            {
+                invocation = Some(DirectOmpInvocation::ExactResume);
+                index += 2;
+            } else {
+                invocation = Some(DirectOmpInvocation::Continue);
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(arg.as_str(), "--resume" | "-r" | "--session") {
+            if invocation.is_some() {
+                return None;
+            }
+            let session_id = args.get(index + 1)?;
+            if !omp_session_uuid(session_id) {
+                return None;
+            }
+            invocation = Some(DirectOmpInvocation::ExactResume);
+            index += 2;
+            continue;
+        }
+        if let Some(session_id) = arg
+            .strip_prefix("--resume=")
+            .or_else(|| arg.strip_prefix("--session="))
+        {
+            if invocation.is_some() || !omp_session_uuid(session_id) {
+                return None;
+            }
+            invocation = Some(DirectOmpInvocation::ExactResume);
+            index += 1;
+            continue;
+        }
+        if omp_option_takes_value(arg) {
+            let value = args.get(index + 1)?;
+            if value == "--" {
+                return None;
+            }
+            resume_prefix.extend([arg.clone(), value.clone()]);
+            index += 2;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            return None;
+        }
+        resume_prefix.push(arg.clone());
+        index += 1;
+    }
+    Some((resume_prefix, invocation))
+}
+
+fn omp_session_uuid(value: &str) -> bool {
+    value.len() == 36 && uuid::Uuid::parse_str(value).is_ok()
+}
+
+fn parse_omp_argv(
+    argv: &[String],
+    windows: bool,
+    allow_literal_executable: bool,
+) -> Option<DirectOmpCommand> {
+    let executable = argv.first()?.as_str();
+    if !(allow_literal_executable && omp_executable_literal(executable, windows))
+        && !resolved_omp_executable(executable, windows)
+    {
+        return None;
+    }
+
+    let (resume_prefix, invocation) = if argv.get(1).is_some_and(|arg| arg == "launch") {
+        let separator = argv
+            .iter()
+            .skip(2)
+            .position(|arg| arg == "--")
+            .map(|index| index + 2);
+        if separator.is_some_and(|separator| {
+            separator + 1 == argv.len() || argv[separator + 1..].iter().any(String::is_empty)
+        }) {
+            return None;
+        }
+        let option_end = separator.unwrap_or(argv.len());
+        let (resume_prefix, _) = collect_omp_resume_options(argv, 2, option_end)?;
+        (resume_prefix, DirectOmpInvocation::Launch)
+    } else {
+        let (resume_prefix, invocation) = collect_omp_resume_options(argv, 1, argv.len())?;
+        (resume_prefix, invocation?)
+    };
+
+    Some(DirectOmpCommand {
+        executable: executable.to_string(),
+        resume_prefix,
+        invocation,
+    })
+}
+fn parse_direct_omp_argv(argv: &[String], windows: bool) -> Option<DirectOmpCommand> {
+    parse_omp_argv(argv, windows, false)
+}
+
+/// Select the argv for any restorable terminal spawn. OMP only trusts an exact
+/// authenticated resume; cwd-scoped bare `--continue` is provisional and must
+/// fall back to the clean relaunch argv after a Fresh restart.
+pub(crate) fn select_restorable_terminal_argv<'a>(
+    companion: Option<fresh_core::api::TerminalCompanion>,
+    resume: Option<&'a [String]>,
+    relaunch: Option<&'a [String]>,
+    resume_agents: bool,
+) -> Option<&'a [String]> {
+    let resume = resume.filter(|argv| !argv.is_empty());
+    if companion == Some(fresh_core::api::TerminalCompanion::Omp) {
+        if let Some(exact) = resume.filter(|argv| exact_omp_resume_argv(argv, cfg!(windows))) {
+            return Some(exact);
+        }
+    } else if resume_agents && resume.is_some() {
+        return resume;
+    }
+    relaunch.filter(|argv| !argv.is_empty())
+}
+
+fn admit_trusted_omp_executable(
+    executable: &str,
+    trusted: &std::path::Path,
+    windows: bool,
+) -> Option<String> {
+    let trusted = std::fs::canonicalize(trusted).ok()?;
+    let trusted_str = trusted.to_str()?;
+    if !resolved_omp_executable(trusted_str, windows) {
+        return None;
+    }
+    let literal = omp_executable_literal(executable, windows);
+    if literal {
+        return Some(trusted_str.to_string());
+    }
+    if !resolved_omp_executable(executable, windows) {
+        return None;
+    }
+    let requested = std::fs::canonicalize(executable).ok()?;
+    (requested == trusted).then(|| trusted_str.to_string())
+}
+
+fn configured_trusted_omp_executable(windows: bool) -> Option<std::path::PathBuf> {
+    let configured = std::env::var_os(OMP_TRUSTED_EXECUTABLE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                home.join(".local")
+                    .join("bin")
+                    .join(if windows { "omp.exe" } else { "omp" })
+            })
+        })?;
+    configured.is_absolute().then_some(configured)
+}
+
+pub(crate) fn resolve_trusted_omp_executable(executable: &str, windows: bool) -> Option<String> {
+    let trusted = configured_trusted_omp_executable(windows)?;
+    admit_trusted_omp_executable(executable, &trusted, windows)
+}
+
+pub(crate) fn current_trusted_omp_executable(windows: bool) -> Option<String> {
+    let trusted = configured_trusted_omp_executable(windows)?;
+    admit_trusted_omp_executable(if windows { "omp.exe" } else { "omp" }, &trusted, windows)
+}
+
+fn omp_companion_executable_supported(executable: &str) -> bool {
+    let mut child = match std::process::Command::new(executable)
+        .args([OMP_COMPANION_ARG, "--version"])
+        .env_remove(OMP_COMPANION_ENV)
+        .env_remove(OMP_COMPANION_ENDPOINT_ENV)
+        .env_remove(OMP_COMPANION_TOKEN_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+pub(crate) fn exact_omp_resume_argv(argv: &[String], windows: bool) -> bool {
+    parse_omp_argv(argv, windows, true)
+        .is_some_and(|command| command.invocation == DirectOmpInvocation::ExactResume)
+}
+
+pub(crate) fn pin_current_trusted_omp_argv(argv: &mut [String], windows: bool) -> bool {
+    if parse_omp_argv(argv, windows, true).is_none() {
+        return false;
+    }
+    let Some(executable) = current_trusted_omp_executable(windows) else {
+        return false;
+    };
+    argv[0] = executable;
+    true
+}
+
+pub(crate) fn trusted_legacy_exact_omp_resume(
+    resume: &[String],
+    relaunch: Option<&[String]>,
+    windows: bool,
+) -> bool {
+    let Some(resume_executable) = resume
+        .first()
+        .and_then(|executable| resolve_trusted_omp_executable(executable, windows))
+    else {
+        return false;
+    };
+    let mut trusted_resume = resume.to_vec();
+    trusted_resume[0] = resume_executable.clone();
+    let Some(parsed_resume) = parse_direct_omp_argv(&trusted_resume, windows)
+        .filter(|parsed| parsed.invocation == DirectOmpInvocation::ExactResume)
+    else {
+        return false;
+    };
+
+    let Some(mut trusted_relaunch) = relaunch.map(<[String]>::to_vec) else {
+        return false;
+    };
+    let Some(relaunch_executable) = trusted_relaunch
+        .first()
+        .and_then(|executable| resolve_trusted_omp_executable(executable, windows))
+    else {
+        return false;
+    };
+    if relaunch_executable != resume_executable {
+        return false;
+    }
+    trusted_relaunch[0] = relaunch_executable;
+    parse_direct_omp_argv(&trusted_relaunch, windows).is_some_and(|parsed_relaunch| {
+        parsed_relaunch.invocation == DirectOmpInvocation::Launch
+            && parsed_relaunch.resume_prefix == parsed_resume.resume_prefix
+    })
+}
+
+fn effective_env_non_empty(
+    name: &str,
+    inherited: &[(String, String)],
+    env_delta: &crate::services::env_provider::EnvDelta,
+    plugin_env: &HashMap<String, String>,
+    windows: bool,
+) -> bool {
+    let mut non_empty = inherited
+        .iter()
+        .filter(|(key, _)| env_key_matches(key, name, windows))
+        .any(|(_, value)| !value.is_empty());
+
+    let mut delta_seen = false;
+    let mut delta_non_empty = false;
+    for (key, value) in &env_delta.set {
+        if env_key_matches(key, name, windows) {
+            delta_seen = true;
+            delta_non_empty |= !value.is_empty();
+        }
+    }
+    if delta_seen {
+        non_empty = delta_non_empty;
+    }
+    if env_delta
+        .unset
+        .iter()
+        .any(|key| env_key_matches(key, name, windows))
+    {
+        non_empty = false;
+    }
+
+    let mut plugin_seen = false;
+    let mut plugin_non_empty = false;
+    for (key, value) in plugin_env {
+        if env_key_matches(key, name, windows) {
+            plugin_seen = true;
+            plugin_non_empty |= !value.is_empty();
+        }
+    }
+    if plugin_seen {
+        non_empty = plugin_non_empty;
+    }
+    non_empty
+}
+
+fn remove_reserved_omp_companion_env(
+    inherited: &[(String, String)],
+    env_delta: &mut crate::services::env_provider::EnvDelta,
+    windows: bool,
+) {
+    let (set, unset) = (&mut env_delta.set, &mut env_delta.unset);
+    for key in inherited.iter().map(|(key, _)| key) {
+        if is_reserved_omp_companion_key(key, windows)
+            && !unset.iter().any(|existing| existing == key)
+        {
+            unset.push(key.clone());
+        }
+    }
+    for (key, _) in set.iter() {
+        if is_reserved_omp_companion_key(key, windows)
+            && !unset.iter().any(|existing| existing == key)
+        {
+            unset.push(key.clone());
+        }
+    }
+    set.retain(|(key, _)| !is_reserved_omp_companion_key(key, windows));
+    for key in [
+        OMP_COMPANION_ENV,
+        OMP_COMPANION_ENDPOINT_ENV,
+        OMP_COMPANION_TOKEN_ENV,
+    ] {
+        if !unset.iter().any(|existing| existing == key) {
+            unset.push(key.to_string());
+        }
+    }
 }
 
 impl Window {
-    /// Remember which capability token `terminal_id`'s freshly-spawned child
-    /// was handed, reading it out of the env [`agent_command_env`] built.
-    ///
-    /// A no-op for a terminal spawned without `allowScript` (no token in the
-    /// map), so every spawn site can call it unconditionally. The membership
-    /// this records is what workspace capture persists and what a later
-    /// restore/respawn re-mints from.
+    /// Remember an explicitly host-minted capability for this live child.
+    /// Caller-provided environment text is never parsed as authority.
     pub(crate) fn record_terminal_script_token(
         &mut self,
         terminal_id: TerminalId,
-        env: &HashMap<String, String>,
+        token: Option<&str>,
     ) {
-        if let Some(token) = env.get("FRESH_CMD_TOKEN") {
+        if let Some(token) = token {
             self.terminal_script_tokens
-                .insert(terminal_id, token.clone());
+                .insert(terminal_id, Some(token.to_string()));
         }
     }
 
@@ -207,12 +1139,24 @@ impl Window {
         &mut self,
         key: TerminalId,
     ) -> HashMap<String, String> {
-        if let Some(stale) = self.terminal_script_tokens.remove(&key) {
+        if let Some(stale) = self
+            .terminal_script_tokens
+            .get_mut(&key)
+            .and_then(Option::take)
+        {
             crate::server::command_access::revoke(&stale);
         }
-        let env = agent_command_env(self.id, None, true);
-        self.record_terminal_script_token(key, &env);
-        env
+        match agent_command_env(self.id, None, true) {
+            Ok(env) => {
+                self.record_terminal_script_token(key, env.script_token.as_deref());
+                env.vars
+            }
+            Err(error) => {
+                tracing::warn!("failed to re-mint terminal script capability: {error}");
+                self.remember_terminal_script_access(key);
+                HashMap::new()
+            }
+        }
     }
 
     /// Move a terminal's script-token entry onto the id the manager actually
@@ -230,6 +1174,54 @@ impl Window {
     /// grant workspace capture persists and a respawn re-mints.
     pub(crate) fn terminal_has_script_access(&self, terminal_id: TerminalId) -> bool {
         self.terminal_script_tokens.contains_key(&terminal_id)
+    }
+
+    pub(crate) fn terminal_script_capability(
+        &self,
+        terminal_id: TerminalId,
+    ) -> Option<crate::services::terminal::manager::TerminalScriptCapability> {
+        self.terminal_script_tokens
+            .get(&terminal_id)
+            .and_then(|token| token.as_ref())
+            .cloned()
+            .map(crate::services::terminal::manager::TerminalScriptCapability::new)
+    }
+
+    /// Retain a persisted script grant without minting a token. Used for
+    /// restored exited terminals, which have no live child yet.
+    pub(crate) fn remember_terminal_script_access(&mut self, terminal_id: TerminalId) {
+        self.terminal_script_tokens
+            .entry(terminal_id)
+            .or_insert(None);
+    }
+
+    /// Revoke the live token for `terminal_id`. `retain_grant` keeps a
+    /// token-less membership entry for restart; closing the terminal drops it.
+    pub(crate) fn revoke_terminal_script_token(
+        &mut self,
+        terminal_id: TerminalId,
+        retain_grant: bool,
+    ) {
+        let Some(token) = self.terminal_script_tokens.remove(&terminal_id) else {
+            return;
+        };
+        if let Some(token) = token {
+            crate::server::command_access::revoke(&token);
+        }
+        if retain_grant {
+            self.terminal_script_tokens.insert(terminal_id, None);
+        }
+    }
+
+    /// Revoke every live child capability before this window is discarded.
+    pub(crate) fn revoke_all_terminal_script_tokens(&mut self) {
+        for token in self
+            .terminal_script_tokens
+            .drain()
+            .filter_map(|(_, token)| token)
+        {
+            crate::server::command_access::revoke(&token);
+        }
     }
 }
 
@@ -262,6 +1254,14 @@ impl Window {
             .terminal_wrapper
             .clone()
             .with_user_shell_override(self.resources.config.terminal.shell.as_ref())
+    }
+    /// Stable-id namespace for every transcript owned by this window.
+    pub(crate) fn terminal_artifacts_dir(&self) -> PathBuf {
+        crate::workspace::terminal_artifacts_dir(
+            &self.resources.dir_context,
+            &self.root,
+            &self.stable_id,
+        )
     }
 
     /// The activated-environment delta (venv/direnv/mise) to apply to a newly
@@ -316,6 +1316,58 @@ impl Window {
         }
         wrapper
     }
+    pub(crate) fn prepare_omp_companion_spawn(
+        &self,
+        kind: fresh_core::api::TerminalCompanion,
+        command: Option<&[String]>,
+        env_delta: &mut crate::services::env_provider::EnvDelta,
+        extra_env: &mut HashMap<String, String>,
+    ) -> Result<OmpCompanionPreparation, String> {
+        let windows = cfg!(windows);
+        reject_reserved_omp_companion_env(extra_env, windows)?;
+
+        let inherited: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(key, value)| {
+                let key = key.into_string().ok()?;
+                (env_key_matches(&key, "TMUX", windows)
+                    || env_key_matches(&key, "STY", windows)
+                    || is_reserved_omp_companion_key(&key, windows))
+                .then(|| (key, value.to_string_lossy().into_owned()))
+            })
+            .collect();
+        let multiplexer_active =
+            effective_env_non_empty("TMUX", &inherited, env_delta, extra_env, windows)
+                || effective_env_non_empty("STY", &inherited, env_delta, extra_env, windows);
+        remove_reserved_omp_companion_env(&inherited, env_delta, windows);
+
+        let direct_local = matches!(
+            &self.authority().command_wrap,
+            crate::services::authority::CommandWrap::Direct
+        );
+        let Some(command) = direct_local
+            .then(|| {
+                command.and_then(|argv| {
+                    let executable = resolve_trusted_omp_executable(argv.first()?, windows)?;
+                    let mut trusted_argv = argv.to_vec();
+                    trusted_argv[0] = executable;
+                    parse_direct_omp_argv(&trusted_argv, windows)
+                })
+            })
+            .flatten()
+            .filter(|command| {
+                !multiplexer_active && omp_companion_executable_supported(&command.executable)
+            })
+        else {
+            return Ok(OmpCompanionPreparation::Unsupported);
+        };
+
+        Ok(preparation_after_mint(mint_omp_companion_spawn(
+            kind,
+            command,
+            extra_env,
+            |secret| getrandom::fill(secret),
+        )))
+    }
 
     /// Get terminal dimensions appropriate for spawning a PTY in this
     /// window. Derived from the window's cached screen size minus a
@@ -350,7 +1402,15 @@ impl Window {
         command_override: Option<Vec<String>>,
         extra_env: HashMap<String, String>,
     ) -> Option<TerminalId> {
-        self.spawn_terminal_session_impl(cwd, persistent, command_override, extra_env, false)
+        self.spawn_terminal_session_impl(
+            cwd,
+            persistent,
+            command_override,
+            extra_env,
+            false,
+            None,
+            None,
+        )
     }
 
     /// Like [`Self::spawn_terminal_session`] but builds the command wrapper from
@@ -365,7 +1425,15 @@ impl Window {
         command_override: Option<Vec<String>>,
         extra_env: HashMap<String, String>,
     ) -> Option<TerminalId> {
-        self.spawn_terminal_session_impl(cwd, persistent, command_override, extra_env, true)
+        self.spawn_terminal_session_impl(
+            cwd,
+            persistent,
+            command_override,
+            extra_env,
+            true,
+            None,
+            None,
+        )
     }
 
     /// Pick the `fresh-terminal-…` file stem for a new persistent terminal in
@@ -393,11 +1461,16 @@ impl Window {
         let base = format!("fresh-terminal-{}", terminal_id.0);
         let taken = |stem: &str| {
             let backing = terminal_root.join(format!("{stem}.txt"));
+            let history = terminal_root.join(format!("{stem}.history.txt"));
             let log = terminal_root.join(format!("{stem}.log"));
             self.terminal_backing_files
                 .values()
-                .chain(self.terminal_log_files.values())
-                .any(|p| *p == backing || *p == log)
+                .any(|path| *path == backing)
+                || self
+                    .terminal_history_files
+                    .values()
+                    .any(|path| *path == history)
+                || self.terminal_log_files.values().any(|path| *path == log)
         };
         if !taken(&base) {
             return base;
@@ -415,8 +1488,10 @@ impl Window {
         cwd: Option<PathBuf>,
         persistent: bool,
         command_override: Option<Vec<String>>,
-        extra_env: HashMap<String, String>,
+        mut extra_env: HashMap<String, String>,
         force_local: bool,
+        companion: Option<fresh_core::api::TerminalCompanion>,
+        script_capability: Option<crate::services::terminal::manager::TerminalScriptCapability>,
     ) -> Option<TerminalId> {
         let (cols, rows) = self.get_terminal_dimensions();
 
@@ -426,7 +1501,7 @@ impl Window {
         self.terminal_manager.set_async_bridge(bridge);
 
         let working_dir = cwd.unwrap_or_else(|| self.root.clone());
-        let terminal_root = self.resources.dir_context.terminal_dir_for(&working_dir);
+        let terminal_root = self.terminal_artifacts_dir();
         if let Err(e) = terminal_backing_fs().create_dir_all(&terminal_root) {
             tracing::warn!("Failed to create terminal directory: {}", e);
         }
@@ -447,7 +1522,10 @@ impl Window {
             format!("fresh-terminal-eph-{}-{}", predicted_terminal_id.0, nanos)
         };
         let log_path = terminal_root.join(format!("{}.log", name_stem));
+        let history_path = terminal_root.join(format!("{}.history.txt", name_stem));
         let backing_path = terminal_root.join(format!("{}.txt", name_stem));
+        self.terminal_history_files
+            .insert(predicted_terminal_id, history_path.clone());
         self.terminal_backing_files
             .insert(predicted_terminal_id, backing_path.clone());
 
@@ -459,45 +1537,100 @@ impl Window {
         // Empty argv falls back to the interactive shell.
         //
         // `force_local` bypasses the window's authority so the command runs on
-        // this host regardless of any remote backend (see `local_direct_wrapper`).
-        let wrapper = match command_override {
-            Some(argv) if !argv.is_empty() && force_local => local_direct_wrapper(&argv),
-            Some(argv) if !argv.is_empty() => self.authority().terminal_command(&argv),
+        let direct_local = matches!(
+            &self.authority().command_wrap,
+            crate::services::authority::CommandWrap::Direct
+        );
+        let mut companion_command = command_override;
+        if companion.is_some() {
+            if let Some(argv) = companion_command.as_mut() {
+                remove_omp_companion_arg(argv);
+                if direct_local {
+                    if let Some(executable) = argv
+                        .first()
+                        .and_then(|argv0| resolve_trusted_omp_executable(argv0, cfg!(windows)))
+                    {
+                        argv[0] = executable;
+                    }
+                }
+            }
+        }
+        let mut wrapper = match companion_command.as_deref() {
+            Some(argv) if !argv.is_empty() && force_local => local_direct_wrapper(argv),
+            Some(argv) if !argv.is_empty() => self.authority().terminal_command(argv),
             _ => self.resolved_terminal_wrapper(),
         };
         // A forced-local command must not inherit a remote authority's activated
         // env (venv/direnv living on another host); it runs on this host and
-        // inherits this editor process's real environment instead.
-        let (wrapper, env_delta) = if force_local {
+        let (next_wrapper, mut env_delta) = if force_local {
             (wrapper, crate::services::env_provider::EnvDelta::default())
         } else {
             let wrapper = self.apply_remote_terminal_env(wrapper);
             let env_delta = self.terminal_env_delta(&wrapper);
             (wrapper, env_delta)
         };
+        wrapper = next_wrapper;
+        let companion_preparation = match companion {
+            Some(kind) => match self.prepare_omp_companion_spawn(
+                kind,
+                companion_command.as_deref(),
+                &mut env_delta,
+                &mut extra_env,
+            ) {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    self.set_status_message(
+                        t!("terminal.failed_to_open", error = error.clone()).to_string(),
+                    );
+                    tracing::warn!("OMP companion terminal launch rejected: {error}");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let preserves_companion_marker = companion_preparation
+            .as_ref()
+            .is_some_and(OmpCompanionPreparation::preserves_marker);
+        if companion_preparation
+            .as_ref()
+            .is_some_and(OmpCompanionPreparation::is_active)
+        {
+            insert_omp_companion_arg(&mut wrapper.args);
+        }
+        let companion_spawn = companion_preparation.and_then(OmpCompanionPreparation::into_spawn);
         match self.terminal_manager.spawn(
             cols,
             rows,
             Some(working_dir),
             Some(log_path.clone()),
-            Some(backing_path.clone()),
-            // A brand-new terminal: its transcripts start empty even if an
-            // earlier run left files on these paths.
+            Some(history_path.clone()),
+            // A brand-new terminal: append-only history starts empty even if an
+            // earlier run left artifacts on these paths.
             crate::services::terminal::BackingMode::Fresh,
             wrapper,
             env_delta,
             extra_env,
+            companion_spawn,
+            script_capability,
         ) {
             Ok(terminal_id) => {
+                persist_initial_companion_marker(
+                    &mut self.terminal_companions,
+                    terminal_id,
+                    companion,
+                    preserves_companion_marker,
+                );
+
                 self.terminal_log_files.insert(terminal_id, log_path);
-                // If the actual terminal id differs from the predicted one,
-                // re-key the backing entry onto the real id — keeping the
-                // *same* path, which is the one the manager's reader thread
-                // is already streaming into.
+                // If the actual id differs, re-key both paths without changing
+                // the files the reader and checkpoint writer already own.
                 if terminal_id != predicted_terminal_id {
                     self.terminal_backing_files.remove(&predicted_terminal_id);
                     self.terminal_backing_files
                         .insert(terminal_id, backing_path);
+                    self.terminal_history_files.remove(&predicted_terminal_id);
+                    self.terminal_history_files
+                        .insert(terminal_id, history_path);
                 }
                 if !persistent {
                     self.ephemeral_terminals.insert(terminal_id);
@@ -532,7 +1665,7 @@ impl Window {
             .get(&terminal_id)
             .cloned()
             .unwrap_or_else(|| {
-                let root = self.resources.dir_context.terminal_dir_for(&self.root);
+                let root = self.terminal_artifacts_dir();
                 if let Err(e) = terminal_backing_fs().create_dir_all(&root) {
                     tracing::warn!("Failed to create terminal directory: {}", e);
                 }
@@ -637,7 +1770,12 @@ impl Window {
             command,
             title,
             env,
+            companion,
+            script_capability,
         } = spec;
+        if companion.is_some() {
+            reject_reserved_omp_companion_env(&env, cfg!(windows))?;
+        }
         // Derive the auto-title from the command's executable name
         // (basename of argv[0]). The host writes this into the
         // terminal buffer's `BufferMetadata::name` so the tab reads
@@ -654,7 +1792,15 @@ impl Window {
         });
         let resolved_title = title.or(auto_title);
         let terminal_id = self
-            .spawn_terminal_session(cwd, persistent, command, env)
+            .spawn_terminal_session_impl(
+                cwd,
+                persistent,
+                command,
+                env,
+                false,
+                companion,
+                script_capability,
+            )
             .ok_or_else(|| "Failed to spawn terminal".to_string())?;
 
         // Register the leader pid with this window's process_groups
@@ -1018,7 +2164,7 @@ impl Window {
         title: String,
     ) -> Option<(TerminalId, BufferId)> {
         let terminal_id =
-            self.spawn_local_terminal_session(None, true, Some(argv), HashMap::new())?;
+            self.spawn_local_terminal_session(None, false, Some(argv), HashMap::new())?;
         let split_id = self
             .buffers
             .splits()
@@ -1045,7 +2191,7 @@ impl Window {
             .get(&terminal_id)
             .cloned()
             .unwrap_or_else(|| {
-                let root = self.resources.dir_context.terminal_dir_for(&self.root);
+                let root = self.terminal_artifacts_dir();
                 if let Err(e) = terminal_backing_fs().create_dir_all(&root) {
                     tracing::warn!("Failed to create terminal directory: {}", e);
                 }
@@ -1126,6 +2272,9 @@ impl Window {
     /// respawned), so callers can tailor a status message and skip it when the
     /// window had no terminals to restore.
     pub fn respawn_terminals_through_authority(&mut self) -> usize {
+        if !self.authority().matches_session_spec(&self.authority_spec) {
+            return 0;
+        }
         // Snapshot the (buffer, old terminal id) pairs up front — the loop
         // mutates `terminal_buffers` as it remaps ids.
         let bindings: Vec<(BufferId, TerminalId)> = self
@@ -1136,6 +2285,14 @@ impl Window {
 
         let mut revived = 0usize;
         for (buffer_id, old_id) in bindings {
+            // Ephemeral commandless terminals are deliberately non-restorable.
+            // The self-update PTY is the host-local instance of this class and
+            // must never relaunch through a newly connected remote authority.
+            if self.ephemeral_terminals.contains(&old_id)
+                && !self.terminal_commands.contains_key(&old_id)
+            {
+                continue;
+            }
             // Leave a still-live terminal alone; only revive the dead ones.
             let handle = self.terminal_manager.get(old_id);
             if handle.is_some_and(|h| h.is_alive()) {
@@ -1149,24 +2306,18 @@ impl Window {
                 .unwrap_or_else(|| self.get_terminal_dimensions());
             let cwd = handle.and_then(|h| h.cwd());
 
-            // Reuse the same backing/log files so the new PTY appends to the
-            // existing scrollback rather than starting blank.
+            // Reuse the same checkpoint/history/log artifacts. Only rendered
+            // history is handed to the PTY writer; the checkpoint stays a
+            // separately replaced read-only view.
             let backing_path = self.terminal_backing_files.get(&old_id).cloned();
+            let history_path = self.terminal_history_files.get(&old_id).cloned();
             let log_path = self.terminal_log_files.get(&old_id).cloned();
 
-            // Same argv precedence as workspace restore: an agent-resume argv
-            // first (rejoin the conversation), then the launch command, else
-            // the plain interactive shell.
-            let resume_argv = self
-                .terminal_resume_commands
-                .get(&old_id)
-                .filter(|argv| !argv.is_empty() && self.resources.config.terminal.resume_agents)
-                .cloned();
-            let launch_argv = self
-                .terminal_commands
-                .get(&old_id)
-                .filter(|argv| !argv.is_empty())
-                .cloned();
+            // Preserve both exact argv vectors. The shared selector in
+            // `respawn_terminal_pty` applies OMP/preference precedence without
+            // discarding the plain-shell `Some(Vec::new())` marker.
+            let resume_argv = self.terminal_resume_commands.get(&old_id).cloned();
+            let launch_argv = self.terminal_commands.get(&old_id).cloned();
             let ephemeral = self.ephemeral_terminals.contains(&old_id);
             let script_access = self.terminal_has_script_access(old_id);
 
@@ -1176,11 +2327,13 @@ impl Window {
                 rows,
                 cwd,
                 backing_path,
+                history_path,
                 log_path,
                 resume_argv,
                 launch_argv,
                 ephemeral,
                 script_access,
+                companion: self.terminal_companions.get(&old_id).copied(),
             };
             match self.respawn_terminal_pty(buffer_id, spawn) {
                 Some(_) => revived += 1,
@@ -1209,46 +2362,110 @@ impl Window {
     fn respawn_terminal_pty(
         &mut self,
         buffer_id: BufferId,
-        spec: RespawnSpec,
+        mut spec: RespawnSpec,
     ) -> Option<TerminalId> {
         // The window's bridge may be unset on a window restored without ever
         // spawning through `spawn_terminal_session_impl`; setting it is idempotent.
         let bridge = self.bridge.clone();
         self.terminal_manager.set_async_bridge(bridge);
 
-        let spawn_argv = spec.resume_argv.as_ref().or(spec.launch_argv.as_ref());
+        if spec.companion == Some(fresh_core::api::TerminalCompanion::Omp) {
+            for persisted in [&mut spec.launch_argv, &mut spec.resume_argv] {
+                if let Some(argv) = persisted.as_mut() {
+                    remove_omp_companion_arg(argv);
+                }
+            }
+            spec.resume_argv = spec
+                .resume_argv
+                .take()
+                .filter(|argv| exact_omp_resume_argv(argv, cfg!(windows)));
+        }
+        let mut spawn_argv = select_restorable_terminal_argv(
+            spec.companion,
+            spec.resume_argv.as_deref(),
+            spec.launch_argv.as_deref(),
+            self.resources.config.terminal.resume_agents,
+        )
+        .map(<[String]>::to_vec);
+        let direct_local = matches!(
+            &self.authority().command_wrap,
+            crate::services::authority::CommandWrap::Direct
+        );
+        if spec.companion == Some(fresh_core::api::TerminalCompanion::Omp) && direct_local {
+            let pin_failed = spawn_argv
+                .as_mut()
+                .is_some_and(|argv| !pin_current_trusted_omp_argv(argv, cfg!(windows)));
+            if pin_failed {
+                tracing::warn!("OMP companion terminal respawn could not pin a trusted executable");
+                return None;
+            }
+            for persisted in [&mut spec.launch_argv, &mut spec.resume_argv] {
+                if let Some(argv) = persisted.as_mut() {
+                    let _ = pin_current_trusted_omp_argv(argv, cfg!(windows));
+                }
+            }
+        }
+        let spawn_argv = spawn_argv.as_deref();
         let wrapper = match spawn_argv {
             Some(argv) => self.authority().terminal_command(argv),
             None => self.resolved_terminal_wrapper(),
         };
-        let wrapper = self.apply_remote_terminal_env(wrapper);
-        let env_delta = self.terminal_env_delta(&wrapper);
+        let mut wrapper = self.apply_remote_terminal_env(wrapper);
+        let mut env_delta = self.terminal_env_delta(&wrapper);
 
         // An agent that was granted editor control keeps it across the
         // respawn: the reborn child gets a freshly-minted token bound to this
         // window, since the one its predecessor carried died with that PTY.
-        let extra_env = if spec.script_access {
+        let mut extra_env = if spec.script_access {
             self.remint_terminal_script_env(spec.old_id)
         } else {
             HashMap::new()
         };
+        let script_capability = self.terminal_script_capability(spec.old_id);
+        let companion_preparation = match spec.companion {
+            Some(kind) => match self.prepare_omp_companion_spawn(
+                kind,
+                spawn_argv,
+                &mut env_delta,
+                &mut extra_env,
+            ) {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    tracing::warn!("OMP companion terminal respawn rejected: {error}");
+                    self.revoke_terminal_script_token(spec.old_id, true);
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let preserves_companion_marker = companion_preparation
+            .as_ref()
+            .is_some_and(OmpCompanionPreparation::preserves_marker);
+        if companion_preparation
+            .as_ref()
+            .is_some_and(OmpCompanionPreparation::is_active)
+        {
+            insert_omp_companion_arg(&mut wrapper.args);
+        }
+        let companion_spawn = companion_preparation.and_then(OmpCompanionPreparation::into_spawn);
 
         let new_id = match self.terminal_manager.spawn(
             spec.cols,
             spec.rows,
             spec.cwd,
             spec.log_path.clone(),
-            spec.backing_path.clone(),
-            // Same terminal reborn: append to its existing transcript rather
-            // than blanking the scrollback the user still has on screen.
+            spec.history_path.clone(),
             crate::services::terminal::BackingMode::Continue,
             wrapper,
             env_delta,
             extra_env,
+            companion_spawn,
+            script_capability,
         ) {
             Ok(id) => id,
             Err(e) => {
                 tracing::warn!("failed to respawn terminal {:?}: {}", spec.old_id, e);
+                self.revoke_terminal_script_token(spec.old_id, true);
                 return None;
             }
         };
@@ -1266,8 +2483,20 @@ impl Window {
         // values come from the caller's spec rather than the maps, so this is
         // correct even when the exit path already dropped the old entries.
         self.rekey_terminal_script_token(spec.old_id, new_id);
+        self.terminal_companions.remove(&spec.old_id);
+        persist_initial_companion_marker(
+            &mut self.terminal_companions,
+            new_id,
+            spec.companion,
+            preserves_companion_marker,
+        );
+        if self.tracked_agent_terminal == Some(spec.old_id) {
+            self.tracked_agent_terminal = Some(new_id);
+        }
+
         if new_id != spec.old_id {
             self.terminal_backing_files.remove(&spec.old_id);
+            self.terminal_history_files.remove(&spec.old_id);
             self.terminal_log_files.remove(&spec.old_id);
             self.terminal_commands.remove(&spec.old_id);
             self.terminal_resume_commands.remove(&spec.old_id);
@@ -1275,6 +2504,9 @@ impl Window {
         }
         if let Some(p) = spec.backing_path {
             self.terminal_backing_files.insert(new_id, p);
+        }
+        if let Some(p) = spec.history_path {
+            self.terminal_history_files.insert(new_id, p);
         }
         if let Some(p) = spec.log_path {
             self.terminal_log_files.insert(new_id, p);
@@ -1333,11 +2565,30 @@ impl Window {
         command: Option<Vec<String>>,
         resume: Option<Vec<String>>,
     ) {
+        let omp_companion = self.terminal_companions.get(&terminal_id)
+            == Some(&fresh_core::api::TerminalCompanion::Omp);
+        let pinned_executable = omp_companion
+            .then(|| self.terminal_manager.get(terminal_id))
+            .flatten()
+            .map(|handle| handle.shell().to_string())
+            .filter(|executable| resolved_omp_executable(executable, cfg!(windows)));
+        let pin = |mut argv: Vec<String>| {
+            if omp_companion {
+                remove_omp_companion_arg(&mut argv);
+            }
+            if let (Some(executable), Some(argv0)) = (pinned_executable.as_ref(), argv.first_mut())
+            {
+                *argv0 = executable.clone();
+            }
+            argv
+        };
         if let Some(argv) = command {
-            self.terminal_commands.insert(terminal_id, argv);
+            self.terminal_commands.insert(terminal_id, pin(argv));
         }
-        if let Some(argv) = resume.filter(|a| !a.is_empty()) {
-            self.terminal_resume_commands.insert(terminal_id, argv);
+        if let Some(argv) = resume.filter(|argv| {
+            !argv.is_empty() && (!omp_companion || exact_omp_resume_argv(argv, cfg!(windows)))
+        }) {
+            self.terminal_resume_commands.insert(terminal_id, pin(argv));
         }
     }
 
@@ -1357,8 +2608,8 @@ impl Window {
     /// This is the per-buffer counterpart to what a workspace restore does for
     /// a whole window: same argv precedence (agent-resume → launch command →
     /// plain shell), same authority wrapper, same reuse of the backing/log
-    /// files so the transcript continues below the `[Terminal process exited]`
-    /// marker rather than starting blank.
+    /// files so the transcript continues in the same backing store rather than
+    /// starting blank.
     ///
     /// Returns the new terminal id. `None` when the buffer has no exited
     /// terminal (never was one, still live, or already restarted) or the
@@ -1367,27 +2618,88 @@ impl Window {
         // Take the record up front: a failed respawn must not leave a stale
         // entry claiming a restart is still available, and a successful one
         // has no dead terminal left to describe.
-        let exited = self.exited_terminals.remove(&buffer_id)?;
+        let mut exited = self.exited_terminals.remove(&buffer_id)?;
 
-        // Same gate as workspace restore: `terminal.resume_agents` off means
-        // re-run the launch command instead of rejoining the conversation.
-        let resume_argv = exited
-            .resume
-            .clone()
-            .filter(|argv| !argv.is_empty() && self.resources.config.terminal.resume_agents);
-        let launch_argv = exited.command.clone().filter(|argv| !argv.is_empty());
+        if let Some(target) = exited.pending_history_migration.clone() {
+            let migration = exited
+                .backing_path
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("legacy terminal has no backing source"))
+                .and_then(|source| migrate_legacy_terminal_history(source, &target));
+            if let Err(error) = migration {
+                tracing::warn!("Failed to migrate legacy terminal history on restart: {error}");
+                self.exited_terminals.insert(buffer_id, exited);
+                return None;
+            }
+            exited.history_path = Some(target.clone());
+            exited.pending_history_migration = None;
+            self.terminal_history_files
+                .insert(exited.terminal_id, target);
+        }
+        let respawn_backing_path = match (
+            exited.backing_history_end,
+            exited.checkpoint_generation.as_deref(),
+        ) {
+            (Some(history_end), Some(generation)) => {
+                let promotion = exited
+                    .backing_path
+                    .as_deref()
+                    .zip(exited.history_path.as_deref())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "exited terminal checkpoint is missing its artifact paths",
+                        )
+                    })
+                    .and_then(|(checkpoint, history)| {
+                        self.promote_saved_terminal_checkpoint(
+                            checkpoint,
+                            history,
+                            history_end,
+                            generation,
+                        )
+                        .map(|()| mutable_terminal_backing_path(history))
+                    });
+                match promotion {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to promote exited terminal checkpoint on restart: {error}"
+                        );
+                        self.exited_terminals.insert(buffer_id, exited);
+                        return None;
+                    }
+                }
+            }
+            (None, None) => exited.backing_path.clone(),
+            _ => {
+                tracing::warn!(
+                    "Refusing to restart an exited terminal with incomplete checkpoint identity"
+                );
+                self.exited_terminals.insert(buffer_id, exited);
+                return None;
+            }
+        };
+
+        // Keep the exact durable vectors. `respawn_terminal_pty` is the single
+        // authority for OMP/preference selection and retains an empty launch
+        // vector as the plain-shell restorable marker after a successful spawn.
+        let resume_argv = exited.resume.clone();
+        let launch_argv = exited.command.clone();
 
         let spec = RespawnSpec {
             old_id: exited.terminal_id,
             cols: exited.cols,
             rows: exited.rows,
             cwd: exited.cwd.clone(),
-            backing_path: exited.backing_path.clone(),
+            backing_path: respawn_backing_path,
+            history_path: exited.history_path.clone(),
             log_path: exited.log_path.clone(),
             resume_argv,
             launch_argv,
             ephemeral: exited.ephemeral,
             script_access: exited.script_access,
+            companion: exited.companion,
         };
         let Some(new_id) = self.respawn_terminal_pty(buffer_id, spec) else {
             // Put the record back so the user can retry the restart.
@@ -1432,6 +2744,7 @@ struct RespawnSpec {
     rows: u16,
     cwd: Option<PathBuf>,
     backing_path: Option<PathBuf>,
+    history_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
     resume_argv: Option<Vec<String>>,
     launch_argv: Option<Vec<String>>,
@@ -1441,6 +2754,9 @@ struct RespawnSpec {
     /// [`Window::remint_terminal_script_env`]) rather than inheriting the dead
     /// one's, which it could not see anyway.
     script_access: bool,
+    /// Descriptive companion marker to reactivate when the replacement PTY is
+    /// eligible for the native protocol.
+    companion: Option<fresh_core::api::TerminalCompanion>,
 }
 
 impl Editor {
@@ -1525,7 +2841,10 @@ impl Editor {
             self.finish_self_update(None);
             return;
         };
-        self.begin_self_update(terminal_id, window, buffer_id);
+        self.begin_self_update(
+            fresh_core::WindowTerminalId::new(window, terminal_id),
+            buffer_id,
+        );
 
         // Editor-wide: refresh the plugin-state snapshot and fire
         // `buffer_activated`, matching `open_terminal`.
@@ -1697,54 +3016,21 @@ impl Editor {
             .create_terminal_buffer_detached(terminal_id)
     }
 
-    /// Close the current terminal (if viewing a terminal buffer)
+    /// Close the current terminal through canonical buffer teardown while the
+    /// buffer↔terminal binding still exists. That path snapshots the rendered
+    /// screen once, revokes grants, closes the PTY, and retains the transcript.
     pub fn close_terminal(&mut self) {
         let buffer_id = self.active_buffer();
-
-        if let Some(terminal_id) = self.active_window().get_terminal_id(buffer_id) {
-            // Close the terminal
-            self.active_window_mut().terminal_manager.close(terminal_id);
-            self.active_window_mut().terminal_buffers.remove(&buffer_id);
-            self.active_window_mut()
-                .ephemeral_terminals
-                .remove(&terminal_id);
-
-            // Clean up backing/rendering file
-            let backing_file = self
-                .active_window_mut()
-                .terminal_backing_files
-                .remove(&terminal_id);
-            if let Some(ref path) = backing_file {
-                // Best-effort cleanup of temporary terminal files.
-                #[allow(clippy::let_underscore_must_use)]
-                let _ = terminal_backing_fs().remove_file(path);
-            }
-            // Clean up raw log file
-            if let Some(log_file) = self
-                .active_window_mut()
-                .terminal_log_files
-                .remove(&terminal_id)
-            {
-                if backing_file.as_ref() != Some(&log_file) {
-                    // Best-effort cleanup of temporary terminal files.
-                    #[allow(clippy::let_underscore_must_use)]
-                    let _ = terminal_backing_fs().remove_file(&log_file);
-                }
-            }
-
-            // Leave the terminal key context; closing the buffer re-syncs the
-            // context from whatever becomes active next.
-            self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Normal;
-
-            // Close the buffer
-            if let Err(e) = self.close_buffer(buffer_id) {
-                tracing::warn!("Failed to close terminal buffer: {}", e);
-            }
-
-            self.set_status_message(t!("terminal.closed", id = terminal_id.0).to_string());
-        } else {
+        let Some(terminal_id) = self.active_window().get_terminal_id(buffer_id) else {
             self.set_status_message(t!("status.not_viewing_terminal").to_string());
+            return;
+        };
+
+        if let Err(e) = self.close_buffer(buffer_id) {
+            tracing::warn!("Failed to close terminal buffer: {}", e);
+            return;
         }
+        self.set_status_message(t!("terminal.closed", id = terminal_id.0).to_string());
     }
 
     /// Send the current selection (or the cursor's line when nothing is
@@ -2002,29 +3288,9 @@ impl Editor {
                 view_state.cursors.map(|c| c.clear_selection());
             }
 
-            // Truncate backing file to remove visible screen tail and scroll to bottom
+            // The read-only checkpoint is separate from append-only history,
+            // so returning to the live grid only needs to reset terminal scroll.
             if let Some(terminal_id) = self.active_window().get_terminal_id(self.active_buffer()) {
-                // Truncate backing file to remove visible screen that was appended
-                if let Some(backing_path) = self
-                    .active_window()
-                    .terminal_backing_files
-                    .get(&terminal_id)
-                {
-                    if let Some(handle) = self.active_window().terminal_manager.get(terminal_id) {
-                        if let Ok(state) = handle.state.lock() {
-                            let truncate_pos = state.backing_file_history_end();
-                            // Always truncate to remove appended visible screen
-                            // (even if truncate_pos is 0, meaning no scrollback yet)
-                            if let Err(e) =
-                                terminal_backing_fs().set_file_length(backing_path, truncate_pos)
-                            {
-                                tracing::warn!("Failed to truncate terminal backing file: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                // Scroll terminal to bottom when re-entering
                 if let Some(handle) = self.active_window().terminal_manager.get(terminal_id) {
                     if let Ok(mut state) = handle.state.lock() {
                         state.scroll_to_bottom();
@@ -2091,9 +3357,13 @@ impl Window {
     /// active buffer is not a terminal).
     pub fn send_terminal_input(&mut self, data: &[u8]) {
         if let Some(terminal_id) = self.get_terminal_id(self.active_buffer()) {
-            if let Some(handle) = self.terminal_manager.get(terminal_id) {
-                handle.write(data);
-            }
+            self.send_terminal_input_to(terminal_id, data);
+        }
+    }
+
+    fn send_terminal_input_to(&self, terminal_id: TerminalId, data: &[u8]) {
+        if let Some(handle) = self.terminal_manager.get(terminal_id) {
+            handle.write(data);
         }
     }
 
@@ -2130,12 +3400,26 @@ impl Window {
         kind: crate::input::handler::TerminalMouseEventKind,
         modifiers: crossterm::event::KeyModifiers,
     ) {
+        if let Some(terminal_id) = self.get_terminal_id(self.active_buffer()) {
+            self.send_terminal_mouse_to(terminal_id, col, row, kind, modifiers);
+        }
+    }
+
+    /// Send a mouse event to one exact terminal, regardless of current focus.
+    pub(crate) fn send_terminal_mouse_to(
+        &self,
+        terminal_id: TerminalId,
+        col: u16,
+        row: u16,
+        kind: crate::input::handler::TerminalMouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+    ) {
         use crate::input::handler::TerminalMouseEventKind;
 
-        // Check if terminal uses SGR mouse encoding.
         let use_sgr = self
-            .get_active_terminal_state()
-            .map(|s| s.uses_sgr_mouse())
+            .terminal_manager
+            .get(terminal_id)
+            .and_then(|handle| handle.state.lock().ok().map(|s| s.uses_sgr_mouse()))
             .unwrap_or(true);
 
         // Alternate-scroll mode converts the wheel into arrow keys so the
@@ -2153,27 +3437,29 @@ impl Window {
         // this branch would otherwise fire for every wheel event forwarded to
         // an alternate-screen program — the `wants_mouse` guard is what keeps
         // mouse-aware programs receiving real wheel reports.
-        let wants_mouse = self
-            .get_active_terminal_state()
-            .map(|s| s.wants_mouse_events())
+        let uses_alt_scroll = self
+            .terminal_manager
+            .get(terminal_id)
+            .and_then(|handle| {
+                handle
+                    .state
+                    .lock()
+                    .ok()
+                    .map(|s| !s.wants_mouse_events() && s.uses_alternate_scroll())
+            })
             .unwrap_or(false);
-        let uses_alt_scroll = !wants_mouse
-            && self
-                .get_active_terminal_state()
-                .map(|s| s.uses_alternate_scroll())
-                .unwrap_or(false);
 
         if uses_alt_scroll {
             match kind {
                 TerminalMouseEventKind::ScrollUp => {
                     for _ in 0..3 {
-                        self.send_terminal_input(b"\x1b[A");
+                        self.send_terminal_input_to(terminal_id, b"\x1b[A");
                     }
                     return;
                 }
                 TerminalMouseEventKind::ScrollDown => {
                     for _ in 0..3 {
-                        self.send_terminal_input(b"\x1b[B");
+                        self.send_terminal_input_to(terminal_id, b"\x1b[B");
                     }
                     return;
                 }
@@ -2198,7 +3484,7 @@ impl Window {
         };
 
         if let Some(bytes) = bytes {
-            self.send_terminal_input(&bytes);
+            self.send_terminal_input_to(terminal_id, &bytes);
         }
     }
 
@@ -2334,77 +3620,81 @@ impl Window {
     /// for read-only viewing / selection.
     ///
     /// Incremental streaming architecture:
-    /// 1. Scrollback has already been streamed to the backing file during PTY reads.
-    /// 2. We append the visible screen (~50 lines) to the backing file.
-    /// 3. Reload the buffer from the backing file (lazy load for large files).
-    ///
-    /// Performance: O(screen_size) instead of O(total_history).
+    /// 1. Rendered scrollback is append-only in the history file.
+    /// 2. A separate history + visible-screen view is atomically replaced.
+    /// 3. The read-only buffer reloads that stable checkpoint.
     pub fn sync_terminal_to_buffer(&mut self, buffer_id: BufferId) {
-        let Some(terminal_id) = self.get_terminal_id(buffer_id) else {
-            return;
-        };
-        // Get the backing file path
-        let backing_file = match self.terminal_backing_files.get(&terminal_id) {
-            Some(path) => path.clone(),
-            None => return,
-        };
-
-        // Append visible screen to backing file
-        // The scrollback has already been incrementally streamed by the PTY read loop.
-        // Capture the file size *just before* the append so the viewport
-        // can anchor to it below — that byte offset is the first byte of
-        // the visible screen we're about to append, which is exactly
-        // where the live PTY grid drew its row 0.
-        let mut history_end_byte: Option<u64> = None;
-        // In-history head of a still-in-progress line taller than the pane
-        // that `append_visible_screen` re-attaches to the first appended
-        // logical line (fresh#2649): the viewport starts `rows` visual rows
-        // into that line so the exit frame is exactly the live grid.
-        let mut prepended = crate::services::terminal::PrependedHead::default();
-        // Grid width at capture time — the scroll-back view wraps at this
-        // exact column count so it lays out identically to the live grid.
-        let mut grid_cols: Option<usize> = None;
-        if let Some(handle) = self.terminal_manager.get(terminal_id) {
-            if let Ok(mut state) = handle.state.lock() {
-                use std::io::BufWriter;
-
-                let (cols, _) = state.size();
-                grid_cols = Some(cols as usize);
-
-                // Flush any scrollback that has scrolled off but isn't in the
-                // file yet — in particular the lines a resize spilled from the
-                // screen into history. The PTY read loop also flushes on output,
-                // but an idle terminal that was only resized has pending lines;
-                // capturing them here guarantees the scroll-back view is complete.
-                if let Ok(mut file) = terminal_backing_fs().open_file_for_append(&backing_file) {
-                    let mut writer = BufWriter::new(&mut *file);
-                    if let Err(e) = state.flush_new_scrollback(&mut writer) {
-                        tracing::error!("Failed to flush terminal scrollback: {}", e);
-                    }
-                }
-
-                // Record the current file size as the history end point
-                // (before appending visible screen) so we can truncate back to it
-                if let Ok(metadata) = terminal_backing_fs().metadata(&backing_file) {
-                    state.set_backing_file_history_end(metadata.size);
-                    history_end_byte = Some(metadata.size);
-                }
-
-                // Open backing file in append mode to add visible screen
-                if let Ok(mut file) = terminal_backing_fs().open_file_for_append(&backing_file) {
-                    let mut writer = BufWriter::new(&mut *file);
-                    match state.append_visible_screen(&mut writer) {
-                        Ok(head) => prepended = head,
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to append visible screen to backing file: {}",
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+        if let Err(error) = self.try_sync_terminal_to_buffer(buffer_id) {
+            tracing::error!("Failed to sync terminal scrollback view: {error}");
         }
+    }
+
+    /// Fallible form used by destructive lifecycle paths that must preserve
+    /// recovery artifacts unless the final checkpoint is durable.
+    pub(crate) fn try_sync_terminal_to_buffer(
+        &mut self,
+        buffer_id: BufferId,
+    ) -> std::io::Result<TerminalCheckpointFence> {
+        let terminal_id = self.get_terminal_id(buffer_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "buffer has no live terminal")
+        })?;
+        let backing_file = self
+            .terminal_backing_files
+            .get(&terminal_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "terminal has no screen checkpoint path",
+                )
+            })?;
+        let history_file = self
+            .terminal_history_files
+            .get(&terminal_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "terminal has no rendered history path",
+                )
+            })?;
+        let log_file = self.terminal_log_files.get(&terminal_id).cloned();
+
+        // In-history head of a still-in-progress line taller than the pane
+        // that `append_visible_screen` re-attaches to the first visible line.
+        let handle = self.terminal_manager.get(terminal_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "terminal disappeared during scrollback sync",
+            )
+        })?;
+        let mut state = handle
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("terminal state lock poisoned"))?;
+        let (cols, _) = state.size();
+        let grid_cols = cols as usize;
+
+        // Capture resize-only scrollback that the reader has not yet streamed.
+        // The cursor moves only after write/flush/sync/exact-length verification.
+        let durable_history_end = durably_flush_terminal_scrollback(&history_file, &mut state)?;
+        let (checkpoint_history_end, head) =
+            write_terminal_checkpoint(&history_file, &backing_file, &state)?;
+        if checkpoint_history_end != durable_history_end {
+            return Err(std::io::Error::other(format!(
+                "terminal history changed during checkpoint: expected {durable_history_end}, copied {checkpoint_history_end}"
+            )));
+        }
+        // Raw-log appends happen after parser-state updates. Observing its
+        // length while this state lock is held makes any later output visible
+        // to delayed cleanup as a length change.
+        let log_len = log_file
+            .as_ref()
+            .map(|path| std::fs::metadata(path).map(|metadata| metadata.len()))
+            .transpose()?;
+        let history_end_byte = durable_history_end;
+        let prepended = head;
+        drop(state);
 
         // Reload buffer from the backing file (reusing existing file loading).
         // Force text mode: raw PTY scrollback can contain control bytes that
@@ -2435,24 +3725,23 @@ impl Window {
             // old `cursor = total_bytes` + `ensure_cursor_visible` path
             // anchored the bottom row instead, which pulled older
             // scrollback into rows the PTY had drawn blank.
-            let anchor_byte = history_end_byte
-                .map(|h| (h as usize).min(total_bytes))
-                .unwrap_or(total_bytes);
-            if let Some((mgr, view_states)) = self.buffers.splits_mut() {
-                let active_split = mgr.active_split();
-                if let Some(view_state) = view_states.get_mut(&active_split) {
-                    // The anchor line may carry a re-attached in-history
-                    // head (a tall in-progress line, fresh#2649): the grid
-                    // view starts `prepended.rows` visual rows into it so
-                    // row 0 on screen is the live grid's row 0, with the
-                    // head reachable by scrolling up. The cursor lands on
-                    // the first visible cell (`prepended.bytes` past the
-                    // line start), not on the line start hidden above.
+            let anchor_byte = (history_end_byte as usize).min(total_bytes);
+            if let Some((_, view_states)) = self.buffers.splits_mut() {
+                for view_state in view_states.values_mut() {
+                    let Some(buffer_state) = view_state.buffer_state_mut(buffer_id) else {
+                        continue;
+                    };
+                    // The anchor line may carry a re-attached in-history head
+                    // (a tall in-progress line, fresh#2649): the grid view
+                    // starts `prepended.rows` visual rows into it so row 0 on
+                    // screen is the live grid's row 0.
                     let cursor_byte = anchor_byte.saturating_add(prepended.bytes).min(total_bytes);
-                    view_state.cursors.primary_mut().position = cursor_byte;
-                    view_state.viewport.set_top_byte(anchor_byte);
-                    view_state.viewport.set_top_view_line_offset(prepended.rows);
-                    view_state.viewport.left_column = 0;
+                    buffer_state.cursors.primary_mut().position = cursor_byte;
+                    buffer_state.viewport.set_top_byte(anchor_byte);
+                    buffer_state
+                        .viewport
+                        .set_top_view_line_offset(prepended.rows);
+                    buffer_state.viewport.left_column = 0;
                 }
             }
         }
@@ -2480,21 +3769,10 @@ impl Window {
         // single missed spot leaks a gutter pop-in on exit — pinning
         // them on this path covers any terminal regardless of how its
         // view state was created.
-        if let Some((mgr, view_states)) = self.buffers.splits_mut() {
-            let active_split = mgr.active_split();
-            // The active split's view state may not yet have a keyed
-            // entry for the terminal buffer (e.g. user just pressed
-            // Alt+] into a split that has the terminal as a tab but
-            // never displayed it before). ensure_buffer_state will
-            // create one with defaults (show_line_numbers=true) the
-            // very first time — so we have to *immediately* override
-            // those defaults here, otherwise the next render flashes
-            // a gutter for restored terminals.
-            //
-            // Also force the gutter / current-line-highlight off on
-            // every other split that has this terminal as a tab. A
-            // single missed BufferViewState (e.g. created lazily by
-            // workspace restore + Alt+]) leaks a gutter pop-in.
+        if let Some((_, view_states)) = self.buffers.splits_mut() {
+            // Update only the terminal's keyed state in splits that own it.
+            // Never mutate the active state through `DerefMut`: a background
+            // terminal can exit while this split is displaying a file.
             for vs in view_states.values_mut() {
                 if vs.has_buffer(buffer_id) {
                     let buf_state = vs.ensure_buffer_state(buffer_id);
@@ -2514,24 +3792,133 @@ impl Window {
                     buf_state.viewport.line_wrap_enabled = true;
                     buf_state.viewport.grid_wrap = true;
                     buf_state.viewport.wrap_indent = false;
-                    if let Some(cols) = grid_cols {
-                        buf_state.viewport.wrap_column = Some(cols);
-                    }
+                    buf_state.viewport.wrap_column = Some(grid_cols);
+                    buf_state.viewport.set_skip_ensure_visible();
                 }
-            }
-            if let Some(view_state) = view_states.get_mut(&active_split) {
-                view_state.viewport.line_wrap_enabled = true;
-                view_state.viewport.grid_wrap = true;
-                view_state.viewport.wrap_indent = false;
-                if let Some(cols) = grid_cols {
-                    view_state.viewport.wrap_column = Some(cols);
-                }
-                view_state.viewport.set_skip_ensure_visible();
-                let buf_state = view_state.ensure_buffer_state(buffer_id);
-                buf_state.show_line_numbers = false;
-                buf_state.highlight_current_line = false;
             }
         }
+        Ok(TerminalCheckpointFence {
+            history_len: durable_history_end,
+            log_len,
+        })
+    }
+
+    /// Convert one exited PTY into its final read-only backing buffer without
+    /// consulting editor focus. The caller owns cross-window status reporting
+    /// and closes the terminal handle after this snapshots restart metadata.
+    pub(crate) fn finalize_terminal_exit_buffer(
+        &mut self,
+        terminal_id: TerminalId,
+        exit_code: Option<i32>,
+        preserve_for_reconnect: bool,
+    ) -> Option<BufferId> {
+        let buffer_id = self.terminal_buffers.iter().find_map(|(buffer, binding)| {
+            (binding.terminal_id == terminal_id).then_some(*buffer)
+        })?;
+
+        if !preserve_for_reconnect {
+            let dead_splits: Vec<LeafId> = self
+                .buffers
+                .splits()
+                .map(|(_, view_states)| {
+                    view_states
+                        .iter()
+                        .filter_map(|(leaf, state)| {
+                            (state.active_buffer == buffer_id).then_some(*leaf)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for leaf in dead_splits {
+                self.set_split_terminal_scrollback(leaf, buffer_id, true);
+            }
+        }
+
+        if self.active_buffer() == buffer_id
+            && self.key_context == crate::input::keybindings::KeyContext::Terminal
+        {
+            self.key_context = crate::input::keybindings::KeyContext::Normal;
+        }
+
+        // Preserve the final screen exactly. Exit is reported on the tab and
+        // status bar instead of appending a line that would displace output.
+        self.sync_terminal_to_buffer(buffer_id);
+        let final_checkpoint = if preserve_for_reconnect {
+            None
+        } else {
+            match self.publish_terminal_checkpoint(terminal_id) {
+                Ok(publication) => Some(publication),
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to publish final checkpoint for exited terminal {:?}: {error}",
+                        terminal_id
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            state.editing_disabled = true;
+            state.margins.configure_for_line_numbers(false);
+            state.buffer.set_modified(false);
+        }
+
+        if !preserve_for_reconnect {
+            let (cols, rows, cwd) = match self.terminal_manager.get(terminal_id) {
+                Some(handle) => {
+                    let (cols, rows) = handle.size();
+                    (cols, rows, handle.cwd())
+                }
+                None => {
+                    let (cols, rows) = self.get_terminal_dimensions();
+                    (cols, rows, None)
+                }
+            };
+            let mut record = ExitedTerminal {
+                terminal_id,
+                exit_code,
+                cols,
+                rows,
+                cwd,
+                backing_path: final_checkpoint
+                    .as_ref()
+                    .map(|publication| publication.checkpoint_path.clone())
+                    .or_else(|| self.terminal_backing_files.get(&terminal_id).cloned()),
+                history_path: self.terminal_history_files.get(&terminal_id).cloned(),
+                backing_history_end: final_checkpoint
+                    .as_ref()
+                    .map(|publication| publication.history_end),
+                checkpoint_generation: final_checkpoint
+                    .as_ref()
+                    .map(|publication| publication.generation.clone()),
+                log_path: self.terminal_log_files.get(&terminal_id).cloned(),
+                pending_history_migration: None,
+                command: self.terminal_commands.get(&terminal_id).cloned(),
+                resume: self
+                    .terminal_resume_commands
+                    .get(&terminal_id)
+                    .filter(|argv| !argv.is_empty())
+                    .cloned(),
+                ephemeral: self.ephemeral_terminals.contains(&terminal_id),
+                script_access: self.terminal_has_script_access(terminal_id),
+                companion: self.terminal_companions.get(&terminal_id).copied(),
+                title: None,
+            };
+
+            self.terminal_buffers.remove(&buffer_id);
+            record.title = self
+                .terminal_explicit_titles
+                .contains(&buffer_id)
+                .then(|| self.buffer_metadata.get(&buffer_id))
+                .flatten()
+                .map(|meta| meta.display_name.clone());
+            if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+                meta.display_name = t!("terminal.tab_exited", name = meta.display_name).to_string();
+            }
+            self.exited_terminals.insert(buffer_id, record);
+        }
+
+        Some(buffer_id)
     }
 
     /// Render terminal content for terminal buffers in this window's
@@ -2713,6 +4100,599 @@ impl Editor {
     // without going through the active-window state.
 }
 
+#[cfg(test)]
+mod omp_companion_activation_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    fn companion_command() -> DirectOmpCommand {
+        parse_direct_omp_argv(
+            &argv(&["/opt/omp", "launch", "--", "inspect this workspace"]),
+            false,
+        )
+        .expect("canonical direct OMP command")
+    }
+
+    #[test]
+    fn direct_omp_requires_resolved_canonical_launch_or_resume_grammar() {
+        const SESSION: &str = "123e4567-e89b-42d3-a456-426614174099";
+        let launch = parse_direct_omp_argv(
+            &argv(&[
+                "/usr/local/bin/omp",
+                "launch",
+                "--profile",
+                "work",
+                "--session-dir=/tmp/sessions",
+                "--model=opus",
+                "--approval-mode",
+                "always-ask",
+                "--no-tools",
+                "--trusted-extension",
+                "/tmp/omp-trusted.ts",
+                "--",
+                "--flag-shaped prompt",
+                "second prompt word",
+            ]),
+            false,
+        )
+        .expect("canonical launch");
+        assert_eq!(launch.executable, "/usr/local/bin/omp");
+        assert_eq!(launch.invocation, DirectOmpInvocation::Launch);
+        assert_eq!(
+            launch.resume_prefix,
+            argv(&[
+                "--profile",
+                "work",
+                "--session-dir=/tmp/sessions",
+                "--model=opus",
+                "--approval-mode",
+                "always-ask",
+                "--no-tools",
+                "--trusted-extension",
+                "/tmp/omp-trusted.ts",
+            ])
+        );
+
+        let exact_resume = parse_direct_omp_argv(
+            &argv(&[
+                "/usr/local/bin/omp",
+                "--profile=work",
+                "--session-dir",
+                "/tmp/sessions",
+                OMP_COMPANION_ARG,
+                "--resume",
+                SESSION,
+            ]),
+            false,
+        )
+        .expect("exact resume");
+        assert_eq!(exact_resume.invocation, DirectOmpInvocation::ExactResume);
+        assert_eq!(
+            exact_resume.resume_prefix,
+            argv(&["--profile=work", "--session-dir", "/tmp/sessions"])
+        );
+
+        for selector in ["--continue", "-c"] {
+            let provisional =
+                parse_direct_omp_argv(&argv(&["/opt/omp", "--profile=work", selector]), false)
+                    .expect("provisional continuation");
+            assert_eq!(provisional.invocation, DirectOmpInvocation::Continue);
+            assert_eq!(provisional.resume_prefix, argv(&["--profile=work"]));
+
+            let exact = parse_direct_omp_argv(
+                &argv(&["/opt/omp", "--profile=work", selector, SESSION]),
+                false,
+            )
+            .expect("continuation alias with exact UUID");
+            assert_eq!(exact.invocation, DirectOmpInvocation::ExactResume);
+            assert_eq!(exact.resume_prefix, argv(&["--profile=work"]));
+        }
+
+        assert!(parse_direct_omp_argv(&argv(&["/opt/omp", "launch"]), false).is_some());
+        assert!(parse_direct_omp_argv(&argv(&["/opt/omp", "launch", "--"]), false).is_none());
+        assert!(parse_direct_omp_argv(&argv(&["omp", "launch", "--", "prompt"]), false).is_none());
+        assert!(parse_direct_omp_argv(&argv(&["/opt/omp", "prompt"]), false).is_none());
+        assert!(parse_direct_omp_argv(
+            &argv(&["/opt/omp", "launch", "--no-session=true", "--", "prompt"]),
+            false,
+        )
+        .is_none());
+        assert!(parse_direct_omp_argv(
+            &argv(&[
+                "/opt/omp",
+                "--profile",
+                "work",
+                "--profile=other",
+                "--continue"
+            ]),
+            false,
+        )
+        .is_none());
+        assert!(
+            parse_direct_omp_argv(&argv(&["/opt/omp", "--session-dir=", "--continue"]), false,)
+                .is_none()
+        );
+        assert!(
+            parse_direct_omp_argv(&argv(&["/opt/omp", "--fork", "--continue"]), false).is_none()
+        );
+        assert!(parse_direct_omp_argv(
+            &argv(&[r"C:\\Tools\\OMP.EXE", "launch", "--", "prompt"]),
+            true,
+        )
+        .is_some());
+        assert!(parse_direct_omp_argv(
+            &argv(&[r"C:\\Tools\\omp.cmd", "launch", "--", "prompt"]),
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reserved_keys_follow_platform_case_rules() {
+        assert!(is_reserved_omp_companion_key(OMP_COMPANION_ENV, false));
+        assert!(!is_reserved_omp_companion_key("fresh_omp_companion", false));
+        assert!(is_reserved_omp_companion_key("fresh_omp_companion", true));
+        assert!(is_reserved_omp_companion_key(
+            "Fresh_Omp_Companion_Endpoint",
+            true,
+        ));
+        assert!(is_reserved_omp_companion_key(
+            "Fresh_Omp_Companion_Token",
+            true,
+        ));
+    }
+
+    #[test]
+    fn effective_multiplexer_environment_uses_final_precedence() {
+        let inherited = vec![("TMUX".to_string(), "inherited".to_string())];
+        let mut delta = crate::services::env_provider::EnvDelta {
+            set: Vec::new(),
+            unset: vec!["TMUX".to_string()],
+        };
+        let mut plugin = HashMap::new();
+        assert!(!effective_env_non_empty(
+            "TMUX", &inherited, &delta, &plugin, false,
+        ));
+        plugin.insert("TMUX".to_string(), String::new());
+        assert!(!effective_env_non_empty(
+            "TMUX", &inherited, &delta, &plugin, false,
+        ));
+
+        plugin.insert("TMUX".to_string(), "plugin".to_string());
+        assert!(effective_env_non_empty(
+            "TMUX", &inherited, &delta, &plugin, false,
+        ));
+
+        delta.unset.clear();
+        delta.set.push(("sty".to_string(), "nested".to_string()));
+        assert!(effective_env_non_empty(
+            "STY",
+            &[],
+            &delta,
+            &HashMap::new(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn reserved_inherited_and_delta_values_are_removed_before_injection() {
+        let inherited = vec![(OMP_COMPANION_ENV.to_string(), "stale".to_string())];
+        let mut delta = crate::services::env_provider::EnvDelta {
+            set: vec![(OMP_COMPANION_ENDPOINT_ENV.to_string(), "stale".to_string())],
+            unset: Vec::new(),
+        };
+        remove_reserved_omp_companion_env(&inherited, &mut delta, false);
+        assert!(delta.set.is_empty());
+        assert!(delta.unset.iter().any(|key| key == OMP_COMPANION_ENV));
+        assert!(delta
+            .unset
+            .iter()
+            .any(|key| key == OMP_COMPANION_ENDPOINT_ENV));
+
+        let inherited = vec![("fresh_omp_companion".to_string(), "stale".to_string())];
+        let mut delta = crate::services::env_provider::EnvDelta {
+            set: vec![(
+                "Fresh_Omp_Companion_Endpoint".to_string(),
+                "stale".to_string(),
+            )],
+            unset: Vec::new(),
+        };
+        remove_reserved_omp_companion_env(&inherited, &mut delta, true);
+        assert!(delta.set.is_empty());
+        assert!(delta.unset.iter().any(|key| key == "fresh_omp_companion"));
+        assert!(delta
+            .unset
+            .iter()
+            .any(|key| key == "Fresh_Omp_Companion_Endpoint"));
+    }
+
+    #[test]
+    fn generated_capability_tokens_are_canonical_and_fresh() {
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        getrandom::fill(&mut first).expect("secure random capability");
+        getrandom::fill(&mut second).expect("secure random capability");
+        assert_ne!(first, second);
+
+        for secret in [first, second] {
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&secret);
+            assert_eq!(token.len(), 43);
+            assert!(token
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' }));
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&token)
+                .expect("canonical base64url");
+            assert_eq!(decoded, secret);
+            assert_eq!(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded),
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn companion_eligibility_rejects_caller_selected_omp_binaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = if cfg!(windows) { "omp.exe" } else { "omp" };
+        let trusted_dir = temp.path().join("trusted");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&trusted_dir).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let trusted = trusted_dir.join(binary);
+        let fake = workspace_dir.join(binary);
+        std::fs::write(&trusted, b"trusted").unwrap();
+        std::fs::write(&fake, b"fake").unwrap();
+
+        assert!(admit_trusted_omp_executable("omp", &trusted, cfg!(windows)).is_some());
+        assert!(
+            admit_trusted_omp_executable(&trusted.to_string_lossy(), &trusted, cfg!(windows),)
+                .is_some()
+        );
+        assert!(
+            admit_trusted_omp_executable(&fake.to_string_lossy(), &trusted, cfg!(windows),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn companion_flag_is_scoped_and_deduplicated_before_argument_delimiter() {
+        let mut args = argv(&["launch", "--", OMP_COMPANION_ARG, "prompt"]);
+        insert_omp_companion_arg(&mut args);
+        assert_eq!(
+            args,
+            argv(&[
+                "launch",
+                OMP_COMPANION_ARG,
+                "--",
+                OMP_COMPANION_ARG,
+                "prompt",
+            ])
+        );
+        insert_omp_companion_arg(&mut args);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == OMP_COMPANION_ARG)
+                .count(),
+            2,
+            "one option-prefix flag and one prompt token must remain",
+        );
+        args.insert(0, OMP_COMPANION_ARG.to_string());
+        remove_omp_companion_arg(&mut args);
+        assert_eq!(
+            args,
+            argv(&["launch", "--", OMP_COMPANION_ARG, "prompt"]),
+            "all option-prefix copies are host-owned; prompt tokens are ordinary payload",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_probe_requires_hidden_flag_support() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let supported = temp.path().join("supported-omp");
+        let unsupported = temp.path().join("unsupported-omp");
+        std::fs::write(
+            &supported,
+            "#!/bin/sh\n[ \"$1\" = \"--fresh-omp-companion\" ] && [ \"$2\" = \"--version\" ]\n",
+        )
+        .unwrap();
+        std::fs::write(&unsupported, "#!/bin/sh\nexit 64\n").unwrap();
+        std::fs::set_permissions(&supported, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&unsupported, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(omp_companion_executable_supported(
+            supported.to_str().unwrap()
+        ));
+        assert!(!omp_companion_executable_supported(
+            unsupported.to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn exact_omp_resume_ignores_generic_resume_preference() {
+        let resume = argv(&["omp", "--resume", "123e4567-e89b-42d3-a456-426614174099"]);
+        let relaunch = argv(&["omp"]);
+        assert_eq!(
+            select_restorable_terminal_argv(
+                Some(fresh_core::api::TerminalCompanion::Omp),
+                Some(&resume),
+                Some(&relaunch),
+                false,
+            ),
+            Some(resume.as_slice())
+        );
+    }
+
+    #[test]
+    fn provisional_omp_continue_falls_back_to_clean_relaunch_after_restart() {
+        let provisional = argv(&["omp", "--profile", "work", "--continue"]);
+        let relaunch = argv(&["omp", "launch", "--profile", "work", "--", "prompt"]);
+        assert_eq!(
+            select_restorable_terminal_argv(
+                Some(fresh_core::api::TerminalCompanion::Omp),
+                Some(&provisional),
+                Some(&relaunch),
+                true,
+            ),
+            Some(relaunch.as_slice())
+        );
+    }
+
+    #[test]
+    fn ordinary_agent_obeys_resume_preference_and_keeps_shell_marker() {
+        let resume = argv(&["agent", "--resume", "session"]);
+        let relaunch = argv(&["agent"]);
+        assert_eq!(
+            select_restorable_terminal_argv(None, Some(&resume), Some(&relaunch), false),
+            Some(relaunch.as_slice())
+        );
+        assert_eq!(
+            select_restorable_terminal_argv(None, Some(&resume), Some(&relaunch), true),
+            Some(resume.as_slice())
+        );
+        assert_eq!(
+            select_restorable_terminal_argv(None, None, Some(&[]), false),
+            None
+        );
+    }
+
+    fn serialized_terminal(
+        companion: Option<fresh_core::api::TerminalCompanion>,
+    ) -> crate::workspace::SerializedTerminalWorkspace {
+        crate::workspace::SerializedTerminalWorkspace {
+            terminal_index: 0,
+            cwd: None,
+            shell: "sh".to_string(),
+            cols: 80,
+            rows: 24,
+            log_path: "terminal.log".into(),
+            backing_path: "terminal.txt".into(),
+            history_path: Some("terminal.history.txt".into()),
+            backing_history_end: None,
+            checkpoint_generation: None,
+            command: Some(argv(&["/opt/omp", "launch", "--", "prompt"])),
+            agent_resume: Some(crate::workspace::AgentResume {
+                argv: argv(&[
+                    "/opt/omp",
+                    "--resume",
+                    "123e4567-e89b-42d3-a456-426614174099",
+                ]),
+            }),
+            exited: None,
+            title: None,
+            script_access: false,
+            companion,
+        }
+    }
+
+    fn serialized_round_trip_after_preparation(
+        saved: crate::workspace::SerializedTerminalWorkspace,
+        preparation: &OmpCompanionPreparation,
+    ) -> crate::workspace::SerializedTerminalWorkspace {
+        let serialized = serde_json::to_vec(&saved).expect("workspace terminal serializes");
+        let mut restored: crate::workspace::SerializedTerminalWorkspace =
+            serde_json::from_slice(&serialized).expect("workspace terminal restores");
+        restored.companion = preparation
+            .preserves_marker()
+            .then_some(restored.companion)
+            .flatten();
+        let serialized = serde_json::to_vec(&restored).expect("resaved workspace serializes");
+        serde_json::from_slice(&serialized).expect("resaved workspace restores")
+    }
+
+    fn serialized_terminal_after_initial_spawn(
+        preparation: &OmpCompanionPreparation,
+        preexisting_marker: bool,
+    ) -> crate::workspace::SerializedTerminalWorkspace {
+        let terminal_id = TerminalId(73);
+        let mut terminal_companions = HashMap::new();
+        if preexisting_marker {
+            terminal_companions.insert(terminal_id, fresh_core::api::TerminalCompanion::Omp);
+        }
+        persist_initial_companion_marker(
+            &mut terminal_companions,
+            terminal_id,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            preparation.preserves_marker(),
+        );
+
+        let saved = serialized_terminal(terminal_companions.get(&terminal_id).copied());
+        let serialized = serde_json::to_vec(&saved).expect("workspace terminal serializes");
+        serde_json::from_slice(&serialized).expect("workspace terminal restores")
+    }
+
+    #[test]
+    fn initial_companion_spawn_fault_injection_commits_marker_disposition_to_workspace() {
+        let mut active_env = HashMap::new();
+        let active = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            companion_command(),
+            &mut active_env,
+            |secret| {
+                *secret = [7; 32];
+                Ok::<(), ()>(())
+            },
+        ));
+        assert_eq!(
+            serialized_terminal_after_initial_spawn(&active, false).companion,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            "an active initial companion persists its workspace marker",
+        );
+
+        let unsupported = OmpCompanionPreparation::Unsupported;
+        assert_eq!(
+            serialized_terminal_after_initial_spawn(&unsupported, false).companion,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            "an unsupported initial companion retains its descriptive marker without a live handle",
+        );
+
+        // Fault-inject a failed entropy source: the PTY remains ordinary and
+        // its stale marker is cleared before the next workspace capture.
+        let mut entropy_env = HashMap::new();
+        let entropy_unavailable = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            companion_command(),
+            &mut entropy_env,
+            |_| Err::<(), ()>(()),
+        ));
+        assert_eq!(
+            serialized_terminal_after_initial_spawn(&entropy_unavailable, true).companion,
+            None,
+            "an entropy-unavailable initial companion must serialize as an ordinary terminal",
+        );
+        assert!(entropy_env.is_empty());
+    }
+
+    #[test]
+    fn unsupported_restore_and_reconnect_preserve_marker_and_exact_resume_across_saves() {
+        let initial = serialized_terminal(Some(fresh_core::api::TerminalCompanion::Omp));
+        let after_restore =
+            serialized_round_trip_after_preparation(initial, &OmpCompanionPreparation::Unsupported);
+        let after_reconnect = serialized_round_trip_after_preparation(
+            after_restore,
+            &OmpCompanionPreparation::Unsupported,
+        );
+        assert_eq!(
+            after_reconnect.companion,
+            Some(fresh_core::api::TerminalCompanion::Omp),
+            "a temporary multiplexer or wrapper fallback must retain the descriptive marker",
+        );
+        assert_eq!(
+            after_reconnect
+                .agent_resume
+                .as_ref()
+                .expect("resume persists")
+                .argv,
+            argv(&[
+                "/opt/omp",
+                "--resume",
+                "123e4567-e89b-42d3-a456-426614174099",
+            ]),
+            "the retained marker keeps exact OMP resume ahead of the generic resume preference",
+        );
+
+        let direct_omp = argv(&[
+            "/opt/omp",
+            "--resume",
+            "123e4567-e89b-42d3-a456-426614174099",
+        ]);
+        assert!(
+            !omp_companion_supported(true, true, Some(&direct_omp), false),
+            "TMUX/STY fallback must be explicitly Unsupported, not entropy failure"
+        );
+        assert!(
+            !omp_companion_supported(false, false, Some(&direct_omp), false),
+            "wrapper/remote fallback must be explicitly Unsupported"
+        );
+
+        let mut extra_env = HashMap::new();
+        let active = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            companion_command(),
+            &mut extra_env,
+            |secret| {
+                *secret = [7; 32];
+                Ok::<(), ()>(())
+            },
+        ));
+        let after_supported = serialized_round_trip_after_preparation(after_reconnect, &active);
+        assert_eq!(
+            after_supported.companion,
+            Some(fresh_core::api::TerminalCompanion::Omp)
+        );
+        assert!(active.into_spawn().is_some());
+        assert!(
+            extra_env.contains_key(OMP_COMPANION_ENDPOINT_ENV),
+            "the next supported restore reactivates the one-shot capability channel"
+        );
+    }
+
+    fn assert_entropy_failure_falls_back_to_ordinary_terminal() {
+        let mut extra_env = HashMap::new();
+        let preparation = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            companion_command(),
+            &mut extra_env,
+            |_| Err::<(), ()>(()),
+        ));
+
+        assert!(!preparation.preserves_marker());
+        assert!(preparation.into_spawn().is_none());
+        assert!(extra_env.is_empty());
+    }
+
+    #[test]
+    fn create_companion_entropy_failure_falls_back_to_an_ordinary_terminal() {
+        assert_entropy_failure_falls_back_to_ordinary_terminal();
+    }
+
+    #[test]
+    fn restore_companion_entropy_failure_falls_back_to_an_ordinary_terminal() {
+        assert_entropy_failure_falls_back_to_ordinary_terminal();
+    }
+
+    #[test]
+    fn reconnect_companion_entropy_failure_falls_back_to_an_ordinary_terminal() {
+        assert_entropy_failure_falls_back_to_ordinary_terminal();
+    }
+
+    #[test]
+    fn entropy_failure_removes_marker_from_the_next_serialized_workspace() {
+        let mut extra_env = HashMap::new();
+        let entropy_unavailable = preparation_after_mint(mint_omp_companion_spawn(
+            fresh_core::api::TerminalCompanion::Omp,
+            companion_command(),
+            &mut extra_env,
+            |_| Err::<(), ()>(()),
+        ));
+        let after_restore = serialized_round_trip_after_preparation(
+            serialized_terminal(Some(fresh_core::api::TerminalCompanion::Omp)),
+            &entropy_unavailable,
+        );
+
+        assert!(after_restore.companion.is_none());
+        assert!(extra_env.is_empty());
+    }
+
+    #[test]
+    fn reserved_companion_environment_is_a_hard_error() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert(OMP_COMPANION_TOKEN_ENV.to_string(), "untrusted".to_string());
+
+        assert_eq!(
+            reject_reserved_omp_companion_env(&extra_env, false),
+            Err("reserved OMP companion environment key".to_string())
+        );
+    }
+}
+
 /// Terminal rendering utilities
 pub mod render {
     use crate::services::terminal::TerminalCell;
@@ -2794,7 +4774,20 @@ pub mod render {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
 
-                buf.set_string(x, y, cell.c.to_string(), style);
+                let rendered = &mut buf[(x, y)];
+                rendered.set_style(style);
+                if cell.wide_spacer {
+                    rendered.set_symbol("");
+                } else if cell.zerowidth.is_empty() {
+                    rendered.set_char(cell.c);
+                } else {
+                    let mut symbol = String::with_capacity(
+                        cell.c.len_utf8()
+                            + cell.zerowidth.iter().map(|ch| ch.len_utf8()).sum::<usize>(),
+                    );
+                    cell.append_text_to(&mut symbol);
+                    rendered.set_symbol(&symbol);
+                }
             }
         }
     }
@@ -2875,6 +4868,42 @@ pub mod render {
                     "cell col {x} underline = {underlined}, expected {expected}",
                 );
             }
+        }
+
+        #[test]
+        fn grapheme_content_renders_once_and_wide_spacer_stays_empty() {
+            let area = Rect::new(0, 0, 3, 1);
+            let mut buf = Buffer::empty(area);
+            let content = vec![vec![
+                TerminalCell {
+                    c: 'e',
+                    zerowidth: vec!['\u{301}'],
+                    ..Default::default()
+                },
+                TerminalCell {
+                    c: '界',
+                    ..Default::default()
+                },
+                TerminalCell {
+                    wide_spacer: true,
+                    ..Default::default()
+                },
+            ]];
+
+            render_terminal_content(
+                &content,
+                (0, 0),
+                false,
+                area,
+                &mut buf,
+                Color::White,
+                Color::Black,
+                None,
+            );
+
+            assert_eq!(buf[(0, 0)].symbol(), "e\u{301}");
+            assert_eq!(buf[(1, 0)].symbol(), "界");
+            assert_eq!(buf[(2, 0)].symbol(), "");
         }
     }
 }
@@ -3078,5 +5107,62 @@ mod mouse_encoding_tests {
         assert_eq!(cb(TerminalMouseEventKind::ScrollDown), 65 + 32);
         assert_eq!(cb(TerminalMouseEventKind::ScrollLeft), 66 + 32);
         assert_eq!(cb(TerminalMouseEventKind::ScrollRight), 67 + 32);
+    }
+}
+
+#[cfg(test)]
+mod agent_command_env_tests {
+    use super::*;
+
+    #[test]
+    fn caller_cannot_supply_host_capability_environment() {
+        for key in ["FRESH_CMD_TOKEN", "FRESH_SESSION"] {
+            let mut env = HashMap::new();
+            env.insert(key.to_string(), "attacker-controlled".to_string());
+            let error = match agent_command_env(fresh_core::WindowId(7), Some(env), false) {
+                Err(error) => error,
+                Ok(_) => panic!("host-reserved capability keys must be rejected"),
+            };
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn reserved_environment_matching_follows_platform_rules() {
+        assert!(env_key_matches("fresh_cmd_token", "FRESH_CMD_TOKEN", true));
+        assert!(!env_key_matches(
+            "fresh_cmd_token",
+            "FRESH_CMD_TOKEN",
+            false
+        ));
+    }
+
+    #[test]
+    fn ordinary_environment_does_not_create_script_authority() {
+        let mut env = HashMap::new();
+        env.insert("AGENT_MODE".to_string(), "review".to_string());
+        let result = agent_command_env(fresh_core::WindowId(7), Some(env), false).unwrap();
+        assert_eq!(
+            result.vars.get("AGENT_MODE").map(String::as_str),
+            Some("review")
+        );
+        assert!(result.script_token.is_none());
+        assert!(!result.vars.contains_key("FRESH_CMD_TOKEN"));
+        assert!(!result.vars.contains_key("FRESH_SESSION"));
+    }
+
+    #[test]
+    fn agent_environment_revoke_invalidates_its_minted_grant() {
+        let token = crate::server::command_access::mint(crate::server::command_access::Grant::new(
+            Some(7),
+            true,
+        ));
+        let env = AgentCommandEnv {
+            vars: HashMap::new(),
+            script_token: Some(token.clone()),
+        };
+        assert!(crate::server::command_access::lookup(&token).is_some());
+        env.revoke();
+        assert!(crate::server::command_access::lookup(&token).is_none());
     }
 }

@@ -34,7 +34,7 @@ use fresh::model::filesystem::{
 use portable_pty::{native_pty_system, PtySize};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 fn pty_available() -> bool {
@@ -58,6 +58,7 @@ struct ToggleRemoteFs {
     inner: StdFileSystem,
     connected: Arc<AtomicBool>,
     channel_id: u64,
+    generation: Arc<AtomicU64>,
 }
 
 impl FileSystem for ToggleRemoteFs {
@@ -164,6 +165,9 @@ impl FileSystem for ToggleRemoteFs {
     fn remote_channel_id(&self) -> Option<u64> {
         Some(self.channel_id)
     }
+    fn remote_reconnect_generation(&self) -> Option<u64> {
+        Some(self.generation.load(Ordering::SeqCst))
+    }
 }
 
 /// A silent agent-channel reconnect (background transport hot-swap) must revive
@@ -180,10 +184,12 @@ fn auto_reconnect_respawns_a_dead_remote_terminal() {
     const CHANNEL_ID: u64 = 4242;
     let temp = tempfile::tempdir().unwrap();
     let connected = Arc::new(AtomicBool::new(true));
+    let generation = Arc::new(AtomicU64::new(0));
     let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(ToggleRemoteFs {
         inner: StdFileSystem,
         connected: connected.clone(),
         channel_id: CHANNEL_ID,
+        generation: generation.clone(),
     });
     let mut harness = EditorTestHarness::create(
         120,
@@ -276,6 +282,87 @@ fn auto_reconnect_respawns_a_dead_remote_terminal() {
     );
 }
 
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn old_terminal_exit_before_reconnect_event_preserves_binding_by_published_generation() {
+    if !pty_available() {
+        eprintln!("Skipping inverse reconnect-order terminal test: PTY not available");
+        return;
+    }
+
+    const CHANNEL_ID: u64 = 4243;
+    let temp = tempfile::tempdir().unwrap();
+    let connected = Arc::new(AtomicBool::new(true));
+    let generation = Arc::new(AtomicU64::new(0));
+    let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(ToggleRemoteFs {
+        inner: StdFileSystem,
+        connected: connected.clone(),
+        channel_id: CHANNEL_ID,
+        generation: generation.clone(),
+    });
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_working_dir(temp.path().to_path_buf())
+            .with_filesystem(fs),
+    )
+    .unwrap();
+    let (old_id, buffer_id) = harness
+        .editor_mut()
+        .active_window_mut()
+        .open_terminal_in_window()
+        .expect("terminal should spawn");
+
+    connected.store(false, Ordering::SeqCst);
+    assert!(harness
+        .editor_mut()
+        .active_window_mut()
+        .terminal_manager
+        .close(old_id));
+
+    // The channel publishes the generation before its replacement reader may
+    // mark connected. Deliver the old PTY exit in that inverse window, before
+    // the forwarder's RemoteReconnected event reaches the editor.
+    generation.store(1, Ordering::SeqCst);
+    connected.store(true, Ordering::SeqCst);
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .get_status_message()
+                .is_some_and(|status| status.contains("Terminal 0 exited"))
+        })
+        .expect("the concrete terminal exit should drain and preserve the binding");
+
+    assert_eq!(
+        harness.editor().active_window().get_terminal_id(buffer_id),
+        Some(old_id),
+        "published reconnect generation preserves the old binding until its event"
+    );
+    assert!(harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .get(old_id)
+        .is_none());
+
+    harness
+        .editor_mut()
+        .test_dispatch_remote_reconnected(CHANNEL_ID);
+    let new_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .expect("reconnect event should respawn the preserved binding");
+    assert_ne!(new_id, old_id);
+    assert!(harness
+        .editor()
+        .active_window()
+        .terminal_manager
+        .get(new_id)
+        .is_some_and(|handle| handle.is_alive()));
+}
+
 /// When the focused buffer is a terminal that was in terminal (input) mode at
 /// the moment the carrier dropped, an auto-reconnect must bring it back live —
 /// reactivating terminal input mode, not stranding it in scrollback/Normal.
@@ -298,10 +385,12 @@ fn auto_reconnect_reactivates_focused_terminal_in_input_mode() {
     const CHANNEL_ID: u64 = 4343;
     let temp = tempfile::tempdir().unwrap();
     let connected = Arc::new(AtomicBool::new(true));
+    let generation = Arc::new(AtomicU64::new(0));
     let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(ToggleRemoteFs {
         inner: StdFileSystem,
         connected: connected.clone(),
         channel_id: CHANNEL_ID,
+        generation,
     });
     let mut harness = EditorTestHarness::create(
         120,
@@ -355,4 +444,68 @@ fn auto_reconnect_reactivates_focused_terminal_in_input_mode() {
         KeyContext::Terminal,
         "reconnect must restore the Terminal key context so keystrokes reach the PTY"
     );
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn reconnect_before_old_reader_drain_respawns_after_concrete_exit() {
+    if !pty_available() {
+        eprintln!("Skipping auto-reconnect terminal test: PTY not available");
+        return;
+    }
+
+    const CHANNEL_ID: u64 = 4444;
+    let temp = tempfile::tempdir().unwrap();
+    let connected = Arc::new(AtomicBool::new(true));
+    let generation = Arc::new(AtomicU64::new(0));
+    let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(ToggleRemoteFs {
+        inner: StdFileSystem,
+        connected,
+        channel_id: CHANNEL_ID,
+        generation,
+    });
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_working_dir(temp.path().to_path_buf())
+            .with_filesystem(fs),
+    )
+    .unwrap();
+    let (old_id, buffer_id) = harness
+        .editor_mut()
+        .active_window_mut()
+        .open_terminal_in_window()
+        .expect("terminal should spawn");
+
+    // The reconnect arrives first. The old reader is still alive, so the
+    // immediate respawn sweep must defer rather than consume the only event.
+    harness
+        .editor_mut()
+        .test_dispatch_remote_reconnected(CHANNEL_ID);
+    assert_eq!(
+        harness.editor().active_window().get_terminal_id(buffer_id),
+        Some(old_id)
+    );
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .terminal_manager
+        .close(old_id);
+
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .active_window()
+                .get_terminal_id(buffer_id)
+                .is_some_and(|id| {
+                    id != old_id
+                        && h.editor()
+                            .active_window()
+                            .terminal_manager
+                            .get(id)
+                            .is_some_and(|handle| handle.is_alive())
+                })
+        })
+        .expect("deferred reconnect should respawn after the old exit barrier");
 }

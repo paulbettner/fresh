@@ -49,10 +49,7 @@ use crate::hooks::{HookCallback, HookRegistry};
 use crate::menu::{Menu, MenuItem};
 use crate::overlay::{OverlayHandle, OverlayNamespace};
 use crate::text_property::{TextProperty, TextPropertyEntry};
-use crate::BufferId;
-use crate::SplitId;
-use crate::TerminalId;
-use crate::WindowId;
+use crate::{BufferId, SplitId, WindowId, WindowTerminalId};
 use lsp_types;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -136,7 +133,37 @@ impl std::fmt::Display for JsCallbackId {
     }
 }
 
-/// Result of creating a terminal
+/// Exact host-owned workspace persistence file admitted for orchestrator
+/// lifecycle transactions.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct WorkspacePersistenceFile {
+    pub path: String,
+    pub content: String,
+    #[ts(type = "string | null")]
+    pub stable_id: Option<String>,
+}
+
+/// Strict host inventory for one Orchestrator create attempt. Inventory
+/// failures are data, not absence, so callers can refuse destructive rollback.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceCreateAttemptInventory {
+    #[serde(rename_all = "camelCase")]
+    Found {
+        root: String,
+        workspace_id: String,
+    },
+    NotFound,
+    #[serde(rename_all = "camelCase")]
+    Error {
+        message: String,
+    },
+}
+
+/// Result of creating a terminal.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
@@ -144,9 +171,8 @@ pub struct TerminalResult {
     /// The created buffer ID (for use with setSplitBuffer, etc.)
     #[ts(type = "number")]
     pub buffer_id: u64,
-    /// The terminal ID (for use with sendTerminalInput, closeTerminal)
-    #[ts(type = "number")]
-    pub terminal_id: u64,
+    /// Exact immutable identity of the created terminal.
+    pub terminal_id: WindowTerminalId,
     /// The split ID (if created in a new split)
     #[ts(type = "number | null")]
     pub split_id: Option<u64>,
@@ -230,8 +256,14 @@ pub enum PluginResponse {
     TerminalCreated {
         request_id: u64,
         buffer_id: BufferId,
-        terminal_id: TerminalId,
+        terminal_id: WindowTerminalId,
         split_id: Option<SplitId>,
+    },
+    /// Response to CreateWindowWithTerminal. Routed through the response channel
+    /// so runtime ownership is recorded before the JavaScript promise resolves.
+    WindowWithTerminalCreated {
+        request_id: u64,
+        result: SessionWithTerminalResult,
     },
     /// Response to a plugin-initiated LSP request
     LspRequest {
@@ -300,6 +332,7 @@ impl PluginResponse {
         match self {
             Self::VirtualBufferCreated { request_id, .. }
             | Self::TerminalCreated { request_id, .. }
+            | Self::WindowWithTerminalCreated { request_id, .. }
             | Self::LspRequest { request_id, .. }
             | Self::HighlightsComputed { request_id, .. }
             | Self::BufferText { request_id, .. }
@@ -402,6 +435,7 @@ pub struct ActionSpec {
     /// macro — which contains `InsertChar` and other payload actions —
     /// round-trip losslessly through `executeActions`.
     #[serde(default)]
+    #[ts(optional)]
     #[ts(type = "Record<string, unknown>")]
     pub args: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -462,6 +496,16 @@ pub struct WindowInfo {
     #[ts(type = "boolean")]
     #[serde(skip_serializing_if = "is_false_field", default)]
     pub shared_worktree: bool,
+    /// Exact live terminal currently selected as this window's agent.
+    /// Omitted while the durable selection is exited or otherwise unavailable.
+    #[serde(
+        rename = "selectedAgentTerminalId",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    #[ts(rename = "selectedAgentTerminalId")]
+    pub selected_agent_terminal_id: Option<WindowTerminalId>,
+
     /// Remote backend identity when this session's backend is not
     /// host-local (SSH / Kubernetes). Carried for live remote windows
     /// *and* for dormant (not-yet-connected / disconnected) sessions, so
@@ -1585,6 +1629,12 @@ pub struct EditorStateSnapshot {
     #[serde(skip)]
     #[ts(skip)]
     pub last_grammar_gen: u64,
+    /// Monotonic host refresh generation. Invocation-scoped plugin snapshots
+    /// copy this value on entry so teardown can detect and preserve a host
+    /// refresh that raced with JavaScript execution.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub host_revision: u64,
     /// Global editor mode for modal editing (e.g., "vi-normal", "vi-insert")
     /// When set, this mode's keybindings take precedence over normal key handling
     pub editor_mode: Option<String>,
@@ -1711,6 +1761,7 @@ impl EditorStateSnapshot {
             user_config: Arc::new(serde_json::Value::Null),
             available_grammars: Vec::new(),
             last_grammar_gen: 0,
+            host_revision: 0,
             editor_mode: None,
             plugin_view_states: HashMap::new(),
             plugin_view_states_split: 0,
@@ -2943,6 +2994,134 @@ pub struct MarkerActivation {
     pub scope_end: usize,
 }
 
+/// One concrete load of a plugin context. IDs are host-minted and never cross
+/// the JavaScript or serialization boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PluginInstanceId(pub u64);
+
+impl PluginInstanceId {
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Closed host-owned identities for bundled plugins with elevated authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrustedBuiltinPlugin {
+    Orchestrator,
+}
+
+/// Loader provenance for one plugin context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginLoadProvenance {
+    #[default]
+    Internal,
+    External,
+    Bundled,
+    AgentScript {
+        request_id: u64,
+    },
+}
+
+/// Immutable host-owned identity of the authority a window was using when a
+/// plugin invocation was queued. Commands are accepted only while both fields
+/// still match the source window, so an authority replacement or reconnect
+/// publication cannot retarget queued work onto a different tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityStamp {
+    pub id: u64,
+    pub generation: u64,
+}
+
+/// Window state captured when a host event or action enters the plugin runtime.
+/// The runtime carries this value through promise callbacks; it is never
+/// serialized or exposed to JavaScript.
+#[derive(Debug, Clone)]
+pub struct PluginInvocation {
+    pub window_id: WindowId,
+    pub authority: Option<AuthorityStamp>,
+    pub state_snapshot: Option<Arc<RwLock<EditorStateSnapshot>>>,
+}
+
+/// Host-only reason a plugin command may outlive its originating context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginCommandPurpose {
+    #[default]
+    Normal,
+    CompensatingCleanup,
+}
+
+/// Loader-owned context attached atomically to every command emitted by one
+/// concrete plugin instance. None of these fields is represented in JavaScript
+/// or serialized, so plugin code cannot forge provenance, identity, or scope.
+#[derive(Clone, Default)]
+pub struct PluginCommandContext {
+    pub plugin_name: Arc<str>,
+    pub plugin_instance_id: PluginInstanceId,
+    pub provenance: PluginLoadProvenance,
+    pub trusted_builtin: Option<TrustedBuiltinPlugin>,
+    pub purpose: PluginCommandPurpose,
+    /// Immutable source window captured by the loader/API invocation.
+    pub source_window: Option<WindowId>,
+    /// Exact authority incarnation captured with `source_window`.
+    pub source_authority: Option<AuthorityStamp>,
+    pub window_scope: Option<WindowId>,
+    pub state_snapshot: Option<Arc<RwLock<EditorStateSnapshot>>>,
+}
+
+impl PluginCommandContext {
+    pub fn is_agent_script(&self) -> bool {
+        matches!(self.provenance, PluginLoadProvenance::AgentScript { .. })
+    }
+
+    pub fn agent_script_request_id(&self) -> Option<u64> {
+        match self.provenance {
+            PluginLoadProvenance::AgentScript { request_id } => Some(request_id),
+            _ => None,
+        }
+    }
+
+    pub fn is_trusted_orchestrator(&self) -> bool {
+        self.provenance == PluginLoadProvenance::Bundled
+            && self.trusted_builtin == Some(TrustedBuiltinPlugin::Orchestrator)
+    }
+
+    pub fn is_compensating_cleanup(&self) -> bool {
+        self.purpose == PluginCommandPurpose::CompensatingCleanup
+    }
+}
+
+impl std::fmt::Debug for PluginCommandContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginCommandContext")
+            .field("plugin_name", &self.plugin_name)
+            .field("plugin_instance_id", &self.plugin_instance_id)
+            .field("provenance", &self.provenance)
+            .field("trusted_builtin", &self.trusted_builtin)
+            .field("purpose", &self.purpose)
+            .field("source_window", &self.source_window)
+            .field("source_authority", &self.source_authority)
+            .field("window_scope", &self.window_scope)
+            .field("has_private_snapshot", &self.state_snapshot.is_some())
+            .finish()
+    }
+}
+
+/// Runtime-only envelope carrying loader-owned authority alongside a plugin
+/// command. The context is never represented in JavaScript or serialized.
+#[derive(Debug, Clone)]
+pub struct PluginCommandEnvelope {
+    pub command: PluginCommand,
+    pub context: PluginCommandContext,
+}
+
+impl PluginCommandEnvelope {
+    pub fn new(command: PluginCommand, context: PluginCommandContext) -> Self {
+        Self { command, context }
+    }
+}
+
 /// Plugin command - allows plugins to send commands to the editor
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -3073,6 +3252,9 @@ pub enum PluginCommand {
         label: String,
         cwd: Option<String>,
         command: Option<Vec<String>>,
+        /// Clean argv for a fresh relaunch when agent resume is disabled.
+        /// Unlike `command`, this excludes one-shot provisioning ids and prompts.
+        relaunch: Option<Vec<String>>,
         title: Option<String>,
         /// Restore-time argv (agent resume); see
         /// `CreateWindowWithTerminalOptions::resume`.
@@ -3080,10 +3262,38 @@ pub enum PluginCommand {
         /// Extra env for the spawned terminal; see
         /// `CreateWindowWithTerminalOptions::env`.
         env: Option<std::collections::HashMap<String, String>>,
+        /// Descriptive companion marker requested for the seeded terminal.
+        companion: Option<TerminalCompanion>,
         /// When set, the host mints a capability token bound to the new
         /// window and injects it as `FRESH_CMD_TOKEN`; see
         /// `CreateWindowWithTerminalOptions::allow_script`.
         allow_script: bool,
+        /// Track this terminal as the window's user-selected agent. This is
+        /// independent of the optional OMP companion protocol.
+        selected_agent: bool,
+        /// Whether the new window becomes active after it is fully initialized.
+        activate: bool,
+        /// Plugin-owned state installed atomically before the response resolves.
+        #[ts(type = "Record<string, unknown>")]
+        initial_state: HashMap<String, JsonValue>,
+        request_id: u64,
+    },
+    /// Recreate and restore one exact persisted workspace after a failed
+    /// lifecycle mutation. The stable id is installed before restore so a
+    /// co-tenant at the same root can never be selected by freshness.
+    RestoreWorkspaceWindow {
+        root: PathBuf,
+        label: String,
+        stable_id: Option<String>,
+        activate: bool,
+        callback_id: JsCallbackId,
+    },
+    /// Send one authenticated command to the exact live OMP companion PTY.
+    /// The request promise resolves to whether the writer channel accepted it.
+    SendOmpCompanionCommand {
+        terminal_id: WindowTerminalId,
+        command_type: OmpCompanionCommandType,
+        target: OmpCompanionCommandTargetV1,
         request_id: u64,
     },
 
@@ -3093,6 +3303,10 @@ pub enum PluginCommand {
     /// surfaced to the plugin — the plugin can verify by reading
     /// `editor.activeWindow()` after.
     SetActiveWindow { id: WindowId },
+
+    /// Make `id` active and resolve only after the editor applied the switch.
+    /// The result is false when the window does not exist.
+    ActivateWindow { id: WindowId, request_id: u64 },
 
     /// Like `SetActiveWindow`, but plays a directional wipe on the
     /// newly-active window's editor content as it appears. `from_edge`
@@ -3115,18 +3329,74 @@ pub enum PluginCommand {
     /// first. Fires `session_closed` on success.
     CloseWindow { id: WindowId },
 
-    /// Forget a directory's persisted workspace registry entry (the
-    /// `workspaces/<encoded-root>.json` file(s) the boot-time session
-    /// discovery scans). `CloseWindow` only drops the in-memory window;
-    /// without this the on-disk file survives and — because discovery
-    /// garbage-collects only entries whose directory is *gone* — an
-    /// in-place session (one that keeps its directory, unlike a worktree
-    /// the caller `git worktree remove`s) is rediscovered on the next
-    /// launch and "comes back". The orchestrator sends this when Delete
-    /// or Archive permanently forgets such a session. Removes every
-    /// co-tenant file at `root`; a still-open co-tenant window re-writes
-    /// its own file on its next checkpoint.
-    DeleteWorkspace { root: PathBuf },
+    /// Strictly inspect every persistence file claiming `root`. The host
+    /// rejects the promise if directory enumeration, file reads, parsing, or
+    /// identity validation is ambiguous.
+    InspectWorkspacePersistence {
+        root: PathBuf,
+        callback_id: JsCallbackId,
+    },
+
+    /// Strictly locate the durable workspace effect of one create attempt.
+    /// Resolution always carries found/not-found/error explicitly so inventory
+    /// uncertainty can never be mistaken for permission to roll back.
+    InspectWorkspaceCreateAttempt {
+        attempt_id: String,
+        root_hint: Option<PathBuf>,
+        workspace_id_hint: Option<String>,
+        callback_id: JsCallbackId,
+    },
+
+    /// Durably forget one exact workspace identity, or every identity at the
+    /// root when `stable_id` is `None`. Resolution is the deletion ack.
+    ForgetWorkspacePersistence {
+        root: PathBuf,
+        stable_id: Option<String>,
+        callback_id: JsCallbackId,
+    },
+
+    /// Acquire continuous host-wide ownership of one canonical workspace root.
+    /// `owner_id` is the caller's durable lifecycle attempt id; repeating the
+    /// same root/id pair is idempotent. Resolution means every other Fresh
+    /// process is fenced from publishing or mutating that root.
+    AcquireWorkspaceRootOwnership {
+        root: PathBuf,
+        owner_id: String,
+        callback_id: JsCallbackId,
+    },
+
+    /// Release a lifecycle root owner after its restore/retain/purge outcome is
+    /// durable. Unknown ids are already released.
+    ReleaseWorkspaceRootOwnership {
+        owner_id: String,
+        callback_id: JsCallbackId,
+    },
+
+    /// Move one exact terminal-artifact namespace (or the whole root when
+    /// `stable_id` is `None`) into an attempt-owned durable quarantine.
+    QuarantineWorkspaceArtifacts {
+        root: PathBuf,
+        stable_id: Option<String>,
+        owner_id: String,
+        callback_id: JsCallbackId,
+    },
+
+    /// Restore an attempt-owned artifact quarantine at `target_root`. This can
+    /// retarget a committed archive after its project root moved; success
+    /// consumes the payload and retains a replay-safe completion receipt.
+    RestoreWorkspaceArtifacts {
+        target_root: PathBuf,
+        stable_id: Option<String>,
+        owner_id: String,
+        callback_id: JsCallbackId,
+    },
+
+    /// Permanently discard an attempt-owned artifact quarantine. Lifecycle
+    /// code calls this only after committed Delete; Archive retains/restores it.
+    PurgeWorkspaceArtifactQuarantine {
+        owner_id: String,
+        callback_id: JsCallbackId,
+    },
 
     /// Eagerly initialise an inactive session's per-session state
     /// (file tree walk, ignore matcher, etc.) without diving. The
@@ -3197,6 +3467,8 @@ pub enum PluginCommand {
     /// stay on disk and be opened as a file-backed buffer without ever
     /// crossing the JS bridge.
     SpawnProcess {
+        /// Immutable authority owner captured when the API was invoked.
+        window_id: WindowId,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
@@ -3225,10 +3497,11 @@ pub enum PluginCommand {
         callback_id: JsCallbackId,
     },
 
-    /// Spawn a long-running background process
+    /// Spawn a long-running background process under one immutable window authority.
     /// Unlike SpawnProcess, this returns immediately with a process handle
-    /// and provides streaming output via hooks
+    /// and provides streaming output via hooks.
     SpawnBackgroundProcess {
+        window_id: WindowId,
         /// Unique ID for this process (generated by plugin runtime)
         process_id: u64,
         /// Command to execute
@@ -3241,12 +3514,17 @@ pub enum PluginCommand {
         callback_id: JsCallbackId,
     },
 
-    /// Kill a background process by ID
-    KillBackgroundProcess { process_id: u64 },
+    /// Kill a background process by its immutable owner and process ID.
+    KillBackgroundProcess {
+        window_id: WindowId,
+        process_id: u64,
+    },
 
     /// Wait for a process to complete and get its result
     /// Used with processes started via SpawnProcess
     SpawnProcessWait {
+        /// Window that owns the process handle.
+        window_id: WindowId,
         /// Process ID to wait for
         process_id: u64,
         /// Callback ID for async response
@@ -3299,12 +3577,10 @@ pub enum PluginCommand {
         value: Option<serde_json::Value>,
     },
 
-    /// Plugin-managed per-session state. Writes to the **currently
-    /// active** session's `plugin_state` map keyed by
-    /// `(plugin_name, key)`. Other sessions' state is unaffected.
-    /// `None` means delete (matches `SetGlobalState` semantics).
+    /// Plugin-managed per-window state. The target is captured when the API is
+    /// invoked; dispatch never falls back to whichever window is active later.
     SetWindowState {
-        plugin_name: String,
+        window_id: WindowId,
         key: String,
         #[ts(type = "any")]
         value: Option<serde_json::Value>,
@@ -4726,77 +5002,44 @@ pub enum PluginCommand {
     ReloadGrammars { callback_id: JsCallbackId },
 
     // ==================== Terminal Commands ====================
-    /// Create a new terminal in a split (async, returns TerminalResult)
-    /// This spawns a PTY-backed terminal that plugins can write to and read from.
+    /// Create a new terminal in one exact window (async, returns TerminalResult).
     CreateTerminal {
-        /// Working directory for the terminal (defaults to editor cwd)
         cwd: Option<String>,
-        /// Split direction ("horizontal" or "vertical"), default vertical
         direction: Option<String>,
-        /// Split ratio (0.0 to 1.0), default 0.5
         ratio: Option<f32>,
-        /// Whether to focus the new terminal split (default true)
         focus: Option<bool>,
-        /// Whether this terminal survives editor restarts. When false, the
-        /// terminal is excluded from workspace serialization and its backing
-        /// file is kept unique-per-spawn so no scrollback from a prior run
-        /// leaks in. Plugin-created terminals default to `false` since they
-        /// are typically one-off tool UIs (rebuilds, exec shells, etc.).
         persistent: bool,
-        /// Optional session id to attach the new terminal buffer to.
-        /// `None` (default) attaches to the active session at creation
-        /// time — the historical behaviour. `Some(id)` lets Orchestrator
-        /// (and any plugin spawning agents in worktrees) attach the
-        /// terminal to its target session without diving first; the
-        /// terminal's split is created in that session's stashed split
-        /// tree, and the buffer is added to the target session's
-        /// `Session.buffers` membership rather than the active one's.
-        /// Falls back to active session if the id is unknown.
-        #[serde(default)]
-        window_id: Option<WindowId>,
-        /// Argv to spawn directly in the PTY in lieu of the host's
-        /// configured shell. See `CreateTerminalOptions::command` for
-        /// the full semantics — `None` keeps the shell-and-type
-        /// behaviour, `Some(argv)` runs `argv` as the PTY child.
+        /// Immutable owner resolved at API invocation. Unknown IDs are rejected;
+        /// they never fall back to the ambient active window.
+        window_id: WindowId,
         #[serde(default)]
         command: Option<Vec<String>>,
-        /// Tab title override. Defaults to `command[0]` (when
-        /// `command` is set) or `"Terminal N"` (when it isn't).
-        /// See `CreateTerminalOptions::title`.
+        #[serde(default)]
+        relaunch: Option<Vec<String>>,
         #[serde(default)]
         title: Option<String>,
-        /// Argv to run on restore/restart instead of `command`.
-        /// See `CreateTerminalOptions::resume`.
         #[serde(default)]
         resume: Option<Vec<String>>,
-        /// Extra env vars for the spawned child, on top of the
-        /// inherited/activated env. See `CreateTerminalOptions::env`.
-        /// `None` adds nothing.
         #[serde(default)]
         env: Option<std::collections::HashMap<String, String>>,
-        /// Capability grant. When set, the host mints a token bound to
-        /// the target window and injects `FRESH_CMD_TOKEN` /
-        /// `FRESH_SESSION` into the spawned child. See
-        /// `CreateTerminalOptions::allow_script`.
+        #[serde(default)]
+        companion: Option<TerminalCompanion>,
         #[serde(default)]
         allow_script: bool,
-        /// Callback ID for async response
+        #[serde(default)]
+        selected_agent: bool,
         request_id: u64,
     },
 
-    /// Send input data to a terminal by its terminal ID
+    /// Send input to one exact window-owned terminal.
     SendTerminalInput {
-        /// The terminal ID (from TerminalResult)
-        terminal_id: TerminalId,
+        terminal_id: WindowTerminalId,
         /// Data to write to the terminal PTY (UTF-8 string, may include escape sequences)
         data: String,
     },
 
-    /// Close a terminal by its terminal ID
-    CloseTerminal {
-        /// The terminal ID to close
-        terminal_id: TerminalId,
-    },
+    /// Close one exact window-owned terminal.
+    CloseTerminal { terminal_id: WindowTerminalId },
 
     /// Send `signal` to every process group tracked by the
     /// window `id`. `signal` is one of `"SIGTERM"` / `"SIGKILL"`
@@ -4807,6 +5050,11 @@ pub enum PluginCommand {
     /// see `app/window/process_group.rs`). Idempotent across
     /// already-exited groups: callers can retry safely.
     SignalWindow { id: WindowId, signal: String },
+
+    /// Snapshot one window's exact terminal/process incarnations, send
+    /// SIGTERM, close those terminals, and schedule an incarnation-fenced
+    /// SIGKILL after `grace_ms` — all from one host operation.
+    StopWindow { id: WindowId, grace_ms: u64 },
 
     /// Register a diff baseline for `buffer_id` (async). `kind` is one of
     /// "saved" | "disk" | "gitRef" | "gitIndex"; `git_ref` carries the ref
@@ -4946,14 +5194,13 @@ pub enum PluginCommand {
     /// plugin wants to do after the switch belongs in its post-restart
     /// init code, not in a callback here.
     SetAuthority {
+        window_id: WindowId,
         #[ts(type = "unknown")]
         payload: JsonValue,
     },
 
-    /// Restore the default local authority. Same semantics as
-    /// `SetAuthority` with a local payload — triggers an editor
-    /// restart.
-    ClearAuthority,
+    /// Restore the default local authority for one exact window.
+    ClearAuthority { window_id: WindowId },
 
     /// Attach to a remote agent over a transport that requires a live
     /// connection (today: `kubectl exec` into a K8s pod). Unlike
@@ -4968,6 +5215,8 @@ pub enum PluginCommand {
     /// schema (`RemoteAgentSpec`) lives in `fresh-editor` so core stays
     /// ignorant of backend kinds, exactly like `SetAuthority`.
     AttachRemoteAgent {
+        /// Immutable window that initiated and owns this attach attempt.
+        window_id: WindowId,
         #[ts(type = "unknown")]
         payload: JsonValue,
         /// JS callback id of the returned promise. The editor settles it once
@@ -4976,25 +5225,27 @@ pub enum PluginCommand {
         request_id: u64,
     },
 
-    /// Cancel every in-flight `attachRemoteAgent` connect. The New-Session
-    /// dialog's Cancel: the awaiting promise is rejected immediately and the
-    /// (uninterruptible) background connect's eventual result is discarded so
-    /// no window is ever built. A no-op when nothing is in flight.
-    CancelRemoteAttach,
+    /// Cancel only the caller-owned attach request with this exact id.
+    CancelRemoteAttach { request_id: u64 },
+
+    /// Cancel every in-flight remote attach owned by the calling plugin
+    /// instance. Plugin unload emits this before retiring that instance's
+    /// callback and liveness records.
+    CancelRemoteAttaches,
 
     /// Activate an environment: set the live env provider's recipe (an
     /// activation shell `snippet` run in `dir`). Re-evaluated on demand on the
     /// active backend and applied to every spawn — no authority rebuild. Only
     /// honored when the workspace is Trusted (it runs repo-controlled code).
     SetEnv {
+        window_id: WindowId,
         snippet: String,
         #[serde(default)]
         dir: Option<String>,
     },
 
-    /// Deactivate the environment — clear the live provider so spawns use the
-    /// inherited environment again.
-    ClearEnv,
+    /// Deactivate one exact window's environment provider.
+    ClearEnv { window_id: WindowId },
 
     /// Override the Remote Indicator's displayed state for the rest
     /// of the current editor session (until a restart, or until the
@@ -5019,14 +5270,13 @@ pub enum PluginCommand {
     /// takes it opaquely so new variants can land without touching
     /// core plumbing.
     SetRemoteIndicatorState {
+        window_id: WindowId,
         #[ts(type = "unknown")]
         state: JsonValue,
     },
 
-    /// Drop any active Remote Indicator override and fall back to
-    /// the authority-derived state. Safe to call without a prior
-    /// `SetRemoteIndicatorState`.
-    ClearRemoteIndicatorState,
+    /// Drop one exact window's Remote Indicator override.
+    ClearRemoteIndicatorState { window_id: WindowId },
 
     /// Spawn a process on the host, regardless of the currently
     /// installed authority.
@@ -5041,6 +5291,8 @@ pub enum PluginCommand {
     /// lets callers abort a long-running host spawn (e.g.
     /// `devcontainer up`) via a user action like "Cancel Startup".
     SpawnHostProcess {
+        /// Immutable trust/ownership target captured before async work begins.
+        window_id: WindowId,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
@@ -5057,7 +5309,10 @@ pub enum PluginCommand {
     /// Unix per `tokio::process::Child::start_kill`; children of the
     /// killed process may leak (see Q-C2 in
     /// `DEVCONTAINER_SPEC_GAP_PLAN.md`).
-    KillHostProcess { process_id: u64 },
+    KillHostProcess {
+        window_id: WindowId,
+        process_id: u64,
+    },
 
     /// Mount a declarative widget panel inside an existing virtual
     /// buffer. The host renders the `WidgetSpec` and writes the
@@ -5887,8 +6142,8 @@ pub struct CreateTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub cwd: Option<String>,
-    /// Split direction: `"horizontal"` or `"vertical"` (default:
-    /// `"vertical"`).
+    /// Split direction: `"horizontal"` or `"vertical"`. Omit this field to
+    /// create a tab in the active split instead of creating a new split.
     ///
     /// The name describes the **divider**, not the arrangement:
     /// `"vertical"` puts the panes side by side, `"horizontal"` stacks them.
@@ -5935,6 +6190,12 @@ pub struct CreateTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub command: Option<Vec<String>>,
+    /// Clean argv to use for a fresh restart when `terminal.resume_agents` is
+    /// disabled. This must omit one-shot session provisioning ids, start
+    /// prompts, and resume-only flags. `None` falls back to `command`.
+    #[serde(default)]
+    #[ts(optional)]
+    pub relaunch: Option<Vec<String>>,
     /// Tab title for the terminal buffer. Defaults to `command[0]`
     /// (when `command` is set) or `"Terminal N"` (the historical
     /// auto-numbered title). If another terminal in the same window
@@ -5967,6 +6228,12 @@ pub struct CreateTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub resume: Option<Vec<String>>,
+    /// Descriptive native companion marker for the spawned terminal.
+    /// Authentication material is generated by the host and never crosses
+    /// this API boundary.
+    #[serde(default)]
+    #[ts(optional)]
+    pub companion: Option<TerminalCompanion>,
     /// When set, the host mints an unforgeable capability token bound
     /// to the TARGET window (the active window, or `windowId` when
     /// set) and injects it into the spawned terminal as
@@ -5982,6 +6249,41 @@ pub struct CreateTerminalOptions {
     #[serde(default, rename = "allowScript")]
     #[ts(optional, rename = "allowScript")]
     pub allow_script: Option<bool>,
+    /// Track this terminal as the window's selected agent. This is distinct
+    /// from `companion`, which only describes an optional native protocol.
+    #[serde(default, rename = "selectedAgent")]
+    #[ts(optional, rename = "selectedAgent")]
+    pub selected_agent: Option<bool>,
+}
+
+/// Descriptive marker for a terminal with a native host companion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum TerminalCompanion {
+    Omp,
+}
+
+/// Closed version-1 Fresh-to-OMP companion command set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum OmpCompanionCommandType {
+    Cancel,
+    RequestSnapshot,
+}
+
+/// Live OMP work identity that a companion command is authorized to target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OmpCompanionCommandTargetV1 {
+    pub incarnation: String,
+    #[ts(type = "number")]
+    pub session_generation: u64,
+    pub session_id: String,
+    #[ts(type = "number")]
+    pub work_epoch: u64,
 }
 
 /// Options for `createWindowWithTerminal` — the atomic
@@ -6014,6 +6316,12 @@ pub struct CreateWindowWithTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub command: Option<Vec<String>>,
+    /// Clean argv to use for a fresh restart when `terminal.resume_agents` is
+    /// disabled. This must omit one-shot session provisioning ids, start
+    /// prompts, and resume-only flags. `None` falls back to `command`.
+    #[serde(default)]
+    #[ts(optional)]
+    pub relaunch: Option<Vec<String>>,
     /// Tab title override. Defaults to `command[0]`'s basename
     /// when `command` is set, or "Terminal N" otherwise.
     #[serde(default)]
@@ -6039,6 +6347,11 @@ pub struct CreateWindowWithTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Opt in to the native OMP TUI companion for a supported local,
+    /// direct `omp` launch. Unsupported launches remain ordinary terminals.
+    #[serde(default)]
+    #[ts(optional)]
+    pub companion: Option<TerminalCompanion>,
     /// When set, the host mints an unforgeable capability token bound
     /// to the NEW window and injects it into the spawned terminal as
     /// `FRESH_CMD_TOKEN`. A client presenting that token over the
@@ -6051,6 +6364,20 @@ pub struct CreateWindowWithTerminalOptions {
     #[serde(default, rename = "allowScript")]
     #[ts(optional, rename = "allowScript")]
     pub allow_script: Option<bool>,
+    /// Track the seeded terminal as the new window's selected agent. This is
+    /// independent of `companion` and is authorized separately by the host.
+    #[serde(default, rename = "selectedAgent")]
+    #[ts(optional, rename = "selectedAgent")]
+    pub selected_agent: Option<bool>,
+    /// Make the new window active after its terminal and initial state exist.
+    /// Defaults to true for compatibility with the original atomic creator.
+    #[serde(default)]
+    #[ts(optional)]
+    pub activate: Option<bool>,
+    /// Plugin-owned state installed before activation and promise resolution.
+    #[serde(default, rename = "initialState")]
+    #[ts(optional, rename = "initialState", type = "Record<string, unknown>")]
+    pub initial_state: Option<HashMap<String, JsonValue>>,
 }
 
 /// Result of `createWindowWithTerminal` — the ids of the new
@@ -6066,9 +6393,8 @@ pub struct SessionWithTerminalResult {
     /// The new workspace's durable identity (`ws-…`), stable across restarts.
     #[serde(default)]
     pub stable_id: String,
-    /// The seeded terminal's id (for `sendTerminalInput`, etc.).
-    #[ts(type = "number")]
-    pub terminal_id: u64,
+    /// The seeded terminal's exact identity.
+    pub terminal_id: WindowTerminalId,
     /// The seeded terminal buffer's id.
     #[ts(type = "number")]
     pub buffer_id: u64,
@@ -6172,6 +6498,9 @@ mod fromjs_impls {
         ProcessLimitsPackConfig,
         CreateTerminalOptions,
         CreateWindowWithTerminalOptions,
+        OmpCompanionCommandType,
+        OmpCompanionCommandTargetV1,
+        WindowTerminalId,
     );
 
     impl<'js> rquickjs::IntoJs<'js> for TextPropertiesAtCursor {
@@ -7008,6 +7337,7 @@ fn default_plugin_provider_priority() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TerminalId;
     use std::path::Path;
 
     #[test]
@@ -7951,12 +8281,22 @@ mod tests {
     /// silently break — this test pins the wire format.
     #[test]
     fn plugin_command_kill_host_process_serde_round_trip() {
-        let cmd = PluginCommand::KillHostProcess { process_id: 1234 };
+        let cmd = PluginCommand::KillHostProcess {
+            window_id: WindowId(9),
+            process_id: 1234,
+        };
         let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(json["KillHostProcess"]["window_id"], 9);
         assert_eq!(json["KillHostProcess"]["process_id"], 1234);
         let decoded: PluginCommand = serde_json::from_value(json).unwrap();
         match decoded {
-            PluginCommand::KillHostProcess { process_id } => assert_eq!(process_id, 1234),
+            PluginCommand::KillHostProcess {
+                window_id,
+                process_id,
+            } => {
+                assert_eq!(window_id, WindowId(9));
+                assert_eq!(process_id, 1234);
+            }
             other => panic!("expected KillHostProcess, got {:?}", other),
         }
     }
@@ -8089,14 +8429,37 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(drained.len(), 200);
     }
+
+    #[test]
+    fn omp_command_serializes_exact_terminal_without_trust_claims() {
+        let command = PluginCommand::SendOmpCompanionCommand {
+            terminal_id: WindowTerminalId::new(WindowId(7), TerminalId(11)),
+            command_type: OmpCompanionCommandType::Cancel,
+            target: OmpCompanionCommandTargetV1 {
+                incarnation: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                session_generation: 3,
+                session_id: "018f1d74-7f7b-7d31-8d93-9a21c7b95bb1".to_string(),
+                work_epoch: 9,
+            },
+            request_id: 13,
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert!(json.contains("\"windowId\":7"));
+        assert!(json.contains("\"workEpoch\":9"));
+        assert!(json.contains("\"terminalId\":11"));
+        assert!(!json.contains("plugin_name"));
+        assert!(!json.contains("pluginName"));
+        assert!(!json.contains("trusted_builtin"));
+        assert!(!json.contains("trustedBuiltin"));
+    }
 }
 
 #[cfg(test)]
 mod create_window_with_terminal_options_tests {
-    use super::CreateWindowWithTerminalOptions;
+    use super::{CreateWindowWithTerminalOptions, TerminalCompanion};
 
-    /// Old callers that supply neither `env` nor `allowScript` must still
-    /// deserialize, with both fields defaulting to off.
+    /// Old callers that supply none of the additive fields must still
+    /// deserialize with their defaults.
     #[test]
     fn deserializes_without_new_fields() {
         let opts: CreateWindowWithTerminalOptions =
@@ -8104,15 +8467,17 @@ mod create_window_with_terminal_options_tests {
         assert_eq!(opts.root, "/tmp/x");
         assert!(opts.env.is_none());
         assert!(opts.allow_script.is_none());
+        assert!(opts.companion.is_none());
     }
 
-    /// The two fields round-trip through serde using their camelCase JSON
-    /// names (`env`, `allowScript`).
+    /// Additive fields round-trip through serde using their camelCase JSON
+    /// names and the frozen lowercase companion discriminator.
     #[test]
     fn new_fields_round_trip() {
         let json = r#"{
             "root": "/tmp/proj",
             "env": {"FOO": "bar"},
+            "companion": "omp",
             "allowScript": true
         }"#;
         let opts: CreateWindowWithTerminalOptions =
@@ -8124,6 +8489,7 @@ mod create_window_with_terminal_options_tests {
                 .map(String::as_str),
             Some("bar")
         );
+        assert_eq!(opts.companion, Some(TerminalCompanion::Omp));
         assert_eq!(opts.allow_script, Some(true));
 
         let reencoded = serde_json::to_string(&opts).expect("re-serialize");
@@ -8131,5 +8497,14 @@ mod create_window_with_terminal_options_tests {
             serde_json::from_str(&reencoded).expect("re-decode");
         assert_eq!(back.allow_script, opts.allow_script);
         assert_eq!(back.env, opts.env);
+        assert_eq!(back.companion, opts.companion);
+    }
+
+    #[test]
+    fn unknown_companion_discriminator_is_rejected() {
+        let result = serde_json::from_str::<CreateWindowWithTerminalOptions>(
+            r#"{"root":"/tmp/x","companion":"other"}"#,
+        );
+        assert!(result.is_err());
     }
 }

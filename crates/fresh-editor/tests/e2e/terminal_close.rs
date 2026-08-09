@@ -5,6 +5,7 @@
 
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
+use fresh_core::api::PluginCommand;
 use portable_pty::{native_pty_system, PtySize};
 
 fn harness_or_skip(width: u16, height: u16) -> Option<EditorTestHarness> {
@@ -310,22 +311,25 @@ fn test_closing_other_buffer_resumes_terminal_correctly() {
 #[test]
 fn test_closed_terminal_not_restored_from_session() {
     use fresh::config::Config;
+    use fresh::config_io::DirectoryContext;
     use tempfile::TempDir;
 
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
     let file = project_dir.join("test.txt");
     std::fs::write(&file, "Test file content").unwrap();
 
     // First session: open file, open terminal, close terminal, save session
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             30,
             Config::default(),
             project_dir.clone(),
+            dir_context.clone(),
         )
         .unwrap();
 
@@ -372,11 +376,12 @@ fn test_closed_terminal_not_restored_from_session() {
 
     // Second session: restore and verify terminal doesn't come back
     {
-        let mut harness = EditorTestHarness::with_config_and_working_dir(
+        let mut harness = EditorTestHarness::with_shared_dir_context(
             120,
             30,
             Config::default(),
             project_dir.clone(),
+            dir_context,
         )
         .unwrap();
 
@@ -410,4 +415,56 @@ fn test_closed_terminal_not_restored_from_session() {
         // Double-check terminal is not visible anywhere
         harness.assert_screen_not_contains("Terminal");
     }
+}
+
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn closing_exited_terminal_removes_durable_restart_record() {
+    let mut harness = harness_or_return!(120, 30);
+    let window_id = harness.editor().active_window_id();
+    harness
+        .editor_mut()
+        .handle_plugin_command(PluginCommand::CreateTerminal {
+            cwd: None,
+            direction: None,
+            ratio: None,
+            focus: Some(true),
+            persistent: false,
+            window_id,
+            command: Some(vec!["sh".into(), "-c".into(), "exit 0".into()]),
+            relaunch: None,
+            title: Some("short-lived".into()),
+            resume: Some(vec!["sh".into(), "-c".into(), "exec sleep 30".into()]),
+            env: None,
+            companion: None,
+            allow_script: false,
+            selected_agent: false,
+            request_id: 0,
+        })
+        .unwrap();
+    let buffer_id = harness.editor().active_buffer_id();
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .active_window()
+                .exited_terminal(buffer_id)
+                .is_some()
+        })
+        .expect("terminal should exit before its tab is closed");
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .exited_terminal(buffer_id)
+        .unwrap()
+        .terminal_id;
+
+    run_command(&mut harness, "Close Buffer");
+    let window = harness.editor().active_window();
+    assert!(window.exited_terminal(buffer_id).is_none());
+    assert!(!window.terminal_commands.contains_key(&terminal_id));
+    assert!(!window.terminal_resume_commands.contains_key(&terminal_id));
+    assert!(!window.terminal_companions.contains_key(&terminal_id));
+    assert!(!window.terminal_log_files.contains_key(&terminal_id));
+    assert!(!window.terminal_backing_files.contains_key(&terminal_id));
+    assert!(!window.terminal_history_files.contains_key(&terminal_id));
 }

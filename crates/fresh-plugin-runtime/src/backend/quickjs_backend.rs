@@ -86,34 +86,143 @@
 //!
 //! This validates TypeScript syntax and writes `plugins/lib/fresh.d.ts`.
 
+use crate::runtime::{
+    may_receive_private_event, may_subscribe_to_event, ActivePluginInstances, AsyncResourceOwner,
+    AsyncResourceOwners, CallbackOwner, PendingResponses, PluginLoadKind, PluginLoadRecord,
+    TrackedAsyncResource, PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT,
+};
 use anyhow::{anyhow, Result};
+#[cfg(test)]
+use fresh_core::api::TrustedBuiltinPlugin;
 use fresh_core::api::{
     ActionSpec, BufferInfo, CompositeHunk, CreateCompositeBufferOptions, EditorStateSnapshot,
     GrammarInfoSnapshot, JsCallbackId, LanguagePackConfig, LspServerPackConfig, OverlayOptions,
-    PluginCommand, PluginMarker, PluginResponse, ScrollbarMarker, SearchHandleRegistry,
-    SearchHandleState, SearchTakeResult, SplitWindowOptions,
+    PluginCommand, PluginCommandContext, PluginCommandEnvelope, PluginInstanceId, PluginInvocation,
+    PluginLoadProvenance, PluginMarker, ScrollbarMarker, SearchHandleRegistry, SearchHandleState,
+    SearchTakeResult, SplitWindowOptions,
 };
 use fresh_core::command::Command;
 use fresh_core::overlay::OverlayNamespace;
 use fresh_core::text_property::TextPropertyEntry;
 use fresh_core::{BufferId, SplitId};
-use fresh_parser_js::{
-    bundle_module, has_es_imports, has_es_module_syntax, strip_imports_and_exports,
-    transpile_typescript,
-};
 use fresh_plugin_api_macros::{plugin_api, plugin_api_impl};
 use rquickjs::{Context, Function, Object, Runtime, Value};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, RwLock};
 
-/// Plugin-API exports map shared across every `JsEditorApi` /
-/// `QuickJsBackend` instance on a single runtime. Maps an export name to
-/// `(exporter plugin name, persistent JS object)`.
-type PluginApiExports =
-    Rc<RefCell<HashMap<String, (String, rquickjs::Persistent<rquickjs::Object<'static>>)>>>;
+/// Plugin-API exports shared by every plugin context on one QuickJS runtime.
+struct PluginApiExport {
+    exporter: PluginCommandContext,
+    object: rquickjs::Persistent<rquickjs::Object<'static>>,
+}
+
+struct PluginApiCall {
+    caller: CallbackOwner,
+    exporter_instance: PluginInstanceId,
+    resolve: rquickjs::Persistent<rquickjs::Function<'static>>,
+    reject: rquickjs::Persistent<rquickjs::Function<'static>>,
+}
+
+enum PluginApiSettlement {
+    Resolve(serde_json::Value),
+    Reject(String),
+}
+
+type PluginApiExports = Rc<RefCell<HashMap<String, PluginApiExport>>>;
+type PluginApiCalls = Rc<RefCell<HashMap<u64, PluginApiCall>>>;
+type PluginApiSettlements = Rc<RefCell<Vec<(u64, PluginApiSettlement)>>>;
+struct PendingPromiseRejection {
+    promise: rquickjs::Persistent<rquickjs::Value<'static>>,
+    error_msg: String,
+    context: Option<PluginCommandContext>,
+}
+
+type PendingPromiseRejections = Rc<RefCell<Vec<PendingPromiseRejection>>>;
+
+#[derive(Clone)]
+struct PrivilegedPluginApiMethod {
+    method: &'static str,
+    asynchronous: bool,
+    append_window: Option<u64>,
+    exporter: PluginCommandContext,
+    object: rquickjs::Persistent<rquickjs::Object<'static>>,
+    caller: PluginCommandContext,
+    exports: PluginApiExports,
+    calls: PluginApiCalls,
+    settlements: PluginApiSettlements,
+    next_request_id: Rc<RefCell<u64>>,
+    current_invocation: Rc<RefCell<Option<PluginInvocation>>>,
+}
+
+const RESERVED_BUNDLED_PLUGIN_NAMES: &[&str] = &["orchestrator"];
+
+fn is_reserved_bundled_plugin(name: &str) -> bool {
+    RESERVED_BUNDLED_PLUGIN_NAMES.contains(&name)
+}
+
+#[derive(Clone)]
+struct PluginCommandSender {
+    sender: mpsc::Sender<PluginCommandEnvelope>,
+    context: PluginCommandContext,
+    current_invocation: Rc<RefCell<Option<PluginInvocation>>>,
+}
+
+impl PluginCommandSender {
+    fn new(
+        sender: mpsc::Sender<PluginCommandEnvelope>,
+        current_invocation: Rc<RefCell<Option<PluginInvocation>>>,
+    ) -> Self {
+        Self {
+            sender,
+            context: PluginCommandContext::default(),
+            current_invocation,
+        }
+    }
+
+    fn with_context(&self, context: PluginCommandContext) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            context,
+            current_invocation: Rc::clone(&self.current_invocation),
+        }
+    }
+
+    fn context_for(&self, explicit_window: Option<fresh_core::WindowId>) -> PluginCommandContext {
+        let mut context = self.context.clone();
+        if context.window_scope.is_none() {
+            if let Some(invocation) = self.current_invocation.borrow().as_ref() {
+                context.source_window = Some(invocation.window_id);
+                context.source_authority = invocation.authority;
+                context.state_snapshot = invocation.state_snapshot.clone();
+            } else if let Some(window_id) = explicit_window {
+                context.source_window = Some(window_id);
+            }
+        }
+        context
+    }
+
+    fn send(
+        &self,
+        command: PluginCommand,
+    ) -> std::result::Result<(), mpsc::SendError<PluginCommandEnvelope>> {
+        self.sender
+            .send(PluginCommandEnvelope::new(command, self.context_for(None)))
+    }
+
+    fn send_to(
+        &self,
+        window_id: fresh_core::WindowId,
+        command: PluginCommand,
+    ) -> std::result::Result<(), mpsc::SendError<PluginCommandEnvelope>> {
+        self.sender.send(PluginCommandEnvelope::new(
+            command,
+            self.context_for(Some(window_id)),
+        ))
+    }
+}
 
 /// Convert a QuickJS Value to serde_json::Value
 #[allow(clippy::only_used_in_recursion)]
@@ -219,6 +328,229 @@ fn json_to_js_value<'js>(
             }
             Ok(obj.into_value())
         }
+    }
+}
+
+fn structured_clone_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Value> {
+    fn unsupported(from: &'static str) -> rquickjs::Error {
+        rquickjs::Error::new_from_js_message(
+            from,
+            "structured-clone value",
+            "plugin APIs accept only finite JSON-compatible data",
+        )
+    }
+
+    fn clone_value<'js>(
+        value: &Value<'js>,
+        seen: &mut HashSet<rquickjs::Object<'js>>,
+        depth: usize,
+    ) -> rquickjs::Result<serde_json::Value> {
+        use rquickjs::Type;
+        if depth > 128 {
+            return Err(unsupported("deep object graph"));
+        }
+        match value.type_of() {
+            Type::Null | Type::Undefined | Type::Uninitialized => Ok(serde_json::Value::Null),
+            Type::Bool => Ok(serde_json::Value::Bool(
+                value.as_bool().ok_or_else(|| unsupported("boolean"))?,
+            )),
+            Type::Int => Ok(serde_json::Value::Number(
+                value.as_int().ok_or_else(|| unsupported("integer"))?.into(),
+            )),
+            Type::Float => {
+                let number = value.as_float().ok_or_else(|| unsupported("number"))?;
+                serde_json::Number::from_f64(number)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| unsupported("non-finite number"))
+            }
+            Type::String => Ok(serde_json::Value::String(
+                value
+                    .as_string()
+                    .and_then(|string| string.to_string().ok())
+                    .ok_or_else(|| unsupported("string"))?,
+            )),
+            Type::Array => {
+                let object = value
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| unsupported("array"))?;
+                if !seen.insert(object.clone()) {
+                    return Err(unsupported("cyclic array"));
+                }
+                let array = value.as_array().ok_or_else(|| unsupported("array"))?;
+                let mut cloned = Vec::with_capacity(array.len());
+                for item in array.iter() {
+                    cloned.push(clone_value(&item?, seen, depth + 1)?);
+                }
+                seen.remove(&object);
+                Ok(serde_json::Value::Array(cloned))
+            }
+            Type::Object if !value.is_promise() => {
+                let object = value
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| unsupported("object"))?;
+                if !seen.insert(object.clone()) {
+                    return Err(unsupported("cyclic object"));
+                }
+                let mut cloned = serde_json::Map::new();
+                for key in object.keys::<String>() {
+                    let key = key?;
+                    let item = object.get::<_, Value>(key.as_str())?;
+                    cloned.insert(key, clone_value(&item, seen, depth + 1)?);
+                }
+                seen.remove(&object);
+                Ok(serde_json::Value::Object(cloned))
+            }
+            other => Err(unsupported(other.as_str())),
+        }
+    }
+
+    clone_value(value, &mut HashSet::new(), 0)
+}
+
+fn plugin_api_error<'js>(ctx: &rquickjs::Ctx<'js>, message: &str) -> rquickjs::Result<Value<'js>> {
+    Ok(rquickjs::Exception::from_message(ctx.clone(), message)?
+        .into_object()
+        .into_value())
+}
+
+impl PrivilegedPluginApiMethod {
+    fn invoke<'js>(
+        &self,
+        caller_ctx: rquickjs::Ctx<'js>,
+        args: rquickjs::function::Rest<Value<'js>>,
+    ) -> rquickjs::Result<Value<'js>> {
+        let mut cloned_args = args
+            .0
+            .iter()
+            .map(structured_clone_json)
+            .collect::<rquickjs::Result<Vec<_>>>()?;
+        if let Some(window_id) = self.append_window {
+            cloned_args.push(serde_json::Value::Number(window_id.into()));
+        }
+
+        let exporter_is_current = self
+            .exports
+            .borrow()
+            .get(self.exporter.plugin_name.as_ref())
+            .is_some_and(|export| {
+                export.exporter.plugin_instance_id == self.exporter.plugin_instance_id
+            });
+        if !exporter_is_current {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin API",
+                self.method,
+                "exporter is no longer loaded",
+            ));
+        }
+
+        if !self.asynchronous {
+            let result = (|| -> rquickjs::Result<serde_json::Value> {
+                let object = self.object.clone().restore(&caller_ctx)?;
+                let function: Function = object.get(self.method)?;
+                let args = cloned_args
+                    .iter()
+                    .map(|value| json_to_js_value(&caller_ctx, value))
+                    .collect::<rquickjs::Result<Vec<_>>>()?;
+                let value: Value = function.call((
+                    rquickjs::function::This(object),
+                    rquickjs::function::Rest(args),
+                ))?;
+                if value.is_promise() {
+                    return Err(rquickjs::Error::new_from_js_message(
+                        "Promise",
+                        "structured-clone value",
+                        "synchronous plugin API method returned a Promise",
+                    ));
+                }
+                structured_clone_json(&value)
+            })()
+            .map_err(|error| format_js_error(&caller_ctx, error, self.method).to_string());
+            return match result {
+                Ok(value) => json_to_js_value(&caller_ctx, &value),
+                Err(message) => Err(rquickjs::Error::new_from_js_message(
+                    "plugin API",
+                    self.method,
+                    message,
+                )),
+            };
+        }
+
+        let (promise, resolve, reject) = rquickjs::Promise::new(&caller_ctx)?;
+        let id = {
+            let mut next = self.next_request_id.borrow_mut();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        self.calls.borrow_mut().insert(
+            id,
+            PluginApiCall {
+                caller: CallbackOwner {
+                    plugin_name: self.caller.plugin_name.to_string(),
+                    plugin_instance_id: self.caller.plugin_instance_id,
+                    invocation: self.current_invocation.borrow().clone(),
+                },
+                exporter_instance: self.exporter.plugin_instance_id,
+                resolve: rquickjs::Persistent::save(&caller_ctx, resolve.clone()),
+                reject: rquickjs::Persistent::save(&caller_ctx, reject.clone()),
+            },
+        );
+
+        let start = (|| -> rquickjs::Result<()> {
+            let object = self.object.clone().restore(&caller_ctx)?;
+            let function: Function = object.get(self.method)?;
+            let args = cloned_args
+                .iter()
+                .map(|value| json_to_js_value(&caller_ctx, value))
+                .collect::<rquickjs::Result<Vec<_>>>()?;
+            let value: Value = function.call((
+                rquickjs::function::This(object),
+                rquickjs::function::Rest(args),
+            ))?;
+
+            if let Some(exporter_promise) = value.as_promise() {
+                let resolve_settlements = Rc::clone(&self.settlements);
+                let on_resolve = Function::new(caller_ctx.clone(), move |value: Value| {
+                    let settlement = structured_clone_json(&value)
+                        .map(PluginApiSettlement::Resolve)
+                        .unwrap_or_else(|error| PluginApiSettlement::Reject(error.to_string()));
+                    resolve_settlements.borrow_mut().push((id, settlement));
+                })?;
+                let reject_settlements = Rc::clone(&self.settlements);
+                let on_reject = Function::new(
+                    caller_ctx.clone(),
+                    move |ctx: rquickjs::Ctx, value: Value| {
+                        let message = value
+                            .as_object()
+                            .and_then(|object| object.get::<_, String>("message").ok())
+                            .unwrap_or_else(|| js_value_to_string(&ctx, &value));
+                        reject_settlements
+                            .borrow_mut()
+                            .push((id, PluginApiSettlement::Reject(message)));
+                    },
+                )?;
+                exporter_promise.then()?.call::<_, ()>((
+                    rquickjs::function::This(exporter_promise.clone()),
+                    on_resolve,
+                    on_reject,
+                ))?;
+            } else {
+                let settlement = structured_clone_json(&value)
+                    .map(PluginApiSettlement::Resolve)
+                    .unwrap_or_else(|error| PluginApiSettlement::Reject(error.to_string()));
+                self.settlements.borrow_mut().push((id, settlement));
+            }
+            Ok(())
+        })()
+        .map_err(|error| format_js_error(&caller_ctx, error, self.method).to_string());
+
+        if let Err(message) = start {
+            self.calls.borrow_mut().remove(&id);
+            reject.call::<_, ()>((plugin_api_error(&caller_ctx, &message)?,))?;
+        }
+        Ok(promise.into_value())
     }
 }
 
@@ -630,10 +962,6 @@ fn parse_text_property_entry(
     })
 }
 
-/// Pending response senders type alias
-pub type PendingResponses =
-    Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<PluginResponse>>>>;
-
 /// Information about a loaded plugin
 #[derive(Debug, Clone)]
 pub struct TsPluginInfo {
@@ -671,31 +999,23 @@ pub struct PluginTrackedState {
     /// Context names set by the plugin
     pub contexts_set: Vec<String>,
     // --- Phase 3: Resource cleanup ---
-    /// Background process IDs spawned by this plugin
-    pub background_process_ids: Vec<u64>,
+    /// Exact background process owners spawned by this plugin.
+    pub background_process_ids: Vec<(fresh_core::WindowId, u64)>,
+    /// Exact host-process owners spawned by this plugin.
+    pub host_process_ids: Vec<(fresh_core::WindowId, u64)>,
     /// Scroll sync group IDs created by this plugin
     pub scroll_sync_group_ids: Vec<u32>,
     /// Virtual buffer IDs created by this plugin
     pub virtual_buffer_ids: Vec<BufferId>,
     /// Composite buffer IDs created by this plugin
     pub composite_buffer_ids: Vec<BufferId>,
-    /// Terminal IDs created by this plugin
-    pub terminal_ids: Vec<fresh_core::TerminalId>,
-    /// File-watcher handles created by this plugin via
-    /// `editor.watchPath`. Cleaned up by sending UnwatchPath on
-    /// plugin unload.
-    pub watch_handles: Vec<u64>,
-    /// Timer ids from `editor.setInterval` / `setTimeout`. Cancelled on
-    /// unload, so a hot-reload during plugin development doesn't leave the
-    /// previous copy's timers ticking against the new one.
+    /// Exact terminal identities created through `createTerminal`.
+    pub terminal_ids: Vec<fresh_core::WindowTerminalId>,
+    /// File-watcher handles created by this plugin via `editor.watchPath`.
+    pub watch_handles: Vec<(u64, PluginCommandContext)>,
+    /// Timer ids from `editor.setInterval` / `setTimeout`.
     pub timer_ids: Vec<u64>,
 }
-
-/// Type alias for the shared async resource owner map.
-/// Maps request_id → plugin_name for pending async resource creations
-/// (virtual buffers, composite buffers, terminals).
-/// Shared between QuickJsBackend (plugin thread) and PluginThreadHandle (main thread).
-pub type AsyncResourceOwners = Arc<std::sync::Mutex<HashMap<u64, String>>>;
 
 /// Plugin event handler registry shared between the plugin thread (which
 /// reads + mutates on `on` / `off` / `emit` / `cleanup_plugin`) and the
@@ -766,7 +1086,7 @@ pub struct JsEditorApi {
     #[qjs(skip_trace)]
     state_snapshot: Arc<RwLock<EditorStateSnapshot>>,
     #[qjs(skip_trace)]
-    command_sender: mpsc::Sender<PluginCommand>,
+    command_sender: PluginCommandSender,
     #[qjs(skip_trace)]
     registered_actions: Rc<RefCell<HashMap<String, PluginHandler>>>,
     #[qjs(skip_trace)]
@@ -774,7 +1094,7 @@ pub struct JsEditorApi {
     #[qjs(skip_trace)]
     next_request_id: Rc<RefCell<u64>>,
     #[qjs(skip_trace)]
-    callback_contexts: Rc<RefCell<HashMap<u64, String>>>,
+    callback_contexts: Rc<RefCell<HashMap<u64, CallbackOwner>>>,
     #[qjs(skip_trace)]
     services: Arc<dyn fresh_core::services::PluginServiceBridge>,
     #[qjs(skip_trace)]
@@ -809,11 +1129,20 @@ pub struct JsEditorApi {
     /// same Runtime so init.ts can reach another plugin's typed API.
     #[qjs(skip_trace)]
     plugin_api_exports: PluginApiExports,
+    #[qjs(skip_trace)]
+    plugin_api_calls: PluginApiCalls,
+    #[qjs(skip_trace)]
+    plugin_api_settlements: PluginApiSettlements,
     /// Streaming-search handle registry. Shared with the editor thread so
     /// host searcher tasks write into the same `SearchHandleState` the JS
     /// side drains via `_searchHandleTake`.
     #[qjs(skip_trace)]
     search_handles: SearchHandleRegistry,
+    #[qjs(skip_trace)]
+    window_scope: Option<fresh_core::WindowId>,
+    #[qjs(skip_trace)]
+    plugin_context: PluginCommandContext,
+    #[qjs(skip_trace)]
     pub plugin_name: String,
 }
 
@@ -1000,29 +1329,124 @@ fn check_range<'js>(
 // Internal helpers used by the macro-processed `impl JsEditorApi` below.
 // Kept in a plain impl block so they don't get exported as JS methods.
 impl JsEditorApi {
-    /// The filesystem a plugin path resolves against: the local editor host for
-    /// a `LocalPath`, or a window's authority (a specific window, or the active
-    /// one for a bare string) otherwise.
+    fn command_window(&self) -> fresh_core::WindowId {
+        self.window_scope
+            .or_else(|| {
+                self.command_sender
+                    .current_invocation
+                    .borrow()
+                    .as_ref()
+                    .map(|invocation| invocation.window_id)
+            })
+            .unwrap_or_else(|| {
+                self.state_snapshot
+                    .read()
+                    .map(|snapshot| snapshot.active_window_id)
+                    .unwrap_or(fresh_core::WindowId(1))
+            })
+    }
+
+    fn track_async_request(&self, request_id: u64, window_id: fresh_core::WindowId) {
+        if let Ok(mut owners) = self.async_resource_owners.lock() {
+            owners.insert(
+                request_id,
+                AsyncResourceOwner {
+                    plugin_name: self.plugin_name.clone(),
+                    plugin_instance_id: self.plugin_context.plugin_instance_id,
+                    context: self.command_sender.context_for(Some(window_id)),
+                },
+            );
+        }
+    }
+
+    fn forget_async_request(&self, request_id: u64) {
+        if let Ok(mut owners) = self.async_resource_owners.lock() {
+            owners.remove(&request_id);
+        }
+        self.callback_contexts.borrow_mut().remove(&request_id);
+    }
+
+    fn require_trusted_terminal_options(
+        &self,
+        companion: Option<fresh_core::api::TerminalCompanion>,
+        allow_script: bool,
+        selected_agent: bool,
+    ) -> rquickjs::Result<()> {
+        if (companion.is_some() || allow_script || selected_agent)
+            && !self.plugin_context.is_trusted_orchestrator()
+        {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "terminal options",
+                "companion, allowScript, and selectedAgent require the trusted bundled Orchestrator",
+            ));
+        }
+        Ok(())
+    }
+    /// Resolve an authority path to one immutable window incarnation. Bare
+    /// paths inherit the invocation owner instead of consulting mutable focus;
+    /// the service bridge then binds a concrete backend for the whole call.
+    fn authority_binding(
+        &self,
+        requested_window: Option<u64>,
+    ) -> Option<(Option<u64>, Option<fresh_core::api::AuthorityStamp>)> {
+        let invocation = self.command_sender.current_invocation.borrow();
+        let target = requested_window
+            .or(self.window_scope.map(|scope| scope.0))
+            .or_else(|| invocation.as_ref().map(|invocation| invocation.window_id.0));
+
+        if self
+            .window_scope
+            .is_some_and(|scope| target != Some(scope.0))
+        {
+            return None;
+        }
+        if invocation.as_ref().is_some_and(|invocation| {
+            target != Some(invocation.window_id.0) && !self.plugin_context.is_trusted_orchestrator()
+        }) {
+            return None;
+        }
+
+        let authority = invocation
+            .as_ref()
+            .filter(|invocation| target == Some(invocation.window_id.0))
+            .and_then(|invocation| invocation.authority)
+            .or_else(|| {
+                (target == self.plugin_context.source_window.map(|window| window.0))
+                    .then_some(self.plugin_context.source_authority)
+                    .flatten()
+            });
+        Some((target, authority))
+    }
+
     fn fs_for(
         &self,
         path: &fresh_core::api::PluginPath,
-    ) -> Arc<dyn fresh_core::services::PluginFilesystem> {
+    ) -> Option<Arc<dyn fresh_core::services::PluginFilesystem>> {
         match path {
-            fresh_core::api::PluginPath::Local(_) => self.services.local_filesystem(),
+            fresh_core::api::PluginPath::Local(_) => self
+                .window_scope
+                .is_none()
+                .then(|| self.services.local_filesystem()),
             fresh_core::api::PluginPath::Authority { window, .. } => {
-                self.services.authority_filesystem(*window)
+                let (target, authority) = self.authority_binding(*window)?;
+                Some(self.services.authority_filesystem(target, authority))
             }
         }
     }
 
-    /// Whether two plugin paths resolve to the same filesystem backend (so a
-    /// two-path op like rename/copy is well-defined). Cross-backend moves are
-    /// rejected rather than silently operating on one side.
-    fn same_backend(a: &fresh_core::api::PluginPath, b: &fresh_core::api::PluginPath) -> bool {
+    fn same_backend(
+        &self,
+        a: &fresh_core::api::PluginPath,
+        b: &fresh_core::api::PluginPath,
+    ) -> bool {
         use fresh_core::api::PluginPath::{Authority, Local};
         match (a, b) {
-            (Local(_), Local(_)) => true,
-            (Authority { window: wa, .. }, Authority { window: wb, .. }) => wa == wb,
+            (Local(_), Local(_)) => self.window_scope.is_none(),
+            (Authority { window: a, .. }, Authority { window: b, .. }) => self
+                .authority_binding(*a)
+                .zip(self.authority_binding(*b))
+                .is_some_and(|(a, b)| a == b),
             _ => false,
         }
     }
@@ -1097,7 +1521,7 @@ impl JsEditorApi {
     /// Get the plugin API version. Plugins can check this to verify
     /// the editor supports the features they need.
     pub fn api_version(&self) -> u32 {
-        2
+        3
     }
 
     /// The name of the plugin this `editor` handle belongs to. Used by the
@@ -1107,15 +1531,8 @@ impl JsEditorApi {
         self.plugin_name.clone()
     }
 
-    /// Publish a typed API surface under `name`. Another plugin (typically
-    /// `init.ts`) can reach it later via `getPluginApi(name)`. Calling
-    /// again with the same `name` replaces the previous registration
-    /// (idempotent — reload works). Exports are auto-dropped when the
-    /// calling plugin is unloaded.
-    ///
-    /// Returns `true` on success. Rejects with a TypeError if `name` is
-    /// empty or `api` is not an object (functions and primitives are not
-    /// valid API surfaces — only objects).
+    /// Publish a typed API surface under `name`. Scoped agent scripts cannot
+    /// export objects because their closures carry window authority.
     #[plugin_api(ts_return = "boolean")]
     pub fn export_plugin_api<'js>(
         &self,
@@ -1123,49 +1540,109 @@ impl JsEditorApi {
         name: String,
         api: rquickjs::Value<'js>,
     ) -> rquickjs::Result<bool> {
-        if name.is_empty() {
-            let msg =
-                rquickjs::String::from_str(ctx.clone(), "exportPluginApi: name must be non-empty")?;
-            return Err(ctx.throw(msg.into_value()));
+        if self.window_scope.is_some() {
+            return Ok(false);
         }
-        let obj = match api.as_object() {
-            Some(o) => o.clone(),
+        if name.is_empty() {
+            let message =
+                rquickjs::String::from_str(ctx.clone(), "exportPluginApi: name must be non-empty")?;
+            return Err(ctx.throw(message.into_value()));
+        }
+        let object = match api.as_object() {
+            Some(object) => object.clone(),
             None => {
-                let msg = rquickjs::String::from_str(
+                let message = rquickjs::String::from_str(
                     ctx.clone(),
                     "exportPluginApi: api must be an object",
                 )?;
-                return Err(ctx.throw(msg.into_value()));
+                return Err(ctx.throw(message.into_value()));
             }
         };
-        let persistent = rquickjs::Persistent::save(&ctx, obj);
-        self.plugin_api_exports
-            .borrow_mut()
-            .insert(name, (self.plugin_name.clone(), persistent));
+        let persistent = rquickjs::Persistent::save(&ctx, object);
+        self.plugin_api_exports.borrow_mut().insert(
+            name,
+            PluginApiExport {
+                exporter: self.plugin_context.clone(),
+                object: persistent,
+            },
+        );
         Ok(true)
     }
 
-    /// Look up a plugin API previously published via `exportPluginApi`.
-    /// Returns the api object (restored into the caller's context) or
-    /// `null` if no plugin exports under that name.
+    /// Return another plugin's API. Privileged built-ins are always exposed as
+    /// caller-realm host functions over structured-cloned data; their objects,
+    /// closures, Promises, and prototypes never cross a realm boundary.
     #[plugin_api(ts_return = "unknown | null")]
     pub fn get_plugin_api<'js>(
         &self,
         ctx: rquickjs::Ctx<'js>,
         name: String,
     ) -> rquickjs::Result<rquickjs::Value<'js>> {
-        let persistent = self
+        let export = self
             .plugin_api_exports
             .borrow()
             .get(&name)
-            .map(|(_exporter, p)| p.clone());
-        match persistent {
-            Some(p) => {
-                let restored = p.restore(&ctx)?;
-                Ok(restored.into_value())
+            .map(|export| (export.exporter.clone(), export.object.clone()));
+        let Some((exporter, persistent)) = export else {
+            return Ok(rquickjs::Value::new_null(ctx));
+        };
+
+        if name == "orchestrator" && exporter.is_trusted_orchestrator() {
+            let proxy = Object::new(ctx.clone())?;
+            proxy.set_prototype(None)?;
+            let methods: &[(&str, bool)] = if self.window_scope.is_some() {
+                &[("runAgent", true), ("newWorkspace", true)]
+            } else {
+                &[
+                    ("runAgent", true),
+                    ("newWorkspace", true),
+                    ("listWorkspaces", false),
+                    ("focusWorkspace", true),
+                ]
+            };
+            let caller_function_prototype = Function::prototype(ctx.clone());
+            for &(method, asynchronous) in methods {
+                let method: &'static str = match method {
+                    "runAgent" => "runAgent",
+                    "newWorkspace" => "newWorkspace",
+                    "listWorkspaces" => "listWorkspaces",
+                    "focusWorkspace" => "focusWorkspace",
+                    _ => unreachable!(),
+                };
+                let bridge = PrivilegedPluginApiMethod {
+                    method,
+                    asynchronous,
+                    append_window: self.window_scope.map(|scope| scope.0),
+                    exporter: exporter.clone(),
+                    object: persistent.clone(),
+                    caller: self.plugin_context.clone(),
+                    exports: Rc::clone(&self.plugin_api_exports),
+                    calls: Rc::clone(&self.plugin_api_calls),
+                    settlements: Rc::clone(&self.plugin_api_settlements),
+                    next_request_id: Rc::clone(&self.next_request_id),
+                    current_invocation: Rc::clone(&self.command_sender.current_invocation),
+                };
+                let caller_context = ctx.clone();
+                let function = Function::new(
+                    ctx.clone(),
+                    move |args: rquickjs::function::Rest<rquickjs::Value<'js>>|
+                          -> rquickjs::Result<rquickjs::Value<'js>> {
+                        bridge.invoke(caller_context.clone(), args)
+                    },
+                )?;
+                function.set_prototype(Some(&caller_function_prototype))?;
+                proxy.set(method, function)?;
             }
-            None => Ok(rquickjs::Value::new_null(ctx)),
+            let object_constructor: Object = ctx.globals().get("Object")?;
+            let freeze: Function = object_constructor.get("freeze")?;
+            let frozen: Object = freeze.call((proxy,))?;
+            return Ok(frozen.into_value());
         }
+
+        if self.window_scope.is_some() {
+            return Ok(rquickjs::Value::new_null(ctx));
+        }
+        Ok(persistent.restore(&ctx)?.into_value())
     }
 
     /// Get the active buffer ID (0 if none)
@@ -1473,6 +1950,9 @@ impl JsEditorApi {
 
     /// Execute a built-in action
     pub fn execute_action(&self, action_name: String) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::ExecuteAction { action_name })
             .is_ok()
@@ -1494,9 +1974,15 @@ impl JsEditorApi {
         output: Option<String>,
         error: Option<String>,
     ) -> bool {
+        let request_id = request_id as u64;
+        if self.plugin_context.is_agent_script()
+            && self.plugin_context.agent_script_request_id() != Some(request_id)
+        {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::CompleteCommand {
-                request_id: request_id as u64,
+                request_id,
                 ok,
                 output,
                 error,
@@ -1815,7 +2301,7 @@ impl JsEditorApi {
     #[plugin_api(
         async_promise,
         js_name = "getCompositeCursorInfo",
-        ts_return = "{ focusedPane: number, paneCount: number, lines: Array<number | null> } | null"
+        ts_return = "CompositeCursorInfo | null"
     )]
     #[qjs(rename = "_getCompositeCursorInfoStart")]
     pub fn get_composite_cursor_info_start(&self, _ctx: rquickjs::Ctx<'_>) -> u64 {
@@ -1961,10 +2447,17 @@ impl JsEditorApi {
         path: String,
         window_id: rquickjs::function::Opt<u64>,
     ) -> bool {
+        let requested = window_id.0.map(fresh_core::WindowId);
+        if self
+            .window_scope
+            .is_some_and(|scope| requested.is_some_and(|id| id != scope))
+        {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::OpenFileInBackground {
                 path: PathBuf::from(path),
-                window_id: window_id.0.map(fresh_core::WindowId),
+                window_id: requested.or(self.window_scope),
             })
             .is_ok()
     }
@@ -2143,9 +2636,14 @@ impl JsEditorApi {
         let mut id_ref = self.next_request_id.borrow_mut();
         let id = *id_ref;
         *id_ref += 1;
-        self.callback_contexts
-            .borrow_mut()
-            .insert(id, self.plugin_name.clone());
+        self.callback_contexts.borrow_mut().insert(
+            id,
+            CallbackOwner {
+                plugin_name: self.plugin_name.clone(),
+                plugin_instance_id: self.plugin_context.plugin_instance_id,
+                invocation: self.command_sender.current_invocation.borrow().clone(),
+            },
+        );
         id
     }
 
@@ -2208,6 +2706,14 @@ impl JsEditorApi {
 
     /// Subscribe to an editor event
     pub fn on<'js>(&self, _ctx: rquickjs::Ctx<'js>, event_name: String, handler_name: String) {
+        if !may_subscribe_to_event(&self.plugin_context, &event_name) {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                event = %event_name,
+                "rejected subscription to a private host event"
+            );
+            return;
+        }
         // If registering for lines_changed, clear all seen_byte_ranges so lines
         // that were already marked "seen" (before this plugin initialized) get
         // re-sent via the hook.
@@ -2227,13 +2733,18 @@ impl JsEditorApi {
 
     /// Unsubscribe from an event
     pub fn off(&self, event_name: String, handler_name: String) {
+        if !may_subscribe_to_event(&self.plugin_context, &event_name) {
+            return;
+        }
         if let Some(list) = self
             .event_handlers
             .write()
             .expect("event_handlers poisoned")
             .get_mut(&event_name)
         {
-            list.retain(|h| h.handler_name != handler_name);
+            list.retain(|handler| {
+                handler.plugin_name != self.plugin_name || handler.handler_name != handler_name
+            });
         }
     }
 
@@ -2454,18 +2965,29 @@ impl JsEditorApi {
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         path: fresh_core::api::PluginPath,
     ) -> bool {
-        self.fs_for(&path).exists(Path::new(path.as_str()))
+        self.fs_for(&path)
+            .is_some_and(|fs| fs.exists(Path::new(path.as_str())))
     }
 
-    /// Read file contents from the path's filesystem.
-    pub fn read_file(
+    /// Read file contents from the path's filesystem. Missing or non-UTF-8
+    /// files return JavaScript `null`, matching the public API contract.
+    #[plugin_api(ts_return = "string | null")]
+    pub fn read_file<'js>(
         &self,
+        ctx: rquickjs::Ctx<'js>,
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         path: fresh_core::api::PluginPath,
-    ) -> Option<String> {
-        self.fs_for(&path)
-            .read_file(Path::new(path.as_str()))
+    ) -> rquickjs::Result<Value<'js>> {
+        match self
+            .fs_for(&path)
+            .and_then(|fs| fs.read_file(Path::new(path.as_str())))
             .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(content) => rquickjs_serde::to_value(ctx, &content).map_err(|error| {
+                rquickjs::Error::new_from_js_message("serialize", "", &error.to_string())
+            }),
+            None => Ok(Value::new_null(ctx)),
+        }
     }
 
     /// Write file contents to the path's filesystem. Parent directories are
@@ -2477,10 +2999,10 @@ impl JsEditorApi {
         content: String,
     ) -> bool {
         self.fs_for(&path)
-            .write_file(Path::new(path.as_str()), content.as_bytes())
+            .is_some_and(|fs| fs.write_file(Path::new(path.as_str()), content.as_bytes()))
     }
 
-    /// Read directory contents (returns array of {name, is_file, is_dir})
+    /// Read directory contents (returns array of {name, is_file, is_dir}).
     #[plugin_api(ts_return = "DirEntry[]")]
     pub fn read_dir<'js>(
         &self,
@@ -2488,71 +3010,97 @@ impl JsEditorApi {
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         path: fresh_core::api::PluginPath,
     ) -> rquickjs::Result<Value<'js>> {
-        let entries = self.fs_for(&path).read_dir(Path::new(path.as_str()));
+        let entries = self
+            .fs_for(&path)
+            .map(|fs| fs.read_dir(Path::new(path.as_str())))
+            .unwrap_or_default();
         rquickjs_serde::to_value(ctx, &entries)
             .map_err(|e| rquickjs::Error::new_from_js_message("serialize", "", &e.to_string()))
     }
 
-    /// Create a directory (and all parent directories) recursively on the
-    /// path's filesystem. Returns true if the directory was created or already
-    /// exists.
+    /// Create a directory and all parent directories recursively.
     pub fn create_dir(
         &self,
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         path: fresh_core::api::PluginPath,
     ) -> bool {
-        self.fs_for(&path).create_dir_all(Path::new(path.as_str()))
+        self.fs_for(&path)
+            .is_some_and(|fs| fs.create_dir_all(Path::new(path.as_str())))
     }
 
-    /// Permanently remove a file or directory on the path's filesystem
-    /// (recursively for directories). For safety, the path must be under the OS
-    /// temp directory or the Fresh config directory. Returns true on success.
+    /// Permanently remove a file or directory below an approved root.
     pub fn remove_path(
         &self,
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         path: fresh_core::api::PluginPath,
     ) -> bool {
-        let fs = self.fs_for(&path);
-        let target = match fs.canonicalize(Path::new(path.as_str())) {
-            Some(p) => p,
-            None => return false, // path doesn't exist or can't be resolved
+        let Some(fs) = self.fs_for(&path) else {
+            return false;
         };
-
-        // Canonicalize allowed roots through the same backend so path prefix
-        // comparisons are consistent (e.g. Windows extended-length paths).
+        let target = match fs.canonicalize(Path::new(path.as_str())) {
+            Some(path) => path,
+            None => return false,
+        };
         let temp_dir = fs
             .canonicalize(&std::env::temp_dir())
             .unwrap_or_else(std::env::temp_dir);
         let config_dir = fs
             .canonicalize(&self.services.config_dir())
             .unwrap_or_else(|| self.services.config_dir());
-
-        // Verify the path is under an allowed root (temp or config dir)
-        let allowed = target.starts_with(&temp_dir) || target.starts_with(&config_dir);
-        if !allowed {
-            tracing::warn!(
-                "removePath refused: {:?} is not under temp dir ({:?}) or config dir ({:?})",
-                target,
-                temp_dir,
-                config_dir
-            );
+        let data_dir = fs
+            .canonicalize(&self.services.data_dir())
+            .unwrap_or_else(|| self.services.data_dir());
+        let allowed = target.starts_with(&temp_dir)
+            || target.starts_with(&config_dir)
+            || target.starts_with(&data_dir);
+        if !allowed || target == temp_dir || target == config_dir || target == data_dir {
             return false;
         }
-
-        // Don't allow removing the root directories themselves
-        if target == temp_dir || target == config_dir {
-            tracing::warn!(
-                "removePath refused: cannot remove root directory {:?}",
-                target
-            );
-            return false;
-        }
-
         fs.remove_path(&target)
     }
+    /// Permanently remove one regular file beneath an exact window root.
+    /// Reserved for the trusted bundled Orchestrator; directories and paths
+    /// that escape through `..` or symlinks are refused after canonicalization.
+    #[plugin_api(js_name = "removeFileTo")]
+    pub fn remove_file_to(&self, window_id: u64, path: String) -> bool {
+        if !self.plugin_context.is_trusted_orchestrator() {
+            return false;
+        }
+        let window_id = fresh_core::WindowId(window_id);
+        let root = self.state_snapshot.read().ok().and_then(|snapshot| {
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.id == window_id)
+                .map(|window| window.root.clone())
+        });
+        let Some(root) = root else {
+            return false;
+        };
+        let Some((window, authority)) = self.authority_binding(Some(window_id.0)) else {
+            return false;
+        };
+        let fs = self.services.authority_filesystem(window, authority);
+        let Some(root) = fs.canonicalize(&root) else {
+            return false;
+        };
+        let requested = PathBuf::from(&path);
+        let windows_absolute = path.as_bytes().get(1) == Some(&b':') || path.starts_with("\\\\");
+        let candidate = if requested.is_absolute() || windows_absolute {
+            requested
+        } else {
+            root.join(requested)
+        };
+        let Some(target) = fs.canonicalize(&candidate) else {
+            return false;
+        };
+        target != root
+            && target.starts_with(&root)
+            && fs.stat(&target).is_some_and(|stat| stat.is_file)
+            && fs.remove_path(&target)
+    }
 
-    /// Rename/move a file or directory. Both paths must target the same
-    /// filesystem (a cross-backend move is rejected). Returns true on success.
+    /// Rename/move a file or directory within one filesystem backend.
     pub fn rename_path(
         &self,
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
@@ -2560,15 +3108,14 @@ impl JsEditorApi {
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         to: fresh_core::api::PluginPath,
     ) -> bool {
-        if !Self::same_backend(&from, &to) {
+        if !self.same_backend(&from, &to) {
             return false;
         }
         self.fs_for(&from)
-            .rename(Path::new(from.as_str()), Path::new(to.as_str()))
+            .is_some_and(|fs| fs.rename(Path::new(from.as_str()), Path::new(to.as_str())))
     }
 
-    /// Copy a file or directory recursively to a new location. Both paths must
-    /// target the same filesystem. Returns true on success.
+    /// Copy a file or directory recursively within one filesystem backend.
     pub fn copy_path(
         &self,
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
@@ -2576,16 +3123,15 @@ impl JsEditorApi {
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         to: fresh_core::api::PluginPath,
     ) -> bool {
-        if !Self::same_backend(&from, &to) {
+        if !self.same_backend(&from, &to) {
             return false;
         }
         self.fs_for(&from)
-            .copy(Path::new(from.as_str()), Path::new(to.as_str()))
+            .is_some_and(|fs| fs.copy(Path::new(from.as_str()), Path::new(to.as_str())))
     }
 
-    /// Construct a `LocalPath` — a path that always resolves on the local
-    /// editor host, regardless of the active window's authority. Use for
-    /// editor-owned state under the config/data dirs.
+    /// Construct a path that resolves on the local editor host. Scoped agent
+    /// scripts may construct one, but filesystem operations reject it.
     #[plugin_api(ts_return = "LocalPath")]
     pub fn local_path<'js>(
         &self,
@@ -2607,8 +3153,7 @@ impl JsEditorApi {
         .map_err(|e| rquickjs::Error::new_from_js_message("serialize", "", &e.to_string()))
     }
 
-    /// Construct a `WindowPath` — a path that resolves on a specific window's
-    /// authority filesystem, regardless of which window is focused.
+    /// Construct a path for one window's authority filesystem.
     #[plugin_api(ts_return = "WindowPath")]
     pub fn window_path<'js>(
         &self,
@@ -2616,6 +3161,13 @@ impl JsEditorApi {
         window_id: u64,
         path: String,
     ) -> rquickjs::Result<Value<'js>> {
+        if self.window_scope.is_some_and(|scope| scope.0 != window_id) {
+            return Err(rquickjs::Error::new_from_js_message(
+                "number",
+                "windowId",
+                "agent scripts cannot construct a path for another window",
+            ));
+        }
         #[derive(serde::Serialize)]
         struct WindowPathJs<'a> {
             kind: &'static str,
@@ -3456,12 +4008,14 @@ impl JsEditorApi {
         #[plugin_api(ts_type = "string | LocalPath | WindowPath | AuthorityPath")]
         path: fresh_core::api::PluginPath,
     ) -> rquickjs::Result<Value<'js>> {
-        let stat = self.fs_for(&path).stat(Path::new(path.as_str())).map(|s| {
-            serde_json::json!({
-                "isFile": s.is_file,
-                "isDir": s.is_dir,
-                "size": s.size,
-                "readonly": s.readonly,
+        let stat = self.fs_for(&path).and_then(|fs| {
+            fs.stat(Path::new(path.as_str())).map(|stat| {
+                serde_json::json!({
+                    "isFile": stat.is_file,
+                    "isDir": stat.is_dir,
+                    "size": stat.size,
+                    "readonly": stat.readonly,
+                })
             })
         });
         rquickjs_serde::to_value(ctx, &stat)
@@ -3479,9 +4033,7 @@ impl JsEditorApi {
 
     /// Kill a process by ID (alias for killBackgroundProcess)
     pub fn kill_process(&self, process_id: u64) -> bool {
-        self.command_sender
-            .send(PluginCommand::KillBackgroundProcess { process_id })
-            .is_ok()
+        self.kill_background_process(process_id)
     }
 
     // === Translation ===
@@ -3724,9 +4276,7 @@ impl JsEditorApi {
         let id = self.alloc_request_id();
 
         // Track request_id → plugin_name for async resource tracking
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
-        }
+        self.track_async_request(id, self.command_window());
         let _ = self
             .command_sender
             .send(PluginCommand::CreateCompositeBuffer {
@@ -5035,6 +5585,9 @@ impl JsEditorApi {
     /// Returns `false` only when the IPC channel to the editor is
     /// closed (editor is shutting down).
     pub fn create_window(&self, root: String, label: String) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::CreateWindow {
                 root: std::path::PathBuf::from(root),
@@ -5065,9 +5618,35 @@ impl JsEditorApi {
         let Some(id) = Self::window_id_arg(id, "setActiveWindow") else {
             return false;
         };
+        if self.window_scope.is_some_and(|scope| scope != id) {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::SetActiveWindow { id })
             .is_ok()
+    }
+
+    /// Make a session active and resolve after the editor applies the switch.
+    /// Returns false when the window no longer exists. Prefer this over
+    /// `setActiveWindow` when subsequent work depends on the target being active.
+    #[plugin_api(async_promise, js_name = "activateWindow", ts_return = "boolean")]
+    #[qjs(rename = "_activateWindowStart")]
+    pub fn activate_window_start(&self, id: i64) -> rquickjs::Result<u64> {
+        let Some(id) = Self::window_id_arg(id, "activateWindow") else {
+            return Err(rquickjs::Error::new_from_js_message(
+                "window",
+                "activateWindow",
+                "window id must be positive",
+            ));
+        };
+        let request_id = self.alloc_request_id();
+        self.command_sender
+            .send(PluginCommand::ActivateWindow { id, request_id })
+            .map_err(|error| {
+                self.forget_async_request(request_id);
+                rquickjs::Error::new_from_js_message("channel", "editor", error.to_string())
+            })?;
+        Ok(request_id)
     }
 
     /// Validate a JS-supplied window id.
@@ -5099,6 +5678,9 @@ impl JsEditorApi {
         let Some(id) = Self::window_id_arg(id, "setActiveWindowAnimated") else {
             return false;
         };
+        if self.window_scope.is_some_and(|scope| scope != id) {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::SetActiveWindowAnimated { id, from_edge })
             .is_ok()
@@ -5110,6 +5692,9 @@ impl JsEditorApi {
     /// at cycle time. See `PluginCommand::SetWindowCycleOrder`.
     #[qjs(rename = "setWindowCycleOrder")]
     pub fn set_window_cycle_order(&self, ids: Vec<i64>) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::SetWindowCycleOrder {
                 ids: ids
@@ -5124,6 +5709,9 @@ impl JsEditorApi {
     /// Close session `id`. Refuses to close the active session or
     /// the base session (id 1). Logs and no-ops on failure.
     pub fn close_window(&self, id: u64) -> bool {
+        if self.window_scope.is_some_and(|scope| scope.0 != id) {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::CloseWindow {
                 id: fresh_core::WindowId(id),
@@ -5131,25 +5719,339 @@ impl JsEditorApi {
             .is_ok()
     }
 
-    /// Forget a directory's persisted workspace so a permanently deleted
-    /// or archived in-place session does not reappear on the next launch.
-    /// `closeWindow` only drops the live window — this removes the on-disk
-    /// registry file the session discovery would otherwise rediscover.
-    /// Call it *after* `closeWindow` for a session whose directory stays
-    /// on disk (a worktree-owning session is forgotten by removing its
-    /// worktree instead). No-op if nothing is persisted for `root`.
-    pub fn delete_workspace(&self, root: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::DeleteWorkspace {
+    /// Strictly inspect every host persistence file claiming `root`.
+    /// Reserved for the bundled unscoped Orchestrator because the returned
+    /// contents are host-local lifecycle data.
+    #[plugin_api(
+        async_promise,
+        js_name = "inspectWorkspacePersistence",
+        ts_return = "WorkspacePersistenceFile[]"
+    )]
+    #[qjs(rename = "_inspectWorkspacePersistenceStart")]
+    pub fn inspect_workspace_persistence_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        root: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "inspectWorkspacePersistence",
+                "only the bundled unscoped Orchestrator may inspect workspace persistence",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::InspectWorkspacePersistence {
                 root: PathBuf::from(root),
+                callback_id: JsCallbackId::from(id),
             })
-            .is_ok()
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Strictly locate one durable Orchestrator create effect. Inventory
+    /// failures resolve as an explicit `error` variant so recovery cannot
+    /// mistake unreadable or ambiguous persistence for absence.
+    #[plugin_api(
+        async_promise,
+        js_name = "inspectWorkspaceCreateAttempt",
+        ts_return = "WorkspaceCreateAttemptInventory"
+    )]
+    #[qjs(rename = "_inspectWorkspaceCreateAttemptStart")]
+    pub fn inspect_workspace_create_attempt_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        attempt_id: String,
+        #[plugin_api(ts_type = "string | null")] root_hint: Option<String>,
+        #[plugin_api(ts_type = "string | null")] workspace_id_hint: Option<String>,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "inspectWorkspaceCreateAttempt",
+                "only the bundled unscoped Orchestrator may inspect workspace create attempts",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::InspectWorkspaceCreateAttempt {
+                attempt_id,
+                root_hint: root_hint.map(PathBuf::from),
+                workspace_id_hint,
+                callback_id: JsCallbackId::from(id),
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Durably forget one exact workspace identity, or every identity at the
+    /// root when `stableId` is null. Promise resolution is the host ack.
+    #[plugin_api(
+        async_promise,
+        js_name = "forgetWorkspacePersistence",
+        ts_return = "void"
+    )]
+    #[qjs(rename = "_forgetWorkspacePersistenceStart")]
+    pub fn forget_workspace_persistence_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        root: String,
+        #[plugin_api(ts_type = "string | null")] stable_id: Option<String>,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "forgetWorkspacePersistence",
+                "only the bundled unscoped Orchestrator may forget workspace persistence",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::ForgetWorkspacePersistence {
+                root: PathBuf::from(root),
+                stable_id,
+                callback_id: JsCallbackId::from(id),
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Hold a host-wide interprocess fence for one workspace root until the
+    /// durable lifecycle attempt explicitly releases it.
+    #[plugin_api(
+        async_promise,
+        js_name = "acquireWorkspaceRootOwnership",
+        ts_return = "void"
+    )]
+    #[qjs(rename = "_acquireWorkspaceRootOwnershipStart")]
+    pub fn acquire_workspace_root_ownership_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        root: String,
+        owner_id: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "acquireWorkspaceRootOwnership",
+                "only the bundled unscoped Orchestrator may own workspace roots",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::AcquireWorkspaceRootOwnership {
+                root: PathBuf::from(root),
+                owner_id,
+                callback_id: JsCallbackId::from(id),
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Release a lifecycle root fence after its terminal outcome is durable.
+    #[plugin_api(
+        async_promise,
+        js_name = "releaseWorkspaceRootOwnership",
+        ts_return = "void"
+    )]
+    #[qjs(rename = "_releaseWorkspaceRootOwnershipStart")]
+    pub fn release_workspace_root_ownership_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        owner_id: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "releaseWorkspaceRootOwnership",
+                "only the bundled unscoped Orchestrator may own workspace roots",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::ReleaseWorkspaceRootOwnership {
+                owner_id,
+                callback_id: JsCallbackId::from(id),
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Stage one exact terminal-artifact namespace under a durable attempt id.
+    #[plugin_api(
+        async_promise,
+        js_name = "quarantineWorkspaceArtifacts",
+        ts_return = "void"
+    )]
+    #[qjs(rename = "_quarantineWorkspaceArtifactsStart")]
+    pub fn quarantine_workspace_artifacts_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        root: String,
+        #[plugin_api(ts_type = "string | null")] stable_id: Option<String>,
+        owner_id: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "quarantineWorkspaceArtifacts",
+                "only the bundled unscoped Orchestrator may quarantine workspace artifacts",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::QuarantineWorkspaceArtifacts {
+                root: PathBuf::from(root),
+                stable_id,
+                owner_id,
+                callback_id: JsCallbackId::from(id),
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Restore a staged artifact namespace at the supplied current root.
+    #[plugin_api(
+        async_promise,
+        js_name = "restoreWorkspaceArtifacts",
+        ts_return = "void"
+    )]
+    #[qjs(rename = "_restoreWorkspaceArtifactsStart")]
+    pub fn restore_workspace_artifacts_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        target_root: String,
+        #[plugin_api(ts_type = "string | null")] stable_id: Option<String>,
+        owner_id: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "restoreWorkspaceArtifacts",
+                "only the bundled unscoped Orchestrator may restore workspace artifacts",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::RestoreWorkspaceArtifacts {
+                target_root: PathBuf::from(target_root),
+                stable_id,
+                owner_id,
+                callback_id: JsCallbackId::from(id),
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Permanently remove a staged namespace after committed Delete.
+    #[plugin_api(
+        async_promise,
+        js_name = "purgeWorkspaceArtifactQuarantine",
+        ts_return = "void"
+    )]
+    #[qjs(rename = "_purgeWorkspaceArtifactQuarantineStart")]
+    pub fn purge_workspace_artifact_quarantine_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        owner_id: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "purgeWorkspaceArtifactQuarantine",
+                "only the bundled unscoped Orchestrator may purge workspace artifacts",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) =
+            self.command_sender
+                .send(PluginCommand::PurgeWorkspaceArtifactQuarantine {
+                    owner_id,
+                    callback_id: JsCallbackId::from(id),
+                })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
     }
 
     /// Eagerly initialise an inactive session's per-session state
     /// (file tree walk, ignore matcher, etc.) without diving.
     /// No-op for the active session or unknown id.
     pub fn prewarm_window(&self, id: u64) -> bool {
+        if self.window_scope.is_some_and(|scope| scope.0 != id) {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::PrewarmWindow {
                 id: fresh_core::WindowId(id),
@@ -5177,9 +6079,7 @@ impl JsEditorApi {
         recursive: rquickjs::function::Opt<bool>,
     ) -> rquickjs::Result<u64> {
         let id = self.alloc_request_id();
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
-        }
+        self.track_async_request(id, self.command_window());
         let _ = self.command_sender.send(PluginCommand::WatchPath {
             path: std::path::PathBuf::from(path),
             recursive: recursive.0.unwrap_or(false),
@@ -5207,6 +6107,9 @@ impl JsEditorApi {
     /// editor UI live — splits, terminals, syntax highlighting,
     /// decorations — at native rendering cost.
     pub fn preview_window_in_rect(&self, id: u64) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
         let sid = if id == 0 {
             None
         } else {
@@ -5220,6 +6123,9 @@ impl JsEditorApi {
     /// Clear the session-preview override. Equivalent to
     /// `previewWindowInRect(0)` but reads better at call sites.
     pub fn clear_window_preview(&self) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::PreviewWindowInRect { id: None })
             .is_ok()
@@ -5232,7 +6138,14 @@ impl JsEditorApi {
         let sessions: Vec<fresh_core::api::WindowInfo> = self
             .state_snapshot
             .read()
-            .map(|s| s.windows.clone())
+            .map(|snapshot| {
+                snapshot
+                    .windows
+                    .iter()
+                    .filter(|window| self.window_scope.map_or(true, |scope| window.id == scope))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         rquickjs_serde::to_value(ctx, &sessions).map_err(|e| {
             rquickjs::Error::new_from_js_message("serialize", "WindowInfo", &e.to_string())
@@ -5242,10 +6155,15 @@ impl JsEditorApi {
     /// The currently active session id. Always present in
     /// `listWindows()`.
     pub fn active_window(&self) -> u64 {
-        self.state_snapshot
-            .read()
-            .map(|s| s.active_window_id.0)
-            .unwrap_or(1)
+        self.window_scope.map_or_else(
+            || {
+                self.state_snapshot
+                    .read()
+                    .map(|snapshot| snapshot.active_window_id.0)
+                    .unwrap_or(1)
+            },
+            |scope| scope.0,
+        )
     }
 
     /// Set the scroll position of a split.
@@ -5832,58 +6750,73 @@ impl JsEditorApi {
         Ok(Value::new_undefined(ctx.clone()))
     }
 
-    /// Set per-session state on the **active** session. Same
-    /// shape as `setGlobalState` (write-through to snapshot +
-    /// dispatched to editor; null/undefined deletes), but the
-    /// underlying storage lives on `Session.plugin_state` and
-    /// swaps with the rest of session state on `setActiveWindow`.
-    /// Plugins that genuinely want per-project state use this;
-    /// Orchestrator itself uses `setGlobalState` because its session
-    /// list lives above session boundaries.
+    /// Set plugin-owned state on the window captured at this API invocation.
     pub fn set_window_state<'js>(
         &self,
         ctx: rquickjs::Ctx<'js>,
         key: String,
         value: Value<'js>,
     ) -> bool {
+        self.set_window_state_to(ctx, self.command_window().0, key, value)
+    }
+
+    /// Set plugin-owned state on one exact window. Scoped agent scripts may
+    /// address only their own immutable window.
+    pub fn set_window_state_to<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+        window_id: u64,
+        key: String,
+        value: Value<'js>,
+    ) -> bool {
+        let window_id = fresh_core::WindowId(window_id);
+        if self.window_scope.is_some_and(|scope| scope != window_id) {
+            return false;
+        }
         let json_value = if value.is_undefined() || value.is_null() {
             None
         } else {
             Some(js_to_json(&ctx, value))
         };
-        // Write-through to snapshot's active-session map so the
-        // very next getWindowState observes our write without
-        // waiting for a tick.
+
+        // Write through only when the runtime snapshot represents this exact
+        // target. Inactive-window state becomes observable on the next host tick.
         if let Ok(mut snapshot) = self.state_snapshot.write() {
-            match &json_value {
-                Some(v) => {
-                    snapshot
-                        .active_session_plugin_states
-                        .entry(self.plugin_name.clone())
-                        .or_default()
-                        .insert(key.clone(), v.clone());
-                }
-                None => {
-                    if let Some(map) = snapshot
-                        .active_session_plugin_states
-                        .get_mut(&self.plugin_name)
-                    {
-                        map.remove(&key);
-                        if map.is_empty() {
-                            snapshot
-                                .active_session_plugin_states
-                                .remove(&self.plugin_name);
+            if snapshot.active_window_id == window_id {
+                match &json_value {
+                    Some(value) => {
+                        snapshot
+                            .active_session_plugin_states
+                            .entry(self.plugin_name.clone())
+                            .or_default()
+                            .insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        if let Some(map) = snapshot
+                            .active_session_plugin_states
+                            .get_mut(&self.plugin_name)
+                        {
+                            map.remove(&key);
+                            if map.is_empty() {
+                                snapshot
+                                    .active_session_plugin_states
+                                    .remove(&self.plugin_name);
+                            }
                         }
                     }
                 }
             }
         }
+
         self.command_sender
-            .send(PluginCommand::SetWindowState {
-                plugin_name: self.plugin_name.clone(),
-                key,
-                value: json_value,
-            })
+            .send_to(
+                window_id,
+                PluginCommand::SetWindowState {
+                    window_id,
+                    key,
+                    value: json_value,
+                },
+            )
             .is_ok()
     }
 
@@ -5964,6 +6897,9 @@ impl JsEditorApi {
     ///
     /// Takes typed ActionSpec array - serde validates field names at runtime
     pub fn execute_actions(&self, actions: Vec<ActionSpec>) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::ExecuteActions { actions })
             .is_ok()
@@ -6109,14 +7045,17 @@ impl JsEditorApi {
 
     /// Get registered event handlers for an event
     pub fn get_handlers(&self, event_name: String) -> Vec<String> {
+        if !may_subscribe_to_event(&self.plugin_context, &event_name) {
+            return Vec::new();
+        }
         self.event_handlers
             .read()
             .expect("event_handlers poisoned")
             .get(&event_name)
-            .cloned()
-            .unwrap_or_default()
             .into_iter()
-            .map(|h| h.handler_name)
+            .flatten()
+            .filter(|handler| handler.plugin_name == self.plugin_name)
+            .map(|handler| handler.handler_name.clone())
             .collect()
     }
 
@@ -6139,9 +7078,7 @@ impl JsEditorApi {
         let entries = initial_entries(opts.entries.take());
 
         // Track request_id → plugin_name for async resource tracking
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
-        }
+        self.track_async_request(id, self.command_window());
 
         // An explicit `splitId` means "put it there", which is the
         // existing-split path. Without this the option was accepted and
@@ -6207,9 +7144,7 @@ impl JsEditorApi {
         let entries = initial_entries(opts.entries.take());
 
         // Track request_id → plugin_name for async resource tracking
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
-        }
+        self.track_async_request(id, self.command_window());
         let _ = self
             .command_sender
             .send(PluginCommand::CreateVirtualBufferInSplit {
@@ -6249,9 +7184,7 @@ impl JsEditorApi {
         let entries = initial_entries(opts.entries.take());
 
         // Track request_id → plugin_name for async resource tracking
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
-        }
+        self.track_async_request(id, self.command_window());
         let _ = self
             .command_sender
             .send(PluginCommand::CreateVirtualBufferInExistingSplit {
@@ -6280,9 +7213,7 @@ impl JsEditorApi {
         layout_json: String,
     ) -> rquickjs::Result<u64> {
         let id = self.alloc_request_id();
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
-        }
+        self.track_async_request(id, self.command_window());
         let _ = self.command_sender.send(PluginCommand::CreateBufferGroup {
             name,
             mode,
@@ -6719,13 +7650,18 @@ impl JsEditorApi {
             stdout_to_path,
             id
         );
-        let _ = self.command_sender.send(PluginCommand::SpawnProcess {
-            callback_id: JsCallbackId::new(id),
-            command,
-            args,
-            cwd: effective_cwd,
-            stdout_to: stdout_to_path,
-        });
+        let window_id = self.command_window();
+        let _ = self.command_sender.send_to(
+            window_id,
+            PluginCommand::SpawnProcess {
+                window_id,
+                callback_id: JsCallbackId::new(id),
+                command,
+                args,
+                cwd: effective_cwd,
+                stdout_to: stdout_to_path,
+            },
+        );
         id
     }
 
@@ -6747,21 +7683,55 @@ impl JsEditorApi {
         command: String,
         args: Vec<String>,
         cwd: rquickjs::function::Opt<String>,
-    ) -> u64 {
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "agent script",
+                "spawnHostProcess",
+                "agent scripts cannot spawn host processes",
+            ));
+        }
         let id = self.alloc_request_id();
+        let window_id = self.command_window();
+        self.plugin_tracked_state
+            .borrow_mut()
+            .entry(self.plugin_name.clone())
+            .or_default()
+            .host_process_ids
+            .push((window_id, id));
         let effective_cwd = cwd.0.or_else(|| {
             self.state_snapshot
                 .read()
                 .ok()
                 .map(|s| s.working_dir.to_string_lossy().to_string())
         });
-        let _ = self.command_sender.send(PluginCommand::SpawnHostProcess {
-            callback_id: JsCallbackId::new(id),
-            command,
-            args,
-            cwd: effective_cwd,
-        });
-        id
+        if let Err(error) = self.command_sender.send_to(
+            window_id,
+            PluginCommand::SpawnHostProcess {
+                window_id,
+                callback_id: JsCallbackId::new(id),
+                command,
+                args,
+                cwd: effective_cwd,
+            },
+        ) {
+            if let Some(state) = self
+                .plugin_tracked_state
+                .borrow_mut()
+                .get_mut(&self.plugin_name)
+            {
+                state
+                    .host_process_ids
+                    .retain(|(_, owned_id)| *owned_id != id);
+            }
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
     }
 
     /// Cancel a host-side process started via `spawnHostProcess`.
@@ -6775,9 +7745,46 @@ impl JsEditorApi {
     /// wrapper.
     #[plugin_api(js_name = "_killHostProcess")]
     pub fn kill_host_process(&self, process_id: u64) -> bool {
-        self.command_sender
-            .send(PluginCommand::KillHostProcess { process_id })
-            .is_ok()
+        if self.window_scope.is_some() {
+            return false;
+        }
+        let window_id = self
+            .plugin_tracked_state
+            .borrow()
+            .get(&self.plugin_name)
+            .and_then(|state| {
+                state
+                    .host_process_ids
+                    .iter()
+                    .find_map(|(window_id, owned_id)| {
+                        (*owned_id == process_id).then_some(*window_id)
+                    })
+            });
+        let Some(window_id) = window_id else {
+            return false;
+        };
+        let sent = self
+            .command_sender
+            .send_to(
+                window_id,
+                PluginCommand::KillHostProcess {
+                    window_id,
+                    process_id,
+                },
+            )
+            .is_ok();
+        if sent {
+            if let Some(state) = self
+                .plugin_tracked_state
+                .borrow_mut()
+                .get_mut(&self.plugin_name)
+            {
+                state
+                    .host_process_ids
+                    .retain(|(_, owned_id)| *owned_id != process_id);
+            }
+        }
+        sent
     }
 
     /// Install a new authority via an opaque payload.
@@ -6794,18 +7801,33 @@ impl JsEditorApi {
         ctx: rquickjs::Ctx<'_>,
         #[plugin_api(ts_type = "AuthorityPayload")] payload: rquickjs::Value<'_>,
     ) -> bool {
+        if self.window_scope.is_some() {
+            return false;
+        }
+        let window_id = self.command_window();
         let json = js_to_json(&ctx, payload);
-        let _ = self
-            .command_sender
-            .send(PluginCommand::SetAuthority { payload: json });
-        true
+        self.command_sender
+            .send_to(
+                window_id,
+                PluginCommand::SetAuthority {
+                    window_id,
+                    payload: json,
+                },
+            )
+            .is_ok()
     }
 
     /// Restore the default local authority. Same restart semantics as
     /// `setAuthority`.
     #[plugin_api(js_name = "clearAuthority")]
     pub fn clear_authority(&self) {
-        let _ = self.command_sender.send(PluginCommand::ClearAuthority);
+        if self.window_scope.is_some() {
+            return;
+        }
+        let window_id = self.command_window();
+        let _ = self
+            .command_sender
+            .send_to(window_id, PluginCommand::ClearAuthority { window_id });
     }
 
     /// Attach to a remote agent that needs a live connection (an SSH host or a
@@ -6814,38 +7836,59 @@ impl JsEditorApi {
     /// session in the background — and this returns a promise that settles on
     /// the real outcome:
     ///
-    ///   * resolves once the session (authority + window) is fully
-    ///     constructed, so a caller can keep its dialog open until there is a
-    ///     real session to show;
+    ///   * resolves with the exact born window identity once the session
+    ///     (authority + window) is fully constructed;
     ///   * rejects with the failure reason (e.g. ssh "Could not resolve
     ///     hostname") if the connect or window creation fails — in which case
     ///     no window is created and the editor stays on its current authority.
     ///
     /// The payload schema (`RemoteAgentSpec`) lives in `fresh-editor`;
     /// plugins hand-build an object matching it.
-    #[plugin_api(async_promise, js_name = "attachRemoteAgent", ts_return = "void")]
+    #[plugin_api(js_name = "attachRemoteAgent", ts_return = "RemoteAttachRequest")]
     #[qjs(rename = "_attachRemoteAgentStart")]
     pub fn attach_remote_agent(
         &self,
         ctx: rquickjs::Ctx<'_>,
         #[plugin_api(ts_type = "RemoteAgentSpec")] payload: rquickjs::Value<'_>,
-    ) -> u64 {
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "object",
+                "RemoteAgentSpec",
+                "agent scripts cannot attach remote windows",
+            ));
+        }
         let json = js_to_json(&ctx, payload);
         let id = self.alloc_request_id();
-        let _ = self.command_sender.send(PluginCommand::AttachRemoteAgent {
-            payload: json,
-            request_id: id,
-        });
-        id
+        let window_id = self.command_window();
+        self.track_async_request(id, window_id);
+        if let Err(error) = self.command_sender.send_to(
+            window_id,
+            PluginCommand::AttachRemoteAgent {
+                window_id,
+                payload: json,
+                request_id: id,
+            },
+        ) {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
     }
 
-    /// Cancel any in-flight `attachRemoteAgent` connect — the New-Session
-    /// dialog's Cancel. The pending promise rejects with "cancelled" and the
-    /// background connect's late result is discarded, so no window is built.
-    /// A no-op when nothing is connecting.
+    /// Cancel one caller-owned in-flight `attachRemoteAgent` request.
     #[plugin_api(js_name = "cancelRemoteAgent")]
-    pub fn cancel_remote_agent(&self) {
-        let _ = self.command_sender.send(PluginCommand::CancelRemoteAttach);
+    pub fn cancel_remote_agent(&self, request_id: u64) {
+        if self.window_scope.is_some() {
+            return;
+        }
+        let _ = self
+            .command_sender
+            .send(PluginCommand::CancelRemoteAttach { request_id });
     }
 
     /// Activate an environment: set the live env recipe (`snippet` run in
@@ -6853,15 +7896,30 @@ impl JsEditorApi {
     /// Honored only when the workspace is Trusted.
     #[plugin_api(js_name = "setEnv")]
     pub fn set_env(&self, snippet: String, dir: Option<String>) {
-        let _ = self
-            .command_sender
-            .send(PluginCommand::SetEnv { snippet, dir });
+        if self.window_scope.is_some() {
+            return;
+        }
+        let window_id = self.command_window();
+        let _ = self.command_sender.send_to(
+            window_id,
+            PluginCommand::SetEnv {
+                window_id,
+                snippet,
+                dir,
+            },
+        );
     }
 
     /// Deactivate the environment — spawns return to the inherited env.
     #[plugin_api(js_name = "clearEnv")]
     pub fn clear_env(&self) {
-        let _ = self.command_sender.send(PluginCommand::ClearEnv);
+        if self.window_scope.is_some() {
+            return;
+        }
+        let window_id = self.command_window();
+        let _ = self
+            .command_sender
+            .send_to(window_id, PluginCommand::ClearEnv { window_id });
     }
 
     /// Override the Remote Indicator's displayed state. Plugins call
@@ -6887,20 +7945,28 @@ impl JsEditorApi {
         ctx: rquickjs::Ctx<'_>,
         #[plugin_api(ts_type = "RemoteIndicatorStatePayload")] state: rquickjs::Value<'_>,
     ) -> bool {
+        let window_id = self.command_window();
         let json = js_to_json(&ctx, state);
-        let _ = self
-            .command_sender
-            .send(PluginCommand::SetRemoteIndicatorState { state: json });
-        true
+        self.command_sender
+            .send_to(
+                window_id,
+                PluginCommand::SetRemoteIndicatorState {
+                    window_id,
+                    state: json,
+                },
+            )
+            .is_ok()
     }
 
     /// Drop any active Remote Indicator override. Safe to call even
     /// without a prior `setRemoteIndicatorState`.
     #[plugin_api(js_name = "clearRemoteIndicatorState")]
     pub fn clear_remote_indicator_state(&self) {
-        let _ = self
-            .command_sender
-            .send(PluginCommand::ClearRemoteIndicatorState);
+        let window_id = self.command_window();
+        let _ = self.command_sender.send_to(
+            window_id,
+            PluginCommand::ClearRemoteIndicatorState { window_id },
+        );
     }
 
     /// Fetch a URL over HTTP(S) and stream the response body into `target_path`.
@@ -6942,10 +8008,15 @@ impl JsEditorApi {
     #[qjs(rename = "_spawnProcessWaitStart")]
     pub fn spawn_process_wait_start(&self, _ctx: rquickjs::Ctx<'_>, process_id: u64) -> u64 {
         let id = self.alloc_request_id();
-        let _ = self.command_sender.send(PluginCommand::SpawnProcessWait {
-            process_id,
-            callback_id: JsCallbackId::new(id),
-        });
+        let window_id = self.command_window();
+        let _ = self.command_sender.send_to(
+            window_id,
+            PluginCommand::SpawnProcessWait {
+                window_id,
+                process_id,
+                callback_id: JsCallbackId::new(id),
+            },
+        );
         id
     }
 
@@ -7479,7 +8550,7 @@ impl JsEditorApi {
         Ok(id)
     }
 
-    /// Spawn a background process (async, returns request_id which is also process_id)
+    /// Spawn a background process under the window captured at invocation.
     #[plugin_api(
         async_thenable,
         js_name = "spawnBackgroundProcess",
@@ -7494,38 +8565,71 @@ impl JsEditorApi {
         cwd: rquickjs::function::Opt<String>,
     ) -> u64 {
         let id = self.alloc_request_id();
-        // Use id as process_id for simplicity
-        let process_id = id;
-        // Track process ID for cleanup on unload
+        let window_id = self.command_window();
         self.plugin_tracked_state
             .borrow_mut()
             .entry(self.plugin_name.clone())
             .or_default()
             .background_process_ids
-            .push(process_id);
-        // Match `spawn_process_start`: empty-string cwd == omitted.
-        let _ = self
-            .command_sender
-            .send(PluginCommand::SpawnBackgroundProcess {
-                process_id,
+            .push((window_id, id));
+        let _ = self.command_sender.send_to(
+            window_id,
+            PluginCommand::SpawnBackgroundProcess {
+                window_id,
+                process_id: id,
                 command,
                 args,
                 cwd: cwd.0.filter(|s| !s.is_empty()),
                 callback_id: JsCallbackId::new(id),
-            });
+            },
+        );
         id
     }
 
-    /// Kill a background process
+    /// Kill a background process through its captured owner window.
     pub fn kill_background_process(&self, process_id: u64) -> bool {
-        self.command_sender
-            .send(PluginCommand::KillBackgroundProcess { process_id })
-            .is_ok()
+        let window_id = self
+            .plugin_tracked_state
+            .borrow()
+            .get(&self.plugin_name)
+            .and_then(|state| {
+                state
+                    .background_process_ids
+                    .iter()
+                    .find_map(|(window_id, owned_id)| {
+                        (*owned_id == process_id).then_some(*window_id)
+                    })
+            });
+        let Some(window_id) = window_id else {
+            return false;
+        };
+        let sent = self
+            .command_sender
+            .send_to(
+                window_id,
+                PluginCommand::KillBackgroundProcess {
+                    window_id,
+                    process_id,
+                },
+            )
+            .is_ok();
+        if sent {
+            if let Some(state) = self
+                .plugin_tracked_state
+                .borrow_mut()
+                .get_mut(&self.plugin_name)
+            {
+                state
+                    .background_process_ids
+                    .retain(|(_, owned_id)| *owned_id != process_id);
+            }
+        }
+        sent
     }
 
     // === Terminal ===
 
-    /// Create a new terminal in a split (async, returns TerminalResult)
+    /// Create a new terminal in one exact window.
     #[plugin_api(
         async_promise,
         js_name = "createTerminal",
@@ -7537,8 +8641,6 @@ impl JsEditorApi {
         _ctx: rquickjs::Ctx<'_>,
         opts: rquickjs::function::Opt<fresh_core::api::CreateTerminalOptions>,
     ) -> rquickjs::Result<u64> {
-        let id = self.alloc_request_id();
-
         let opts = opts.0.unwrap_or(fresh_core::api::CreateTerminalOptions {
             cwd: None,
             direction: None,
@@ -7547,41 +8649,58 @@ impl JsEditorApi {
             persistent: None,
             window_id: None,
             command: None,
+            relaunch: None,
             title: None,
             resume: None,
             env: None,
             allow_script: None,
+            companion: None,
+            selected_agent: None,
         });
-
-        // Track request_id → plugin_name for async resource tracking
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
+        let window_id = opts.window_id.unwrap_or_else(|| self.command_window());
+        if self.window_scope.is_some_and(|scope| scope != window_id) {
+            return Err(rquickjs::Error::new_from_js_message(
+                "number",
+                "windowId",
+                "agent scripts cannot create terminals in another window",
+            ));
         }
-        let _ = self.command_sender.send(PluginCommand::CreateTerminal {
-            cwd: opts.cwd,
-            direction: opts.direction,
-            ratio: opts.ratio,
-            focus: opts.focus,
-            window_id: opts.window_id,
-            // Plugin-created terminals default to ephemeral. Opt in explicitly
-            // by passing `persistent: true` in the options if the plugin wants
-            // the terminal to survive workspace save/restore.
-            persistent: opts.persistent.unwrap_or(false),
-            command: opts.command,
-            title: opts.title,
-            resume: opts.resume,
-            env: opts.env,
-            allow_script: opts.allow_script.unwrap_or(false),
-            request_id: id,
-        });
+        let allow_script = opts.allow_script.unwrap_or(false);
+        let selected_agent = opts.selected_agent.unwrap_or(false);
+        self.require_trusted_terminal_options(opts.companion, allow_script, selected_agent)?;
+
+        let id = self.alloc_request_id();
+        if let Err(error) = self.command_sender.send_to(
+            window_id,
+            PluginCommand::CreateTerminal {
+                cwd: opts.cwd,
+                direction: opts.direction,
+                ratio: opts.ratio,
+                focus: opts.focus,
+                persistent: opts.persistent.unwrap_or(false),
+                window_id,
+                command: opts.command,
+                relaunch: opts.relaunch,
+                title: opts.title,
+                resume: opts.resume,
+                env: opts.env,
+                companion: opts.companion,
+                allow_script,
+                selected_agent,
+                request_id: id,
+            },
+        ) {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
         Ok(id)
     }
 
-    /// Create a new editor window seeded with an agent terminal as
-    /// its only buffer. Atomic — replaces the legacy
-    /// `createWindow` + `setActiveWindow` + `createTerminal`
-    /// chain that left a transient `[No Name]` tab alongside the
-    /// agent terminal.
+    /// Create a new editor window seeded with an agent terminal as its only buffer.
     #[plugin_api(
         async_promise,
         js_name = "createWindowWithTerminal",
@@ -7593,42 +8712,162 @@ impl JsEditorApi {
         _ctx: rquickjs::Ctx<'_>,
         opts: fresh_core::api::CreateWindowWithTerminalOptions,
     ) -> rquickjs::Result<u64> {
-        let id = self.alloc_request_id();
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.insert(id, self.plugin_name.clone());
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "object",
+                "CreateWindowWithTerminalOptions",
+                "agent scripts cannot create windows directly",
+            ));
         }
-        let _ = self
+        let allow_script = opts.allow_script.unwrap_or(false);
+        let selected_agent = opts.selected_agent.unwrap_or(false);
+        self.require_trusted_terminal_options(opts.companion, allow_script, selected_agent)?;
+        let id = self.alloc_request_id();
+        if let Err(error) = self
             .command_sender
             .send(PluginCommand::CreateWindowWithTerminal {
                 root: std::path::PathBuf::from(opts.root),
                 label: opts.label,
                 cwd: opts.cwd,
                 command: opts.command,
+                relaunch: opts.relaunch,
                 title: opts.title,
                 resume: opts.resume,
                 env: opts.env,
-                allow_script: opts.allow_script.unwrap_or(false),
+                companion: opts.companion,
+                allow_script,
+                selected_agent,
+                activate: opts.activate.unwrap_or(true),
+                initial_state: opts.initial_state.unwrap_or_default(),
                 request_id: id,
-            });
+            })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
         Ok(id)
     }
 
-    /// Send input data to a terminal
-    pub fn send_terminal_input(&self, terminal_id: u64, data: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::SendTerminalInput {
-                terminal_id: fresh_core::TerminalId(terminal_id as usize),
-                data,
+    /// Reopen one exact persisted workspace identity after lifecycle rollback.
+    #[plugin_api(
+        async_promise,
+        js_name = "restoreWorkspaceWindow",
+        ts_return = "{ windowId: number; stableId: string }"
+    )]
+    #[qjs(rename = "_restoreWorkspaceWindowStart")]
+    pub fn restore_workspace_window_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        root: String,
+        label: String,
+        #[plugin_api(ts_type = "string | null")] stable_id: Option<String>,
+        activate: bool,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() || !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "restoreWorkspaceWindow",
+                "only the bundled unscoped Orchestrator may restore workspace windows",
+            ));
+        }
+        let id = self.alloc_request_id();
+        self.track_async_request(id, self.command_window());
+        if let Err(error) = self
+            .command_sender
+            .send(PluginCommand::RestoreWorkspaceWindow {
+                root: std::path::PathBuf::from(root),
+                label,
+                stable_id,
+                activate,
+                callback_id: JsCallbackId::from(id),
             })
+        {
+            self.forget_async_request(id);
+            return Err(rquickjs::Error::new_from_js_message(
+                "channel",
+                "editor",
+                error.to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Send a closed-set command to an exact live OMP companion terminal.
+    #[plugin_api(
+        async_promise,
+        js_name = "sendOmpCompanionCommand",
+        ts_return = "boolean"
+    )]
+    #[qjs(rename = "_sendOmpCompanionCommandStart")]
+    pub fn send_omp_companion_command_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        terminal_id: fresh_core::WindowTerminalId,
+        type_: fresh_core::api::OmpCompanionCommandType,
+        target: fresh_core::api::OmpCompanionCommandTargetV1,
+    ) -> rquickjs::Result<u64> {
+        if !self.plugin_context.is_trusted_orchestrator() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "plugin",
+                "sendOmpCompanionCommand",
+                "only the trusted bundled Orchestrator may control OMP companions",
+            ));
+        }
+        let request_id = self.alloc_request_id();
+        self.command_sender
+            .send_to(
+                terminal_id.window,
+                PluginCommand::SendOmpCompanionCommand {
+                    terminal_id,
+                    command_type: type_,
+                    target,
+                    request_id,
+                },
+            )
+            .map_err(|error| {
+                self.forget_async_request(request_id);
+                rquickjs::Error::new_from_js_message("channel", "editor", error.to_string())
+            })?;
+        Ok(request_id)
+    }
+
+    /// Send input data to one exact terminal.
+    pub fn send_terminal_input(
+        &self,
+        terminal_id: fresh_core::WindowTerminalId,
+        data: String,
+    ) -> bool {
+        if self
+            .window_scope
+            .is_some_and(|scope| scope != terminal_id.window)
+        {
+            return false;
+        }
+        self.command_sender
+            .send_to(
+                terminal_id.window,
+                PluginCommand::SendTerminalInput { terminal_id, data },
+            )
             .is_ok()
     }
 
-    /// Close a terminal
-    pub fn close_terminal(&self, terminal_id: u64) -> bool {
+    /// Close one exact terminal.
+    pub fn close_terminal(&self, terminal_id: fresh_core::WindowTerminalId) -> bool {
+        if self
+            .window_scope
+            .is_some_and(|scope| scope != terminal_id.window)
+        {
+            return false;
+        }
         self.command_sender
-            .send(PluginCommand::CloseTerminal {
-                terminal_id: fresh_core::TerminalId(terminal_id as usize),
-            })
+            .send_to(
+                terminal_id.window,
+                PluginCommand::CloseTerminal { terminal_id },
+            )
             .is_ok()
     }
 
@@ -7639,10 +8878,27 @@ impl JsEditorApi {
     /// owns" rather than reaching at the terminal level. Returns
     /// `false` only when the command channel is closed.
     pub fn signal_window(&self, id: f64, signal: String) -> bool {
+        if self.window_scope.is_some_and(|scope| scope.0 != id as u64) {
+            return false;
+        }
         self.command_sender
             .send(PluginCommand::SignalWindow {
                 id: fresh_core::WindowId(id as u64),
                 signal,
+            })
+            .is_ok()
+    }
+
+    /// Stop the exact terminal/process incarnations currently owned by one
+    /// window, escalating inside the host after `grace_ms`.
+    pub fn stop_window(&self, id: f64, grace_ms: u64) -> bool {
+        if self.window_scope.is_some_and(|scope| scope.0 != id as u64) {
+            return false;
+        }
+        self.command_sender
+            .send(PluginCommand::StopWindow {
+                id: fresh_core::WindowId(id as u64),
+                grace_ms,
             })
             .is_ok()
     }
@@ -7668,37 +8924,70 @@ impl JsEditorApi {
     /// Load a plugin from a file path (async)
     #[plugin_api(async_promise, js_name = "loadPlugin", ts_return = "boolean")]
     #[qjs(rename = "_loadPluginStart")]
-    pub fn load_plugin_start(&self, _ctx: rquickjs::Ctx<'_>, path: String) -> u64 {
+    pub fn load_plugin_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        path: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "string",
+                "path",
+                "agent scripts cannot load plugins",
+            ));
+        }
         let id = self.alloc_request_id();
         let _ = self.command_sender.send(PluginCommand::LoadPlugin {
             path: std::path::PathBuf::from(path),
             callback_id: JsCallbackId::new(id),
         });
-        id
+        Ok(id)
     }
 
     /// Unload a plugin by name (async)
     #[plugin_api(async_promise, js_name = "unloadPlugin", ts_return = "boolean")]
     #[qjs(rename = "_unloadPluginStart")]
-    pub fn unload_plugin_start(&self, _ctx: rquickjs::Ctx<'_>, name: String) -> u64 {
+    pub fn unload_plugin_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        name: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "string",
+                "name",
+                "agent scripts cannot unload plugins",
+            ));
+        }
         let id = self.alloc_request_id();
         let _ = self.command_sender.send(PluginCommand::UnloadPlugin {
             name,
             callback_id: JsCallbackId::new(id),
         });
-        id
+        Ok(id)
     }
 
     /// Reload a plugin by name (async)
     #[plugin_api(async_promise, js_name = "reloadPlugin", ts_return = "boolean")]
     #[qjs(rename = "_reloadPluginStart")]
-    pub fn reload_plugin_start(&self, _ctx: rquickjs::Ctx<'_>, name: String) -> u64 {
+    pub fn reload_plugin_start(
+        &self,
+        _ctx: rquickjs::Ctx<'_>,
+        name: String,
+    ) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "string",
+                "name",
+                "agent scripts cannot reload plugins",
+            ));
+        }
         let id = self.alloc_request_id();
         let _ = self.command_sender.send(PluginCommand::ReloadPlugin {
             name,
             callback_id: JsCallbackId::new(id),
         });
-        id
+        Ok(id)
     }
 
     /// List all loaded plugins (async)
@@ -7709,12 +8998,19 @@ impl JsEditorApi {
         ts_return = "Array<{name: string, path: string, enabled: boolean}>"
     )]
     #[qjs(rename = "_listPluginsStart")]
-    pub fn list_plugins_start(&self, _ctx: rquickjs::Ctx<'_>) -> u64 {
+    pub fn list_plugins_start(&self, _ctx: rquickjs::Ctx<'_>) -> rquickjs::Result<u64> {
+        if self.window_scope.is_some() {
+            return Err(rquickjs::Error::new_from_js_message(
+                "undefined",
+                "listPlugins",
+                "agent scripts cannot enumerate plugins",
+            ));
+        }
         let id = self.alloc_request_id();
         let _ = self.command_sender.send(PluginCommand::ListPlugins {
             callback_id: JsCallbackId::new(id),
         });
-        id
+        Ok(id)
     }
 
     /// Re-read `~/.config/fresh/init.ts` and run it — the scriptable form of
@@ -7811,16 +9107,8 @@ fn initial_entries(
         .collect()
 }
 
-/// The request id behind an agent script's context, if this context belongs to
-/// one.
-///
-/// `Editor::eval_agent_script` names each script's plugin `agent-script-<id>`,
-/// and `setup_context_api` publishes that name as `__pluginName__`. Reading it
-/// back is what lets a runtime-level event — which knows a context but no
-/// request — be attributed to the caller waiting on it.
-fn agent_script_request_id(ctx: &rquickjs::Ctx<'_>) -> Option<u64> {
-    let name: String = ctx.globals().get("__pluginName__").ok()?;
-    name.strip_prefix("agent-script-")?.parse().ok()
+fn context_key(ctx: &rquickjs::Ctx<'_>) -> usize {
+    ctx.as_raw().as_ptr() as usize
 }
 
 /// QuickJS-based JavaScript runtime for plugins
@@ -7839,14 +9127,29 @@ pub struct QuickJsBackend {
     /// Editor state snapshot (read-only access)
     state_snapshot: Arc<RwLock<EditorStateSnapshot>>,
     /// Command sender for write operations
-    command_sender: mpsc::Sender<PluginCommand>,
+    command_sender: PluginCommandSender,
+    /// Immutable host invocation currently entering or resuming JavaScript.
+    current_invocation: Rc<RefCell<Option<PluginInvocation>>>,
+    /// Loader-owned record for each plugin context. Set before execution and
+    /// removed with the context so hot reload cannot inherit old authority.
+    plugin_load_records: Rc<RefCell<HashMap<String, PluginLoadRecord>>>,
+    /// Exact plugin instances whose loader-owned contexts are currently live.
+    active_plugin_instances: ActivePluginInstances,
+    /// Raw QuickJS context identity to loader-owned authority. Used by host
+    /// callbacks that receive a context but no plugin name (notably unhandled
+    /// promise rejection tracking); JavaScript cannot forge this key.
+    context_authorities: Rc<RefCell<HashMap<usize, PluginCommandContext>>>,
+    /// Promise rejections reported by QuickJS but not yet confirmed unhandled
+    /// at an event-loop checkpoint. A later `is_handled` notification removes
+    /// the matching promise before it can be treated as fatal.
+    pending_promise_rejections: PendingPromiseRejections,
     /// Pending response senders for async operations (held to keep Arc alive)
     #[allow(dead_code)]
     pending_responses: PendingResponses,
     /// Next request ID for async operations
     next_request_id: Rc<RefCell<u64>>,
-    /// Plugin name for each pending callback ID
-    callback_contexts: Rc<RefCell<HashMap<u64, String>>>,
+    /// Exact plugin instance that owns each pending callback ID.
+    callback_contexts: Rc<RefCell<HashMap<u64, CallbackOwner>>>,
     /// Bridge for editor services (i18n, theme, etc.)
     pub services: Arc<dyn fresh_core::services::PluginServiceBridge>,
     /// Per-plugin tracking of created state (namespaces, IDs) for cleanup on unload
@@ -7855,8 +9158,7 @@ pub struct QuickJsBackend {
     /// `JsEditorApi`). Shared with every `JsEditorApi` handle so command senders
     /// can stamp it.
     current_hook_epoch: Rc<std::cell::Cell<Option<(u32, u64)>>>,
-    /// Shared map of request_id → plugin_name for async resource creations.
-    /// Used by PluginThreadHandle to track buffer/terminal IDs when responses arrive.
+    /// Exact plugin instance and source context for owned async resource creations.
     async_resource_owners: AsyncResourceOwners,
     /// Tracks command name → owning plugin name (first-writer-wins collision detection)
     registered_command_names: Rc<RefCell<HashMap<String, String>>>,
@@ -7870,6 +9172,9 @@ pub struct QuickJsBackend {
     /// JS Object). Shared across every JsEditorApi instance on this
     /// Runtime.
     plugin_api_exports: PluginApiExports,
+    /// Pending caller-owned promises for host-mediated privileged API calls.
+    plugin_api_calls: PluginApiCalls,
+    plugin_api_settlements: PluginApiSettlements,
     /// Streaming-search handle registry shared with the editor thread.
     search_handles: SearchHandleRegistry,
 }
@@ -7881,7 +9186,9 @@ impl Drop for QuickJsBackend {
         // gc_obj_list. Clear the plugin-API export map (and any other
         // Persistent-holding map we add later) before the Runtime field
         // gets to run its own Drop.
+        self.pending_promise_rejections.borrow_mut().clear();
         self.plugin_api_exports.borrow_mut().clear();
+        self.plugin_api_calls.borrow_mut().clear();
     }
 }
 
@@ -7968,8 +9275,16 @@ const EDITOR_PROMISE_BOOTSTRAP: &str = r#"
                         };
                     }
                     return function(...args) {
-                        // Call via bracket notation to preserve method binding and Ctx injection
-                        const callbackId = editor[methodName](...args);
+                        // Host start methods can reject arguments or authority
+                        // synchronously. Keep the public async API contract by
+                        // turning that throw into a Promise rejection.
+                        let callbackId;
+                        try {
+                            // Call via bracket notation to preserve method binding and Ctx injection
+                            callbackId = editor[methodName](...args);
+                        } catch (error) {
+                            return Promise.reject(error);
+                        }
                         return new Promise((resolve, reject) => {
                             // NOTE: setTimeout not available in QuickJS - timeout disabled for now
                             // TODO: Implement setTimeout polyfill using editor.delay() or similar
@@ -8134,6 +9449,7 @@ const EDITOR_PROMISE_BOOTSTRAP: &str = r#"
                 editor.getLineEndPosition = _wrapAsync("_getLineEndPositionStart", "getLineEndPosition");
                 editor.createTerminal = _wrapAsync("_createTerminalStart", "createTerminal");
                 editor.createWindowWithTerminal = _wrapAsync("_createWindowWithTerminalStart", "createWindowWithTerminal");
+                editor.sendOmpCompanionCommand = _wrapAsync("_sendOmpCompanionCommandStart", "sendOmpCompanionCommand");
                 editor.reloadGrammars = _wrapAsync("_reloadGrammarsStart", "reloadGrammars");
 
                 // Everything else that follows the `_<name>Start` convention
@@ -8170,7 +9486,28 @@ const EDITOR_PROMISE_BOOTSTRAP: &str = r#"
                 editor.openFileStreaming = _wrapAsync("_openFileStreamingStart", "openFileStreaming");
                 editor.refreshBufferFromDisk = _wrapAsync("_refreshBufferFromDiskStart", "refreshBufferFromDisk");
                 editor.setBufferGroupPanelBuffer = _wrapAsync("_setBufferGroupPanelBufferStart", "setBufferGroupPanelBuffer");
-                editor.attachRemoteAgent = _wrapAsync("_attachRemoteAgentStart", "attachRemoteAgent");
+                editor.attachRemoteAgent = function(payload) {
+                    if (typeof editor._attachRemoteAgentStart !== 'function') {
+                        throw new Error('editor.attachRemoteAgent is not implemented (missing _attachRemoteAgentStart)');
+                    }
+                    const requestId = editor._attachRemoteAgentStart(payload);
+                    const promise = new Promise((resolve, reject) => {
+                        globalThis._pendingCallbacks.set(requestId, { resolve, reject });
+                    });
+                    Object.defineProperty(promise, 'requestId', {
+                        value: requestId,
+                        writable: false,
+                        configurable: false,
+                        enumerable: true,
+                    });
+                    Object.defineProperty(promise, 'cancel', {
+                        value: function() { editor.cancelRemoteAgent(requestId); },
+                        writable: false,
+                        configurable: false,
+                        enumerable: true,
+                    });
+                    return promise;
+                };
 
                 // Pull-based streaming search. Producers (host searcher tasks)
                 // write into shared state at full speed; the consumer drains
@@ -8262,7 +9599,7 @@ impl QuickJsBackend {
     /// Create a new QuickJS backend with editor state
     pub fn with_state(
         state_snapshot: Arc<RwLock<EditorStateSnapshot>>,
-        command_sender: mpsc::Sender<PluginCommand>,
+        command_sender: mpsc::Sender<PluginCommandEnvelope>,
         services: Arc<dyn fresh_core::services::PluginServiceBridge>,
     ) -> Result<Self> {
         let pending_responses: PendingResponses = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -8272,12 +9609,14 @@ impl QuickJsBackend {
     /// Create a new QuickJS backend with editor state and shared pending responses
     pub fn with_state_and_responses(
         state_snapshot: Arc<RwLock<EditorStateSnapshot>>,
-        command_sender: mpsc::Sender<PluginCommand>,
+        command_sender: mpsc::Sender<PluginCommandEnvelope>,
         pending_responses: PendingResponses,
         services: Arc<dyn fresh_core::services::PluginServiceBridge>,
     ) -> Result<Self> {
         let async_resource_owners: AsyncResourceOwners =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let active_plugin_instances: ActivePluginInstances =
+            Arc::new(std::sync::RwLock::new(HashSet::new()));
         let search_handles: SearchHandleRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let event_handlers: EventHandlerRegistry = Arc::new(RwLock::new(HashMap::new()));
         Self::with_state_responses_and_resources(
@@ -8286,6 +9625,7 @@ impl QuickJsBackend {
             pending_responses,
             services,
             async_resource_owners,
+            active_plugin_instances,
             search_handles,
             event_handlers,
         )
@@ -8295,10 +9635,11 @@ impl QuickJsBackend {
     /// and a shared async resource owner map
     pub fn with_state_responses_and_resources(
         state_snapshot: Arc<RwLock<EditorStateSnapshot>>,
-        command_sender: mpsc::Sender<PluginCommand>,
+        command_sender: mpsc::Sender<PluginCommandEnvelope>,
         pending_responses: PendingResponses,
         services: Arc<dyn fresh_core::services::PluginServiceBridge>,
         async_resource_owners: AsyncResourceOwners,
+        active_plugin_instances: ActivePluginInstances,
         search_handles: SearchHandleRegistry,
         event_handlers: EventHandlerRegistry,
     ) -> Result<Self> {
@@ -8307,51 +9648,50 @@ impl QuickJsBackend {
         let runtime =
             Runtime::new().map_err(|e| anyhow!("Failed to create QuickJS runtime: {}", e))?;
 
-        // Set up promise rejection tracker to catch unhandled rejections
-        let rejection_sender = command_sender.clone();
+        // Set up promise rejection tracking before any context executes. Raw
+        // QuickJS context identity is mapped to loader-owned authority when the
+        // context API is installed; no JavaScript global participates. QuickJS
+        // reports a rejection before callers get a chance to attach a handler,
+        // then reports the same promise with `is_handled = true`. Keep the first
+        // notification until the event-loop checkpoint so transient, handled
+        // rejections do not terminate the plugin thread.
+        let context_authorities: Rc<RefCell<HashMap<usize, PluginCommandContext>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let pending_promise_rejections: PendingPromiseRejections =
+            Rc::new(RefCell::new(Vec::new()));
+        let rejection_contexts = Rc::clone(&context_authorities);
+        let tracked_rejections = Rc::clone(&pending_promise_rejections);
         runtime.set_host_promise_rejection_tracker(Some(Box::new(
-            move |ctx, _promise, reason, is_handled| {
-                if !is_handled {
-                    // Format the rejection reason
-                    let error_msg = if let Some(exc) = reason.as_exception() {
-                        format!(
-                            "{}: {}",
-                            exc.message().unwrap_or_default(),
-                            exc.stack().unwrap_or_default()
-                        )
-                    } else {
-                        format!("{:?}", reason)
-                    };
+            move |ctx, promise, reason, is_handled| {
+                let promise = rquickjs::Persistent::save(&ctx, promise);
+                let mut pending = tracked_rejections.borrow_mut();
+                if is_handled {
+                    pending.retain(|rejection| rejection.promise != promise);
+                    return;
+                }
 
-                    tracing::error!("Unhandled Promise rejection: {}", error_msg);
-
-                    // An agent-submitted script has a caller waiting on a
-                    // socket, and a rejection that escaped its wrapper would
-                    // otherwise settle nothing: the editor logs this line and
-                    // the agent — a different process, reading its own stderr —
-                    // sees only a timeout. Answer the request instead, so the
-                    // failure reaches the caller that asked for it.
-                    //
-                    // The script's context is named for its request id (see
-                    // `Editor::eval_agent_script`), which is how a rejection
-                    // with no other provenance finds its way home. Settling an
-                    // already-settled id is a no-op, so a late rejection after
-                    // a successful return changes nothing.
-                    if let Some(request_id) = agent_script_request_id(&ctx) {
-                        let _ = rejection_sender.send(PluginCommand::CompleteCommand {
-                            request_id,
-                            ok: false,
-                            output: None,
-                            error: Some(error_msg.clone()),
-                        });
-                    }
-
-                    if should_panic_on_js_errors() {
-                        // Don't panic here - we're inside an FFI callback and rquickjs catches panics.
-                        // Instead, set a fatal error flag that the plugin thread loop will check.
-                        let full_msg = format!("Unhandled Promise rejection: {}", error_msg);
-                        set_fatal_js_error(full_msg);
-                    }
+                let error_msg = if let Some(exc) = reason.as_exception() {
+                    format!(
+                        "{}: {}",
+                        exc.message().unwrap_or_default(),
+                        exc.stack().unwrap_or_default()
+                    )
+                } else {
+                    format!("{:?}", reason)
+                };
+                let context = rejection_contexts.borrow().get(&context_key(&ctx)).cloned();
+                if let Some(rejection) = pending
+                    .iter_mut()
+                    .find(|rejection| rejection.promise == promise)
+                {
+                    rejection.error_msg = error_msg;
+                    rejection.context = context;
+                } else {
+                    pending.push(PendingPromiseRejection {
+                        promise,
+                        error_msg,
+                        context,
+                    });
                 }
             },
         )));
@@ -8369,7 +9709,13 @@ impl QuickJsBackend {
         let registered_language_configs = Rc::new(RefCell::new(HashMap::new()));
         let registered_lsp_servers = Rc::new(RefCell::new(HashMap::new()));
         let plugin_api_exports = Rc::new(RefCell::new(HashMap::new()));
+        let plugin_api_calls = Rc::new(RefCell::new(HashMap::new()));
+        let plugin_api_settlements = Rc::new(RefCell::new(Vec::new()));
+        let plugin_load_records = Rc::new(RefCell::new(HashMap::new()));
 
+        let current_invocation = Rc::new(RefCell::new(None));
+        let command_sender =
+            PluginCommandSender::new(command_sender, Rc::clone(&current_invocation));
         let backend = Self {
             runtime,
             main_context,
@@ -8378,6 +9724,7 @@ impl QuickJsBackend {
             registered_actions,
             state_snapshot,
             command_sender,
+            current_invocation,
             pending_responses,
             next_request_id,
             callback_contexts,
@@ -8390,8 +9737,41 @@ impl QuickJsBackend {
             registered_language_configs,
             registered_lsp_servers,
             plugin_api_exports,
+            plugin_api_calls,
+            plugin_api_settlements,
+            plugin_load_records,
+            active_plugin_instances,
+            context_authorities,
+            pending_promise_rejections,
             search_handles,
         };
+        backend.plugin_load_records.borrow_mut().insert(
+            "internal".to_string(),
+            PluginLoadRecord {
+                kind: PluginLoadKind::External,
+                context: PluginCommandContext {
+                    plugin_name: Arc::from("internal"),
+                    plugin_instance_id: PluginInstanceId::fresh(),
+                    provenance: PluginLoadProvenance::Internal,
+                    source_window: backend
+                        .state_snapshot
+                        .read()
+                        .ok()
+                        .map(|snapshot| snapshot.active_window_id),
+                    ..PluginCommandContext::default()
+                },
+            },
+        );
+        if let Some(instance) = backend
+            .plugin_load_records
+            .borrow()
+            .get("internal")
+            .map(|record| record.context.plugin_instance_id)
+        {
+            if let Ok(mut active) = backend.active_plugin_instances.write() {
+                active.insert(instance);
+            }
+        }
 
         // Initialize main context (for internal utilities if needed)
         backend.setup_context_api(&backend.main_context.clone(), "internal")?;
@@ -8400,13 +9780,144 @@ impl QuickJsBackend {
         Ok(backend)
     }
 
-    /// Set up the editor API in a specific JavaScript context
+    pub(crate) fn validate_plugin_load(
+        &self,
+        plugin_name: &str,
+        kind: &PluginLoadKind,
+    ) -> Result<()> {
+        if is_reserved_bundled_plugin(plugin_name) && kind.trusted_builtin(plugin_name).is_none() {
+            return Err(anyhow!(
+                "Plugin name '{}' is reserved for a bundled built-in",
+                plugin_name
+            ));
+        }
+        match kind {
+            PluginLoadKind::AgentScript { request_id, .. } => {
+                let expected = format!("agent-script-{request_id}");
+                if plugin_name != expected {
+                    return Err(anyhow!(
+                        "Agent script plugin name must be exactly '{}'",
+                        expected
+                    ));
+                }
+            }
+            _ if plugin_name.starts_with("agent-script-") => {
+                return Err(anyhow!(
+                    "Plugin name '{}' is reserved for host-created agent scripts",
+                    plugin_name
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Establish loader-owned provenance before plugin code executes.
+    pub(crate) fn prepare_plugin_load(
+        &self,
+        plugin_name: &str,
+        kind: PluginLoadKind,
+    ) -> Result<()> {
+        self.validate_plugin_load(plugin_name, &kind)?;
+        let context = match &kind {
+            PluginLoadKind::External => PluginCommandContext {
+                plugin_name: Arc::from(plugin_name),
+                plugin_instance_id: PluginInstanceId::fresh(),
+                provenance: PluginLoadProvenance::External,
+                ..PluginCommandContext::default()
+            },
+            PluginLoadKind::Bundled { .. } => PluginCommandContext {
+                plugin_name: Arc::from(plugin_name),
+                plugin_instance_id: PluginInstanceId::fresh(),
+                provenance: PluginLoadProvenance::Bundled,
+                trusted_builtin: kind.trusted_builtin(plugin_name),
+                ..PluginCommandContext::default()
+            },
+            PluginLoadKind::AgentScript {
+                request_id,
+                plugin_instance_id,
+                window_id,
+                authority,
+                state_snapshot,
+            } => PluginCommandContext {
+                plugin_name: Arc::from(plugin_name),
+                plugin_instance_id: *plugin_instance_id,
+                provenance: PluginLoadProvenance::AgentScript {
+                    request_id: *request_id,
+                },
+                source_window: Some(*window_id),
+                source_authority: Some(*authority),
+                window_scope: Some(*window_id),
+                state_snapshot: Some(Arc::clone(state_snapshot)),
+                ..PluginCommandContext::default()
+            },
+        };
+        let instance = context.plugin_instance_id;
+        let previous = self
+            .plugin_load_records
+            .borrow_mut()
+            .insert(plugin_name.to_string(), PluginLoadRecord { kind, context });
+        if let Ok(mut active) = self.active_plugin_instances.write() {
+            if let Some(previous) = previous {
+                active.remove(&previous.context.plugin_instance_id);
+            }
+            active.insert(instance);
+        }
+        Ok(())
+    }
+
+    pub fn plugin_load_kind(&self, plugin_name: &str) -> Option<PluginLoadKind> {
+        self.plugin_load_records
+            .borrow()
+            .get(plugin_name)
+            .map(|record| record.kind.clone())
+    }
+
+    pub fn abandon_plugin_load(&self, plugin_name: &str) {
+        let removed = self.plugin_load_records.borrow_mut().remove(plugin_name);
+        if let Some(removed) = removed {
+            if let Ok(mut active) = self.active_plugin_instances.write() {
+                active.remove(&removed.context.plugin_instance_id);
+            }
+        }
+        if let Some(context) = self.plugin_contexts.borrow_mut().remove(plugin_name) {
+            context.with(|ctx| {
+                self.context_authorities
+                    .borrow_mut()
+                    .remove(&context_key(&ctx));
+            });
+        }
+    }
+
     /// Build a fresh [`JsEditorApi`] handle for `plugin_name`, cloning the
-    /// shared runtime state this backend hands to every plugin context.
+    /// exact loader-owned context established before its source executed.
     fn build_editor_api(&self, plugin_name: &str) -> JsEditorApi {
+        let command_context = self
+            .plugin_load_records
+            .borrow()
+            .get(plugin_name)
+            .map(|record| record.context.clone())
+            .unwrap_or_else(|| PluginCommandContext {
+                plugin_name: Arc::from(plugin_name),
+                plugin_instance_id: PluginInstanceId::fresh(),
+                provenance: PluginLoadProvenance::Internal,
+                source_window: self
+                    .state_snapshot
+                    .read()
+                    .ok()
+                    .map(|snapshot| snapshot.active_window_id),
+                ..PluginCommandContext::default()
+            });
+        let state_snapshot = command_context
+            .state_snapshot
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(&self.state_snapshot));
+        let window_scope = command_context.window_scope;
+
         JsEditorApi {
-            state_snapshot: Arc::clone(&self.state_snapshot),
-            command_sender: self.command_sender.clone(),
+            state_snapshot,
+            command_sender: self.command_sender.with_context(command_context.clone()),
             registered_actions: Rc::clone(&self.registered_actions),
             event_handlers: Arc::clone(&self.event_handlers),
             next_request_id: Rc::clone(&self.next_request_id),
@@ -8420,26 +9931,28 @@ impl QuickJsBackend {
             registered_language_configs: Rc::clone(&self.registered_language_configs),
             registered_lsp_servers: Rc::clone(&self.registered_lsp_servers),
             plugin_api_exports: Rc::clone(&self.plugin_api_exports),
+            plugin_api_calls: Rc::clone(&self.plugin_api_calls),
+            plugin_api_settlements: Rc::clone(&self.plugin_api_settlements),
             search_handles: Arc::clone(&self.search_handles),
+            window_scope,
+            plugin_context: command_context,
             plugin_name: plugin_name.to_string(),
         }
     }
-
     fn setup_context_api(&self, context: &Context, plugin_name: &str) -> Result<()> {
         context
             .with(|ctx| {
                 let globals = ctx.globals();
+                let api = self.build_editor_api(plugin_name);
+                self.context_authorities
+                    .borrow_mut()
+                    .insert(context_key(&ctx), api.plugin_context.clone());
 
-                // Set the plugin name global.
+                // Plugin name is informational only. Host authorization uses
+                // the loader-owned context registered above.
                 globals.set("__pluginName__", plugin_name)?;
 
-                // Create the `editor` object from the JsEditorApi class (which
-                // gives proper lifetime handling for methods returning JS
-                // values) and export it as a global.
-                let editor = rquickjs::Class::<JsEditorApi>::instance(
-                    ctx.clone(),
-                    self.build_editor_api(plugin_name),
-                )?;
+                let editor = rquickjs::Class::<JsEditorApi>::instance(ctx.clone(), api)?;
                 globals.set("editor", editor)?;
 
                 // Bootstrap, in order: the getEditor()/registerHandler()
@@ -8454,59 +9967,6 @@ impl QuickJsBackend {
                 Ok::<_, rquickjs::Error>(())
             })
             .map_err(|e| anyhow!("Failed to set up global API: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Load and execute a TypeScript/JavaScript plugin from a file path
-    pub async fn load_module_with_source(
-        &mut self,
-        path: &str,
-        _plugin_source: &str,
-    ) -> Result<()> {
-        let path_buf = PathBuf::from(path);
-        let source = std::fs::read_to_string(&path_buf)
-            .map_err(|e| anyhow!("Failed to read plugin {}: {}", path, e))?;
-
-        let filename = path_buf
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("plugin.ts");
-
-        // Check for ES imports - these need bundling to resolve dependencies
-        if has_es_imports(&source) {
-            // Try to bundle (this also strips imports and exports)
-            match bundle_module(&path_buf) {
-                Ok(bundled) => {
-                    self.execute_js(&bundled, path)?;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Plugin {} uses ES imports but bundling failed: {}. Skipping.",
-                        path,
-                        e
-                    );
-                    return Ok(()); // Skip plugins with unresolvable imports
-                }
-            }
-        } else if has_es_module_syntax(&source) {
-            // Has exports but no imports - strip exports and transpile
-            let stripped = strip_imports_and_exports(&source);
-            let js_code = if filename.ends_with(".ts") {
-                transpile_typescript(&stripped, filename)?
-            } else {
-                stripped
-            };
-            self.execute_js(&js_code, path)?;
-        } else {
-            // Plain code - just transpile if TypeScript
-            let js_code = if filename.ends_with(".ts") {
-                transpile_typescript(&source, filename)?
-            } else {
-                source
-            };
-            self.execute_js(&js_code, path)?;
-        }
 
         Ok(())
     }
@@ -8550,7 +10010,20 @@ impl QuickJsBackend {
         let wrapped_code = format!("(function() {{ {} }})();", code);
         let wrapped = wrapped_code.as_str();
 
-        context.with(|ctx| {
+        let invocation = self
+            .plugin_load_records
+            .borrow()
+            .get(plugin_name)
+            .filter(|record| record.context.is_agent_script())
+            .and_then(|record| {
+                Some(PluginInvocation {
+                    window_id: record.context.source_window?,
+                    authority: record.context.source_authority,
+                    state_snapshot: record.context.state_snapshot.as_ref().map(Arc::clone),
+                })
+            });
+        let invocation_scope = invocation.map(|invocation| self.enter_invocation(Some(invocation)));
+        let result = context.with(|ctx| {
             tracing::debug!("execute_js: executing plugin code for '{}'", plugin_name);
 
             // Execute the plugin code with filename for better stack traces
@@ -8568,7 +10041,11 @@ impl QuickJsBackend {
             );
 
             result
-        })
+        });
+        if let Some((previous_invocation, previous_snapshot)) = invocation_scope {
+            self.leave_invocation(previous_invocation, previous_snapshot);
+        }
+        result
     }
 
     /// Execute JavaScript source code directly as a plugin (no file I/O).
@@ -8615,14 +10092,115 @@ impl QuickJsBackend {
         self.execute_js(&js_code, &source_name)
     }
 
+    pub(crate) fn record_or_cleanup_async_resource(
+        &self,
+        owner: AsyncResourceOwner,
+        resource: TrackedAsyncResource,
+    ) {
+        let is_current = self
+            .plugin_load_records
+            .borrow()
+            .get(&owner.plugin_name)
+            .is_some_and(|record| record.context.plugin_instance_id == owner.plugin_instance_id);
+        if is_current {
+            let mut tracked = self.plugin_tracked_state.borrow_mut();
+            let state = tracked.entry(owner.plugin_name).or_default();
+            match resource {
+                TrackedAsyncResource::VirtualBuffer(buffer_id) => {
+                    state.virtual_buffer_ids.push(buffer_id);
+                }
+                TrackedAsyncResource::CompositeBuffer(buffer_id) => {
+                    state.composite_buffer_ids.push(buffer_id);
+                }
+                TrackedAsyncResource::Terminal(terminal_id) => {
+                    state.terminal_ids.push(terminal_id);
+                }
+                TrackedAsyncResource::WatchHandle(handle) => {
+                    state.watch_handles.push((handle, owner.context));
+                }
+                TrackedAsyncResource::Window(_) => {
+                    // A live attach transfers ownership to the acknowledged caller.
+                }
+            }
+            return;
+        }
+
+        let mut context = owner.context;
+        context.purpose = fresh_core::api::PluginCommandPurpose::CompensatingCleanup;
+        let sender = self.command_sender.with_context(context);
+        let _ = match resource {
+            TrackedAsyncResource::VirtualBuffer(buffer_id) => {
+                sender.send(PluginCommand::CloseBuffer {
+                    buffer_id,
+                    force: true,
+                })
+            }
+            TrackedAsyncResource::CompositeBuffer(buffer_id) => {
+                sender.send(PluginCommand::CloseCompositeBuffer { buffer_id })
+            }
+            TrackedAsyncResource::Terminal(terminal_id) => sender.send_to(
+                terminal_id.window,
+                PluginCommand::CloseTerminal { terminal_id },
+            ),
+            TrackedAsyncResource::WatchHandle(handle) => {
+                sender.send(PluginCommand::UnwatchPath { handle })
+            }
+            TrackedAsyncResource::Window(window_id) => {
+                sender.send(PluginCommand::CloseWindow { id: window_id })
+            }
+        };
+    }
+
     /// Clean up all runtime state owned by a plugin.
     ///
     /// This removes the plugin's JS context, event handlers, registered actions,
     /// callback contexts, and sends compensating commands to the editor to clear
     /// namespaced visual state (overlays, conceals, virtual text, etc.).
     pub fn cleanup_plugin(&self, plugin_name: &str) {
-        // 1. Remove plugin's JS context (CRITICAL — without this, execute_js reuses old context)
-        self.plugin_contexts.borrow_mut().remove(plugin_name);
+        let unloading_context = self
+            .plugin_load_records
+            .borrow()
+            .get(plugin_name)
+            .map(|record| record.context.clone());
+        if let Some(context) = unloading_context.as_ref() {
+            // Enqueue host cancellation while this exact instance's callback
+            // ownership and liveness records still exist. The editor filters
+            // by the envelope's non-forgeable plugin_instance_id, so a
+            // same-name replacement remains isolated.
+            let _ = self
+                .command_sender
+                .with_context(context.clone())
+                .send(PluginCommand::CancelRemoteAttaches);
+        }
+        let unloading_instance = unloading_context
+            .as_ref()
+            .map(|context| context.plugin_instance_id);
+        if let Some(unloading_instance) = unloading_instance {
+            let mut calls = self.plugin_api_calls.borrow_mut();
+            let mut settlements = self.plugin_api_settlements.borrow_mut();
+            calls.retain(|id, call| {
+                if call.caller.plugin_instance_id == unloading_instance {
+                    return false;
+                }
+                if call.exporter_instance == unloading_instance {
+                    settlements.push((
+                        *id,
+                        PluginApiSettlement::Reject("plugin API exporter unloaded".to_string()),
+                    ));
+                }
+                true
+            });
+        }
+
+        // 1. Remove the non-forgeable context mapping before dropping the JS
+        // context, so a recycled raw pointer cannot inherit old authority.
+        if let Some(context) = self.plugin_contexts.borrow_mut().remove(plugin_name) {
+            context.with(|ctx| {
+                self.context_authorities
+                    .borrow_mut()
+                    .remove(&context_key(&ctx));
+            });
+        }
 
         // 2. Remove event handlers for this plugin
         {
@@ -8644,10 +10222,16 @@ impl QuickJsBackend {
             .borrow_mut()
             .retain(|_, h| h.plugin_name != plugin_name);
 
-        // 4. Remove callback contexts for this plugin
-        self.callback_contexts
-            .borrow_mut()
-            .retain(|_, pname| pname != plugin_name);
+        // 4. Remove callback contexts for this exact plugin instance.
+        if let Some(unloading_instance) = unloading_instance {
+            self.callback_contexts
+                .borrow_mut()
+                .retain(|_, owner| owner.plugin_instance_id != unloading_instance);
+        } else {
+            self.callback_contexts
+                .borrow_mut()
+                .retain(|_, owner| owner.plugin_name != plugin_name);
+        }
 
         // 5. Send compensating commands for editor-side state
         if let Some(tracked) = self.plugin_tracked_state.borrow_mut().remove(plugin_name) {
@@ -8752,13 +10336,26 @@ impl QuickJsBackend {
 
             // --- Phase 3: Resource cleanup ---
 
-            // Kill background processes spawned by this plugin
-            for process_id in &tracked.background_process_ids {
-                let _ = self
-                    .command_sender
-                    .send(PluginCommand::KillBackgroundProcess {
+            // Kill background processes spawned by this plugin.
+            for (window_id, process_id) in &tracked.background_process_ids {
+                let _ = self.command_sender.send_to(
+                    *window_id,
+                    PluginCommand::KillBackgroundProcess {
+                        window_id: *window_id,
                         process_id: *process_id,
-                    });
+                    },
+                );
+            }
+
+            // Kill host-side processes spawned by this exact plugin instance.
+            for (window_id, process_id) in &tracked.host_process_ids {
+                let _ = self.command_sender.send_to(
+                    *window_id,
+                    PluginCommand::KillHostProcess {
+                        window_id: *window_id,
+                        process_id: *process_id,
+                    },
+                );
             }
 
             // Remove scroll sync groups created by this plugin
@@ -8789,19 +10386,23 @@ impl QuickJsBackend {
                     });
             }
 
-            // Close terminals created by this plugin
+            // Close exact terminal resources created by this plugin.
             for terminal_id in &tracked.terminal_ids {
-                let _ = self.command_sender.send(PluginCommand::CloseTerminal {
-                    terminal_id: *terminal_id,
-                });
+                let _ = self.command_sender.send_to(
+                    terminal_id.window,
+                    PluginCommand::CloseTerminal {
+                        terminal_id: *terminal_id,
+                    },
+                );
             }
 
-            // Drop any file watchers this plugin registered. The
-            // editor side ignores unknown handles, so it's safe to
-            // resend on partial failures.
-            for handle in &tracked.watch_handles {
+            // Drop file watchers with the exact context that created them.
+            for (handle, context) in &tracked.watch_handles {
+                let mut context = context.clone();
+                context.purpose = fresh_core::api::PluginCommandPurpose::CompensatingCleanup;
                 let _ = self
                     .command_sender
+                    .with_context(context)
                     .send(PluginCommand::UnwatchPath { handle: *handle });
             }
 
@@ -8816,15 +10417,21 @@ impl QuickJsBackend {
             }
         }
 
-        // Clean up any pending async resource owner entries for this plugin
-        if let Ok(mut owners) = self.async_resource_owners.lock() {
-            owners.retain(|_, name| name != plugin_name);
+        // Keep in-flight owner records until their response or rejection arrives.
+        // A late successful response after unload must still emit compensating cleanup.
+
+        // Provenance and liveness die with the context; a later load of the
+        // same name must be classified again by its loader.
+        if let Some(removed) = self.plugin_load_records.borrow_mut().remove(plugin_name) {
+            if let Ok(mut active) = self.active_plugin_instances.write() {
+                active.remove(&removed.context.plugin_instance_id);
+            }
         }
 
-        // Drop any plugin-API exports (design M3) this plugin published.
+        // Drop any plugin-API exports this exact plugin instance published.
         self.plugin_api_exports
             .borrow_mut()
-            .retain(|_, (exporter, _)| exporter != plugin_name);
+            .retain(|_, export| export.exporter.plugin_name.as_ref() != plugin_name);
 
         // Clear collision tracking maps so another plugin can re-register these names
         self.registered_command_names
@@ -8845,10 +10452,107 @@ impl QuickJsBackend {
             plugin_name
         );
     }
+    fn invocation_buffer_ids(snapshot: &EditorStateSnapshot) -> Vec<BufferId> {
+        let mut buffer_ids: Vec<_> = snapshot.buffers.keys().copied().collect();
+        if snapshot.active_buffer_id.0 != 0 && !buffer_ids.contains(&snapshot.active_buffer_id) {
+            buffer_ids.push(snapshot.active_buffer_id);
+        }
+        buffer_ids
+    }
+
+    fn sync_plugin_markers_for_buffers(
+        target: &mut HashMap<BufferId, HashMap<String, PluginMarker>>,
+        source: &HashMap<BufferId, HashMap<String, PluginMarker>>,
+        buffer_ids: &[BufferId],
+    ) {
+        for buffer_id in buffer_ids {
+            if let Some(markers) = source.get(buffer_id) {
+                target.insert(*buffer_id, markers.clone());
+            } else {
+                target.remove(buffer_id);
+            }
+        }
+    }
+
+    fn enter_invocation(
+        &self,
+        invocation: Option<PluginInvocation>,
+    ) -> (Option<PluginInvocation>, Option<EditorStateSnapshot>) {
+        let replacement_snapshot = invocation
+            .as_ref()
+            .and_then(|current| current.state_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.read().ok().map(|snapshot| snapshot.clone()))
+            .map(|mut replacement| {
+                if let Ok(current) = self.state_snapshot.read() {
+                    let buffer_ids = Self::invocation_buffer_ids(&replacement);
+                    Self::sync_plugin_markers_for_buffers(
+                        &mut replacement.plugin_markers,
+                        &current.plugin_markers,
+                        &buffer_ids,
+                    );
+                }
+                replacement
+            });
+        let previous_invocation = self.current_invocation.replace(invocation);
+        let previous_snapshot = replacement_snapshot.and_then(|mut snapshot| {
+            self.state_snapshot.write().ok().map(|mut current| {
+                // Match the host generation at entry. If the editor refreshes
+                // the shared snapshot while JavaScript runs, its generation
+                // advances and teardown must not restore this older value.
+                snapshot.host_revision = current.host_revision;
+                std::mem::replace(&mut *current, snapshot)
+            })
+        });
+        (previous_invocation, previous_snapshot)
+    }
+
+    fn leave_invocation(
+        &self,
+        previous_invocation: Option<PluginInvocation>,
+        mut previous_snapshot: Option<EditorStateSnapshot>,
+    ) {
+        let current_invocation = self.current_invocation.borrow().clone();
+        let marker_state = self.state_snapshot.read().ok().map(|current| {
+            (
+                current.plugin_markers.clone(),
+                Self::invocation_buffer_ids(&current),
+            )
+        });
+
+        if let (Some(invocation), Some((plugin_markers, buffer_ids))) =
+            (current_invocation, marker_state)
+        {
+            if let Some(private_snapshot) = invocation.state_snapshot {
+                if let Ok(mut private_snapshot) = private_snapshot.write() {
+                    Self::sync_plugin_markers_for_buffers(
+                        &mut private_snapshot.plugin_markers,
+                        &plugin_markers,
+                        &buffer_ids,
+                    );
+                }
+            }
+            if let Some(previous_snapshot) = previous_snapshot.as_mut() {
+                Self::sync_plugin_markers_for_buffers(
+                    &mut previous_snapshot.plugin_markers,
+                    &plugin_markers,
+                    &buffer_ids,
+                );
+            }
+        }
+
+        if let Some(snapshot) = previous_snapshot {
+            if let Ok(mut current) = self.state_snapshot.write() {
+                if current.host_revision == snapshot.host_revision {
+                    *current = snapshot;
+                }
+            }
+        }
+        self.current_invocation.replace(previous_invocation);
+    }
 
     /// Emit an event to all registered handlers
     pub async fn emit(&mut self, event_name: &str, event_data: &serde_json::Value) -> Result<bool> {
-        self.emit_to(event_name, event_data, None).await
+        self.emit_to(event_name, event_data, None, None).await
     }
 
     /// Emit an event to registered handlers. When `target` is set, only
@@ -8859,8 +10563,32 @@ impl QuickJsBackend {
         event_name: &str,
         event_data: &serde_json::Value,
         target: Option<&str>,
+        invocation: Option<PluginInvocation>,
     ) -> Result<bool> {
         tracing::trace!("emit: event '{}' with data: {:?}", event_name, event_data);
+
+        if event_name == PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT {
+            let target = target.ok_or_else(|| {
+                anyhow!("private host event '{event_name}' requires an explicit target")
+            })?;
+            let authorized = self
+                .plugin_load_records
+                .borrow()
+                .get(target)
+                .is_some_and(|record| {
+                    may_receive_private_event(
+                        &record.context,
+                        event_name,
+                        &self.active_plugin_instances,
+                    )
+                });
+            if !authorized {
+                return Err(anyhow!(
+                    "private host event '{event_name}' target is not the active trusted Orchestrator"
+                ));
+            }
+        }
+        let (previous_invocation, previous_snapshot) = self.enter_invocation(invocation);
 
         self.services
             .set_js_execution_state(format!("hook '{}'", event_name));
@@ -8903,6 +10631,7 @@ impl QuickJsBackend {
 
         self.current_hook_epoch.set(prev_epoch);
         self.services.clear_js_execution_state();
+        self.leave_invocation(previous_invocation, previous_snapshot);
         Ok(true)
     }
 
@@ -8937,6 +10666,7 @@ impl QuickJsBackend {
         action_name: &str,
         args_json: Option<&str>,
         request_id: Option<u64>,
+        invocation: Option<PluginInvocation>,
     ) -> Result<()> {
         // Handle mode_text_input:<char> — route to the plugin that registered
         // "mode_text_input" and pass the character as an argument.
@@ -8957,6 +10687,7 @@ impl QuickJsBackend {
         let context = plugin_contexts
             .get(&plugin_name)
             .unwrap_or(&self.main_context);
+        let (previous_invocation, previous_snapshot) = self.enter_invocation(invocation);
 
         // Track execution state for signal handler debugging
         self.services
@@ -9050,6 +10781,7 @@ impl QuickJsBackend {
 
         // Clear execution state (action started, may still be running async)
         self.services.clear_js_execution_state();
+        self.leave_invocation(previous_invocation, previous_snapshot);
 
         Ok(())
     }
@@ -9126,6 +10858,88 @@ impl QuickJsBackend {
         Ok(())
     }
 
+    fn drain_unhandled_promise_rejections(&mut self) -> bool {
+        let rejections = std::mem::take(&mut *self.pending_promise_rejections.borrow_mut());
+        if rejections.is_empty() {
+            return false;
+        }
+
+        for rejection in rejections {
+            tracing::error!("Unhandled Promise rejection: {}", rejection.error_msg);
+            if let Some(context) = rejection.context {
+                if let Some(request_id) = context.agent_script_request_id() {
+                    let _ = self.command_sender.sender.send(PluginCommandEnvelope {
+                        command: PluginCommand::CompleteCommand {
+                            request_id,
+                            ok: false,
+                            output: None,
+                            error: Some(rejection.error_msg.clone()),
+                        },
+                        context,
+                    });
+                }
+            }
+
+            if should_panic_on_js_errors() {
+                // Don't panic here - rquickjs can invoke the tracker across an
+                // FFI boundary. Let the plugin thread surface the fatal error.
+                set_fatal_js_error(format!(
+                    "Unhandled Promise rejection: {}",
+                    rejection.error_msg
+                ));
+            }
+        }
+        true
+    }
+
+    fn drain_plugin_api_settlements(&mut self) -> bool {
+        let settlements = std::mem::take(&mut *self.plugin_api_settlements.borrow_mut());
+        if settlements.is_empty() {
+            return false;
+        }
+
+        for (id, settlement) in settlements {
+            let Some(call) = self.plugin_api_calls.borrow_mut().remove(&id) else {
+                continue;
+            };
+            if !self.callback_owner_is_current(&call.caller, id) {
+                continue;
+            }
+            let Some(context) = self
+                .plugin_contexts
+                .borrow()
+                .get(&call.caller.plugin_name)
+                .cloned()
+            else {
+                continue;
+            };
+            let invocation = call.caller.invocation.clone();
+            let (previous_invocation, previous_snapshot) = self.enter_invocation(invocation);
+            context.with(|ctx| {
+                let result = match settlement {
+                    PluginApiSettlement::Resolve(value) => {
+                        call.resolve.restore(&ctx).and_then(|resolve| {
+                            json_to_js_value(&ctx, &value)
+                                .and_then(|value| resolve.call::<_, ()>((value,)))
+                        })
+                    }
+                    PluginApiSettlement::Reject(message) => {
+                        call.reject.restore(&ctx).and_then(|reject| {
+                            plugin_api_error(&ctx, &message)
+                                .and_then(|error| reject.call::<_, ()>((error,)))
+                        })
+                    }
+                };
+                if let Err(error) = result {
+                    log_js_error(&ctx, error, &format!("plugin API settlement {id}"));
+                }
+                run_pending_jobs_checked(&ctx, &format!("plugin API settlement {id}"));
+            });
+            self.leave_invocation(previous_invocation, previous_snapshot);
+        }
+        true
+    }
+
     /// Poll the event loop once to run any pending microtasks
     pub fn poll_event_loop_once(&mut self) -> bool {
         let mut had_work = false;
@@ -9148,6 +10962,12 @@ impl QuickJsBackend {
                 }
             });
         }
+        if self.drain_plugin_api_settlements() {
+            had_work = true;
+        }
+        if self.drain_unhandled_promise_rejections() {
+            had_work = true;
+        }
         had_work
     }
 
@@ -9161,177 +10981,244 @@ impl QuickJsBackend {
     /// Send a hook-completed sentinel to the editor.
     /// This signals that all commands from the hook have been sent,
     /// allowing the render loop to wait deterministically.
-    pub fn send_hook_completed(&self, hook_name: String) {
+    pub fn send_hook_completed(&self, hook_name: String, invocation: Option<PluginInvocation>) {
+        let (previous_invocation, previous_snapshot) = self.enter_invocation(invocation);
         let _ = self
             .command_sender
             .send(PluginCommand::HookCompleted { hook_name });
+        self.leave_invocation(previous_invocation, previous_snapshot);
     }
 
-    /// Resolve a pending async callback with a result (called from Rust when async op completes)
-    ///
-    /// Takes a JSON string which is parsed and converted to a proper JS value.
-    /// This avoids string interpolation with eval for better type safety.
+    fn take_callback_owner(
+        &self,
+        callback_id: u64,
+        expected_instance: Option<PluginInstanceId>,
+        operation: &str,
+    ) -> Option<CallbackOwner> {
+        let mut callbacks = self.callback_contexts.borrow_mut();
+        let Some(owner) = callbacks.get(&callback_id) else {
+            tracing::warn!(callback_id, "{operation}: callback owner no longer exists");
+            return None;
+        };
+        if expected_instance.is_some_and(|expected| expected != owner.plugin_instance_id) {
+            tracing::warn!(
+                callback_id,
+                expected_instance = ?expected_instance,
+                actual_instance = ?owner.plugin_instance_id,
+                "{operation}: rejected callback settlement from the wrong plugin instance"
+            );
+            return None;
+        }
+        callbacks.remove(&callback_id)
+    }
+
+    fn callback_owner_is_current(&self, owner: &CallbackOwner, callback_id: u64) -> bool {
+        let current = self
+            .plugin_load_records
+            .borrow()
+            .get(&owner.plugin_name)
+            .is_some_and(|record| record.context.plugin_instance_id == owner.plugin_instance_id);
+        if !current {
+            tracing::warn!(
+                callback_id,
+                plugin = %owner.plugin_name,
+                plugin_instance = ?owner.plugin_instance_id,
+                "discarded callback settlement for an unloaded or replaced plugin instance"
+            );
+        }
+        current
+    }
+
+    /// Resolve a pending async callback. The callback's recorded owner must
+    /// still be the currently loaded instance, so a late result can never enter
+    /// a same-name replacement context.
     pub fn resolve_callback(
         &mut self,
         callback_id: fresh_core::api::JsCallbackId,
         result_json: &str,
     ) {
-        let id = callback_id.as_u64();
-        tracing::debug!("resolve_callback: starting for callback_id={}", id);
+        self.resolve_callback_impl(None, callback_id, result_json);
+    }
 
-        // Find the plugin name and then context for this callback
-        let plugin_name = {
-            let mut contexts = self.callback_contexts.borrow_mut();
-            contexts.remove(&id)
+    pub fn resolve_callback_for(
+        &mut self,
+        plugin_instance_id: PluginInstanceId,
+        callback_id: fresh_core::api::JsCallbackId,
+        result_json: &str,
+    ) {
+        self.resolve_callback_impl(Some(plugin_instance_id), callback_id, result_json);
+    }
+
+    fn resolve_callback_impl(
+        &mut self,
+        expected_instance: Option<PluginInstanceId>,
+        callback_id: fresh_core::api::JsCallbackId,
+        result_json: &str,
+    ) {
+        let id = callback_id.as_u64();
+        let parsed_resource = || {
+            let value = serde_json::from_str::<serde_json::Value>(result_json).ok()?;
+            if let Some(window_id) = value.get("windowId").and_then(serde_json::Value::as_u64) {
+                return Some(TrackedAsyncResource::Window(fresh_core::WindowId(
+                    window_id,
+                )));
+            }
+            value
+                .get("bufferId")
+                .and_then(serde_json::Value::as_u64)
+                .map(|buffer_id| TrackedAsyncResource::VirtualBuffer(BufferId(buffer_id as usize)))
         };
 
-        let Some(name) = plugin_name else {
-            tracing::warn!("resolve_callback: No plugin found for callback_id={}", id);
+        let callback_owner = self.take_callback_owner(id, expected_instance, "resolve_callback");
+        let Some(callback_owner) = callback_owner else {
+            // A wrong-instance settlement leaves the callback live for its real
+            // owner. A callback removed by unload has no JS recipient, but a
+            // successful creation still requires compensating cleanup.
+            if self.callback_contexts.borrow().contains_key(&id) {
+                return;
+            }
+            let owned_resource = self
+                .async_resource_owners
+                .lock()
+                .ok()
+                .and_then(|mut owners| owners.remove(&id));
+            if let (Some(owner), Some(resource)) = (owned_resource, parsed_resource()) {
+                self.record_or_cleanup_async_resource(owner, resource);
+            }
             return;
         };
 
-        // Record a virtual buffer against the plugin that asked for it, so
-        // unload can close it.
-        //
-        // This has to happen here rather than in the `PluginResponse`
-        // handler, because every `createVirtualBuffer*` path answers by
-        // resolving the callback directly and never emits
-        // `PluginResponse::VirtualBufferCreated` — so the tracking that
-        // cleanup relies on was never populated, and `virtual_buffer_ids`
-        // stayed empty. The visible cost was that `edit → reload → run`, the
-        // documented plugin dev loop, left the previous panel open and
-        // stacked a new one every iteration.
-        //
-        // `async_resource_owners` holds an entry only for the calls that
-        // create a tracked resource, and the kinds that *do* answer through
-        // `PluginResponse` have already removed theirs by now — so an entry
-        // still present here, whose result carries a `bufferId`, is a
-        // virtual buffer.
+        let owner_is_current = self.callback_owner_is_current(&callback_owner, id);
         let owned_resource = self
             .async_resource_owners
             .lock()
             .ok()
             .and_then(|mut owners| owners.remove(&id));
-        if owned_resource.is_some() {
-            if let Some(buffer_id) = serde_json::from_str::<serde_json::Value>(result_json)
-                .ok()
-                .and_then(|v| v.get("bufferId").and_then(serde_json::Value::as_u64))
-            {
-                self.plugin_tracked_state
-                    .borrow_mut()
-                    .entry(name.clone())
-                    .or_default()
-                    .virtual_buffer_ids
-                    .push(BufferId(buffer_id as usize));
+        if let (Some(owner), Some(resource)) = (owned_resource, parsed_resource()) {
+            if !matches!(resource, TrackedAsyncResource::Window(_)) || !owner_is_current {
+                self.record_or_cleanup_async_resource(owner, resource);
             }
+        }
+        if !owner_is_current {
+            return;
+        }
+
+        let invocation = callback_owner.invocation.clone();
+        let name = callback_owner.plugin_name;
+        if let Some(state) = self.plugin_tracked_state.borrow_mut().get_mut(&name) {
+            state
+                .background_process_ids
+                .retain(|(_, process_id)| *process_id != id);
+            state
+                .host_process_ids
+                .retain(|(_, process_id)| *process_id != id);
         }
 
         let plugin_contexts = self.plugin_contexts.borrow();
         let Some(context) = plugin_contexts.get(&name) else {
-            tracing::warn!("resolve_callback: Context lost for plugin {}", name);
+            tracing::warn!(callback_id = id, plugin = %name, "resolve_callback: context lost");
             return;
         };
-
+        let (previous_invocation, previous_snapshot) = self.enter_invocation(invocation);
         context.with(|ctx| {
-            // Parse JSON string to serde_json::Value
             let json_value: serde_json::Value = match serde_json::from_str(result_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(
-                        "resolve_callback: failed to parse JSON for callback_id={}: {}",
-                        id,
-                        e
-                    );
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(callback_id = id, %error, "resolve_callback: invalid JSON");
                     return;
                 }
             };
-
-            // Convert to JS value using rquickjs_serde
             let js_value = match rquickjs_serde::to_value(ctx.clone(), &json_value) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(
-                        "resolve_callback: failed to convert to JS value for callback_id={}: {}",
-                        id,
-                        e
-                    );
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(callback_id = id, %error, "resolve_callback: JS conversion failed");
                     return;
                 }
             };
-
-            // Get _resolveCallback function from globalThis
             let globals = ctx.globals();
             let resolve_fn: rquickjs::Function = match globals.get("_resolveCallback") {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(
-                        "resolve_callback: _resolveCallback not found for callback_id={}: {:?}",
-                        id,
-                        e
-                    );
+                Ok(function) => function,
+                Err(error) => {
+                    tracing::error!(callback_id = id, ?error, "resolve_callback: resolver missing");
                     return;
                 }
             };
-
-            // Call the function with callback_id (as u64) and the JS value
-            if let Err(e) = resolve_fn.call::<_, ()>((id, js_value)) {
-                log_js_error(&ctx, e, &format!("resolving callback {}", id));
+            if let Err(error) = resolve_fn.call::<_, ()>((id, js_value)) {
+                log_js_error(&ctx, error, &format!("resolving callback {id}"));
             }
-
-            // IMPORTANT: Run pending jobs to process Promise continuations
-            let job_count = run_pending_jobs_checked(&ctx, &format!("resolve_callback {}", id));
-            tracing::info!(
-                "resolve_callback: executed {} pending jobs for callback_id={}",
-                job_count,
-                id
-            );
+            run_pending_jobs_checked(&ctx, &format!("resolve_callback {id}"));
         });
+        self.leave_invocation(previous_invocation, previous_snapshot);
     }
 
-    /// Reject a pending async callback with an error (called from Rust when async op fails)
+    /// Reject a pending async callback with the same instance check as resolve.
     pub fn reject_callback(&mut self, callback_id: fresh_core::api::JsCallbackId, error: &str) {
+        self.reject_callback_impl(None, callback_id, error);
+    }
+
+    pub fn reject_callback_for(
+        &mut self,
+        plugin_instance_id: PluginInstanceId,
+        callback_id: fresh_core::api::JsCallbackId,
+        error: &str,
+    ) {
+        self.reject_callback_impl(Some(plugin_instance_id), callback_id, error);
+    }
+
+    fn reject_callback_impl(
+        &mut self,
+        expected_instance: Option<PluginInstanceId>,
+        callback_id: fresh_core::api::JsCallbackId,
+        error: &str,
+    ) {
         let id = callback_id.as_u64();
-
-        // Find the plugin name and then context for this callback
-        let plugin_name = {
-            let mut contexts = self.callback_contexts.borrow_mut();
-            contexts.remove(&id)
-        };
-
-        let Some(name) = plugin_name else {
-            tracing::warn!("reject_callback: No plugin found for callback_id={}", id);
+        let Some(callback_owner) =
+            self.take_callback_owner(id, expected_instance, "reject_callback")
+        else {
             return;
         };
+        if let Ok(mut owners) = self.async_resource_owners.lock() {
+            owners.remove(&id);
+        }
+        if !self.callback_owner_is_current(&callback_owner, id) {
+            return;
+        }
+        let invocation = callback_owner.invocation.clone();
+        let name = callback_owner.plugin_name;
+        if let Some(state) = self.plugin_tracked_state.borrow_mut().get_mut(&name) {
+            state
+                .background_process_ids
+                .retain(|(_, process_id)| *process_id != id);
+            state
+                .host_process_ids
+                .retain(|(_, process_id)| *process_id != id);
+        }
 
         let plugin_contexts = self.plugin_contexts.borrow();
         let Some(context) = plugin_contexts.get(&name) else {
-            tracing::warn!("reject_callback: Context lost for plugin {}", name);
+            tracing::warn!(callback_id = id, plugin = %name, "reject_callback: context lost");
             return;
         };
-
+        let (previous_invocation, previous_snapshot) = self.enter_invocation(invocation);
         context.with(|ctx| {
-            // Get _rejectCallback function from globalThis
             let globals = ctx.globals();
             let reject_fn: rquickjs::Function = match globals.get("_rejectCallback") {
-                Ok(f) => f,
-                Err(e) => {
+                Ok(function) => function,
+                Err(callback_error) => {
                     tracing::error!(
-                        "reject_callback: _rejectCallback not found for callback_id={}: {:?}",
-                        id,
-                        e
+                        callback_id = id,
+                        ?callback_error,
+                        "reject_callback: rejector missing"
                     );
                     return;
                 }
             };
-
-            // Call the function with callback_id (as u64) and error string
-            if let Err(e) = reject_fn.call::<_, ()>((id, error)) {
-                log_js_error(&ctx, e, &format!("rejecting callback {}", id));
+            if let Err(callback_error) = reject_fn.call::<_, ()>((id, error)) {
+                log_js_error(&ctx, callback_error, &format!("rejecting callback {id}"));
             }
-
-            // IMPORTANT: Run pending jobs to process Promise continuations
-            run_pending_jobs_checked(&ctx, &format!("reject_callback {}", id));
+            run_pending_jobs_checked(&ctx, &format!("reject_callback {id}"));
         });
+        self.leave_invocation(previous_invocation, previous_snapshot);
     }
 }
 
@@ -9342,17 +11229,59 @@ mod tests {
     use std::sync::mpsc;
 
     /// Helper to create a backend with a command receiver for testing
-    fn create_test_backend() -> (QuickJsBackend, mpsc::Receiver<PluginCommand>) {
+    fn create_test_backend() -> (QuickJsBackend, mpsc::Receiver<PluginCommandEnvelope>) {
         let (tx, rx) = mpsc::channel();
         let state_snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
         let services = Arc::new(TestServiceBridge::new());
         let backend = QuickJsBackend::with_state(state_snapshot, tx, services).unwrap();
+        backend
+            .prepare_plugin_load("test", PluginLoadKind::External)
+            .unwrap();
         (backend, rx)
+    }
+    fn trusted_orchestrator_kind() -> PluginLoadKind {
+        let spec = crate::runtime::TrustedBuiltinSpec::from_embedded_files(
+            TrustedBuiltinPlugin::Orchestrator,
+            PathBuf::from("/unused-trusted-plugin-root"),
+            PathBuf::from("orchestrator.ts"),
+            [(PathBuf::from("orchestrator.ts"), b"".as_slice())],
+        )
+        .unwrap();
+        PluginLoadKind::bundled(crate::runtime::TrustedBuiltinManifest::new([(
+            "orchestrator".to_string(),
+            spec,
+        )]))
+    }
+
+    struct TestDirectories(std::path::PathBuf);
+
+    impl TestDirectories {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "fresh-plugin-runtime-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectories {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     struct TestServiceBridge {
         en_strings: std::sync::Mutex<HashMap<String, String>>,
         fs: Arc<dyn fresh_core::services::PluginFilesystem>,
+        directories: TestDirectories,
     }
 
     impl TestServiceBridge {
@@ -9360,6 +11289,7 @@ mod tests {
             Self {
                 en_strings: std::sync::Mutex::new(HashMap::new()),
                 fs: Arc::new(StdTestFilesystem),
+                directories: TestDirectories::new(),
             }
         }
 
@@ -9369,6 +11299,7 @@ mod tests {
             Self {
                 en_strings: std::sync::Mutex::new(HashMap::new()),
                 fs,
+                directories: TestDirectories::new(),
             }
         }
     }
@@ -9450,6 +11381,7 @@ mod tests {
         fn authority_filesystem(
             &self,
             _window: Option<u64>,
+            _authority: Option<fresh_core::api::AuthorityStamp>,
         ) -> Arc<dyn fresh_core::services::PluginFilesystem> {
             Arc::clone(&self.fs)
         }
@@ -9488,13 +11420,13 @@ mod tests {
         fn unregister_commands_by_prefix(&self, _prefix: &str) {}
         fn unregister_commands_by_plugin(&self, _plugin_name: &str) {}
         fn plugins_dir(&self) -> std::path::PathBuf {
-            std::path::PathBuf::from("/tmp/plugins")
+            self.directories.path().join("plugins")
         }
         fn config_dir(&self) -> std::path::PathBuf {
-            std::path::PathBuf::from("/tmp/config")
+            self.directories.path().join("config")
         }
         fn data_dir(&self) -> std::path::PathBuf {
-            std::path::PathBuf::from("/tmp/data")
+            self.directories.path().join("data")
         }
         fn get_theme_data(&self, _name: &str) -> Option<serde_json::Value> {
             None
@@ -9559,7 +11491,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert_eq!(message, "Hello from test");
@@ -9583,7 +11515,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::RegisterCommand { command } => {
                 assert_eq!(command.name, "Test Command");
@@ -9612,7 +11544,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::DefineMode {
                 name,
@@ -9649,7 +11581,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetEditorMode { mode } => {
                 assert_eq!(mode, Some("vi-normal".to_string()));
@@ -9672,7 +11604,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetEditorMode { mode } => {
                 assert!(mode.is_none());
@@ -9695,7 +11627,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::InsertAtCursor { text } => {
                 assert_eq!(text, "Hello, World!");
@@ -9718,7 +11650,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetContext { name, active } => {
                 assert_eq!(name, "myContext");
@@ -9761,7 +11693,7 @@ mod tests {
         backend.execute_action("my_sync_action").await.unwrap();
 
         // Check the command was sent
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert_eq!(message, "sync action executed");
@@ -9804,7 +11736,7 @@ mod tests {
         backend.execute_action("my_async_action").await.unwrap();
 
         // Check the command was sent (async should complete)
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert_eq!(message, "async action executed");
@@ -9844,7 +11776,7 @@ mod tests {
         // Execute the action by name (should resolve to handler)
         backend.execute_action("my_action").await.unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert_eq!(message, "handler executed");
@@ -9915,7 +11847,7 @@ mod tests {
         let event_data: serde_json::Value = serde_json::json!({"path": "/test.txt"});
         backend.emit("bufferSave", &event_data).await.unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert!(message.contains("/test.txt"));
@@ -9950,10 +11882,10 @@ mod tests {
 
         let event_data: serde_json::Value = serde_json::json!({ "panel_id": 7 });
         backend
-            .emit_to("widget_event", &event_data, Some("beta"))
+            .emit_to("widget_event", &event_data, Some("beta"), None)
             .await
             .unwrap();
-        match rx.try_recv().unwrap() {
+        match rx.try_recv().unwrap().command {
             PluginCommand::SetStatus { message } => assert_eq!(message, "beta got 7"),
             cmd => panic!("Expected SetStatus, got {:?}", cmd),
         }
@@ -9963,11 +11895,11 @@ mod tests {
         );
 
         backend
-            .emit_to("widget_event", &event_data, None)
+            .emit_to("widget_event", &event_data, None, None)
             .await
             .unwrap();
         let mut got: Vec<String> = Vec::new();
-        while let Ok(cmd) = rx.try_recv() {
+        while let Ok(PluginCommandEnvelope { command: cmd, .. }) = rx.try_recv() {
             if let PluginCommand::SetStatus { message } = cmd {
                 got.push(message);
             }
@@ -10004,7 +11936,7 @@ mod tests {
         });
         backend.emit("bigEvent", &event_data).await.unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert_eq!(
@@ -10030,7 +11962,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetClipboard { text } => {
                 assert_eq!(text, "clipboard text");
@@ -10067,7 +11999,7 @@ mod tests {
             ("/with-position.txt", Some(12), Some(3)),
         ];
         for (want_path, want_line, want_col) in expected {
-            let cmd = rx.try_recv().unwrap();
+            let cmd = rx.try_recv().unwrap().command;
             match cmd {
                 PluginCommand::OpenFileAtLocation { path, line, column } => {
                     assert_eq!(path.to_str().unwrap(), want_path);
@@ -10094,7 +12026,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::DeleteRange { range, .. } => {
                 assert_eq!(range.start, 10);
@@ -10119,7 +12051,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::InsertText { position, text, .. } => {
                 assert_eq!(position, 5);
@@ -10144,7 +12076,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetBufferCursor { position, .. } => {
                 assert_eq!(position, 100);
@@ -10541,7 +12473,7 @@ mod tests {
         // Execute the transpiled JavaScript
         backend.execute_js(&js_code, "test.js").unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetStatus { message } => {
                 assert_eq!(message, "Hello, TypeScript");
@@ -10567,7 +12499,7 @@ mod tests {
             .unwrap();
 
         // Verify the GetBufferText command was sent
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::GetBufferText {
                 buffer_id,
@@ -10582,6 +12514,73 @@ mod tests {
             }
             _ => panic!("Expected GetBufferText, got {:?}", cmd),
         }
+    }
+
+    #[test]
+    fn flush_authority_rejection_settles_only_its_exact_promise() {
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .execute_js(
+                r#"
+                const editor = getEditor();
+                globalThis._firstFlush = "pending";
+                globalThis._secondFlush = "pending";
+                editor.flush().then(
+                    () => { globalThis._firstFlush = "resolved"; },
+                    error => { globalThis._firstFlush = error.message; },
+                );
+                editor.flush().then(
+                    () => { globalThis._secondFlush = "resolved"; },
+                    error => { globalThis._secondFlush = error.message; },
+                );
+                "#,
+                "test.js",
+            )
+            .unwrap();
+
+        let first = rx.try_recv().unwrap();
+        let first_request_id = match first.command {
+            PluginCommand::SyncSnapshot { request_id } => request_id,
+            command => panic!("Expected SyncSnapshot, got {command:?}"),
+        };
+        let second = rx.try_recv().unwrap();
+        let second_request_id = match second.command {
+            PluginCommand::SyncSnapshot { request_id } => request_id,
+            command => panic!("Expected SyncSnapshot, got {command:?}"),
+        };
+        assert_eq!(
+            first.context.plugin_instance_id,
+            second.context.plugin_instance_id
+        );
+
+        backend.reject_callback_for(
+            first.context.plugin_instance_id,
+            JsCallbackId::from(first_request_id),
+            "plugin command source authority was replaced",
+        );
+        backend.resolve_callback_for(
+            second.context.plugin_instance_id,
+            JsCallbackId::from(second_request_id),
+            "null",
+        );
+
+        backend
+            .plugin_contexts
+            .borrow()
+            .get("test")
+            .unwrap()
+            .clone()
+            .with(|ctx| {
+                let globals = ctx.globals();
+                assert_eq!(
+                    globals.get::<_, String>("_firstFlush").unwrap(),
+                    "plugin command source authority was replaced"
+                );
+                assert_eq!(
+                    globals.get::<_, String>("_secondFlush").unwrap(),
+                    "resolved"
+                );
+            });
     }
 
     #[test]
@@ -10603,7 +12602,7 @@ mod tests {
             .unwrap();
 
         // Get the request_id from the command
-        let request_id = match rx.try_recv().unwrap() {
+        let request_id = match rx.try_recv().unwrap().command {
             PluginCommand::GetBufferText { request_id, .. } => request_id,
             cmd => panic!("Expected GetBufferText, got {:?}", cmd),
         };
@@ -10634,6 +12633,142 @@ mod tests {
                 let result: String = global.get("_resolvedText").unwrap();
                 assert_eq!(result, "hello world");
             });
+    }
+
+    #[test]
+    fn async_callback_resumes_with_shared_invocation_snapshot() {
+        let (mut backend, rx) = create_test_backend();
+        let snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        snapshot.write().unwrap().active_window_id = fresh_core::WindowId(7);
+        let authority = fresh_core::api::AuthorityStamp {
+            id: 3,
+            generation: 4,
+        };
+        let invocation = PluginInvocation {
+            window_id: fresh_core::WindowId(7),
+            authority: Some(authority),
+            state_snapshot: Some(Arc::clone(&snapshot)),
+        };
+
+        let (previous_invocation, previous_snapshot) = backend.enter_invocation(Some(invocation));
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            editor.getBufferText(0, 0, 1).then(() => {
+                editor.setStatus(String(editor.activeWindow()));
+            });
+        "#,
+                "test.js",
+            )
+            .unwrap();
+        backend.leave_invocation(previous_invocation, previous_snapshot);
+
+        let request = rx.try_recv().unwrap();
+        let request_id = match request.command {
+            PluginCommand::GetBufferText { request_id, .. } => request_id,
+            command => panic!("Expected GetBufferText, got {command:?}"),
+        };
+        assert_eq!(request.context.source_window, Some(fresh_core::WindowId(7)));
+        assert_eq!(request.context.source_authority, Some(authority));
+        assert!(Arc::ptr_eq(
+            request.context.state_snapshot.as_ref().unwrap(),
+            &snapshot,
+        ));
+
+        snapshot.write().unwrap().active_window_id = fresh_core::WindowId(9);
+        backend.resolve_callback(JsCallbackId::from(request_id), "\"done\"");
+
+        let resumed = rx.try_recv().unwrap();
+        match resumed.command {
+            PluginCommand::SetStatus { message } => assert_eq!(message, "9"),
+            command => panic!("Expected SetStatus, got {command:?}"),
+        }
+        assert_eq!(resumed.context.source_window, Some(fresh_core::WindowId(7)));
+        assert_eq!(resumed.context.source_authority, Some(authority));
+        assert!(Arc::ptr_eq(
+            resumed.context.state_snapshot.as_ref().unwrap(),
+            &snapshot,
+        ));
+    }
+
+    #[test]
+    fn invocation_marker_writes_persist_and_seed_the_next_invocation() {
+        let (mut backend, _rx) = create_test_backend();
+        backend.state_snapshot.write().unwrap().active_buffer_id = BufferId(42);
+
+        let first_snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        first_snapshot.write().unwrap().active_buffer_id = BufferId(42);
+        let first_invocation = PluginInvocation {
+            window_id: fresh_core::WindowId(7),
+            authority: None,
+            state_snapshot: Some(Arc::clone(&first_snapshot)),
+        };
+
+        let (previous_invocation, previous_snapshot) =
+            backend.enter_invocation(Some(first_invocation));
+        backend
+            .execute_js(
+                "getEditor().createMarker(42, 'tracked', 5, 8, null);",
+                "test.js",
+            )
+            .unwrap();
+        backend.leave_invocation(previous_invocation, previous_snapshot);
+
+        assert_eq!(
+            backend.state_snapshot.read().unwrap().plugin_markers[&BufferId(42)]["tracked"].start,
+            5
+        );
+        assert_eq!(
+            first_snapshot.read().unwrap().plugin_markers[&BufferId(42)]["tracked"].end,
+            8
+        );
+
+        let second_snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        second_snapshot.write().unwrap().active_buffer_id = BufferId(42);
+        let second_invocation = PluginInvocation {
+            window_id: fresh_core::WindowId(7),
+            authority: None,
+            state_snapshot: Some(second_snapshot),
+        };
+        let (previous_invocation, previous_snapshot) =
+            backend.enter_invocation(Some(second_invocation));
+        assert_eq!(
+            backend.state_snapshot.read().unwrap().plugin_markers[&BufferId(42)]["tracked"].start,
+            5
+        );
+        backend.leave_invocation(previous_invocation, previous_snapshot);
+    }
+
+    #[test]
+    fn host_snapshot_refresh_during_invocation_is_not_rolled_back() {
+        let (backend, _rx) = create_test_backend();
+        {
+            let mut shared = backend.state_snapshot.write().unwrap();
+            shared.authority_label = "local".into();
+            shared.host_revision = 7;
+        }
+
+        let private_snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        private_snapshot.write().unwrap().authority_label = "container".into();
+        let invocation = PluginInvocation {
+            window_id: fresh_core::WindowId(7),
+            authority: None,
+            state_snapshot: Some(private_snapshot),
+        };
+        let (previous_invocation, previous_snapshot) = backend.enter_invocation(Some(invocation));
+
+        {
+            let mut shared = backend.state_snapshot.write().unwrap();
+            assert_eq!(shared.authority_label, "container");
+            shared.authority_label.clear();
+            shared.host_revision = shared.host_revision.wrapping_add(1);
+        }
+        backend.leave_invocation(previous_invocation, previous_snapshot);
+
+        let shared = backend.state_snapshot.read().unwrap();
+        assert_eq!(shared.authority_label, "");
+        assert_eq!(shared.host_revision, 8);
     }
 
     #[test]
@@ -10737,7 +12872,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetLineIndicator {
                 buffer_id,
@@ -10772,7 +12907,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::ClearLineIndicators {
                 buffer_id,
@@ -10812,7 +12947,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::CreateVirtualBufferWithContent {
                 name,
@@ -10853,7 +12988,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetVirtualBufferContent { buffer_id, entries } => {
                 assert_eq!(buffer_id.0, 5);
@@ -10884,7 +13019,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::AddOverlay {
                 buffer_id,
@@ -10932,7 +13067,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::AddOverlay {
                 buffer_id,
@@ -10976,7 +13111,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::ClearNamespace {
                 buffer_id,
@@ -11063,7 +13198,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::ApplyTheme { theme_name } => {
                 assert_eq!(theme_name, "dark");
@@ -11091,7 +13226,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::OverrideThemeColors { overrides } => {
                 assert_eq!(overrides.get("editor.bg").copied(), Some([10, 20, 30]));
@@ -11118,7 +13253,7 @@ mod tests {
             )
             .unwrap();
 
-        match rx.try_recv().unwrap() {
+        match rx.try_recv().unwrap().command {
             PluginCommand::OverrideThemeColors { overrides } => {
                 assert_eq!(overrides.get("editor.bg").copied(), Some([0, 255, 128]));
             }
@@ -11147,7 +13282,7 @@ mod tests {
             )
             .unwrap();
 
-        match rx.try_recv().unwrap() {
+        match rx.try_recv().unwrap().command {
             PluginCommand::OverrideThemeColors { overrides } => {
                 assert_eq!(overrides.get("editor.bg").copied(), Some([1, 2, 3]));
                 assert!(!overrides.contains_key("not_an_array"));
@@ -11302,8 +13437,9 @@ mod tests {
         fn authority_filesystem(
             &self,
             window: Option<u64>,
+            authority: Option<fresh_core::api::AuthorityStamp>,
         ) -> Arc<dyn fresh_core::services::PluginFilesystem> {
-            self.inner.authority_filesystem(window)
+            self.inner.authority_filesystem(window, authority)
         }
         fn local_filesystem(&self) -> Arc<dyn fresh_core::services::PluginFilesystem> {
             self.inner.local_filesystem()
@@ -11391,7 +13527,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::CloseBuffer { buffer_id, force } => {
                 assert_eq!(buffer_id.0, 3);
@@ -11416,7 +13552,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::FocusSplit { split_id } => {
                 assert_eq!(split_id.0, 2);
@@ -11444,7 +13580,7 @@ mod tests {
             )
             .unwrap();
 
-        let create = rx.try_recv().unwrap();
+        let create = rx.try_recv().unwrap().command;
         match create {
             fresh_core::api::PluginCommand::CreateWindow { root, label } => {
                 assert_eq!(root, std::path::PathBuf::from("/tmp/wt-feat"));
@@ -11453,7 +13589,7 @@ mod tests {
             other => panic!("Expected CreateWindow, got {:?}", other),
         }
 
-        let activate = rx.try_recv().unwrap();
+        let activate = rx.try_recv().unwrap().command;
         match activate {
             fresh_core::api::PluginCommand::SetActiveWindow { id } => {
                 assert_eq!(id, fresh_core::WindowId(7));
@@ -11461,13 +13597,77 @@ mod tests {
             other => panic!("Expected SetActiveWindow, got {:?}", other),
         }
 
-        let close = rx.try_recv().unwrap();
+        let close = rx.try_recv().unwrap().command;
         match close {
             fresh_core::api::PluginCommand::CloseWindow { id } => {
                 assert_eq!(id, fresh_core::WindowId(3));
             }
             other => panic!("Expected CloseWindow, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn trusted_lifecycle_api_dispatches_exact_restore_and_stop() {
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .prepare_plugin_load("orchestrator", trusted_orchestrator_kind())
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                const editor = getEditor();
+                void editor.restoreWorkspaceWindow("/tmp/exact-root", "Exact", "ws-exact", true);
+                editor.stopWindow(7, 1500);
+                "#,
+                "orchestrator",
+                false,
+            )
+            .unwrap();
+
+        let restore = rx.try_recv().unwrap();
+        assert!(restore.context.is_trusted_orchestrator());
+        match restore.command {
+            PluginCommand::RestoreWorkspaceWindow {
+                root,
+                label,
+                stable_id,
+                activate,
+                callback_id: _,
+            } => {
+                assert_eq!(root, std::path::PathBuf::from("/tmp/exact-root"));
+                assert_eq!(label, "Exact");
+                assert_eq!(stable_id.as_deref(), Some("ws-exact"));
+                assert!(activate);
+            }
+            command => panic!("Expected RestoreWorkspaceWindow, got {command:?}"),
+        }
+
+        let stop = rx.try_recv().unwrap();
+        assert!(stop.context.is_trusted_orchestrator());
+        match stop.command {
+            PluginCommand::StopWindow { id, grace_ms } => {
+                assert_eq!(id, fresh_core::WindowId(7));
+                assert_eq!(grace_ms, 1500);
+            }
+            command => panic!("Expected StopWindow, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn external_plugin_cannot_restore_workspace_identity() {
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .execute_js(
+                r#"
+                void getEditor()
+                    .restoreWorkspaceWindow("/tmp/exact-root", "Exact", "ws-exact", true)
+                    .catch(() => {});
+                "#,
+                "test.js",
+            )
+            .unwrap();
+
+        assert!(rx.try_recv().is_err());
     }
 
     /// `editor.listWindows()` reads from the state snapshot and
@@ -11488,6 +13688,8 @@ mod tests {
                     root: std::path::PathBuf::from("/repo"),
                     project_path: std::path::PathBuf::from("/repo"),
                     shared_worktree: false,
+                    selected_agent_terminal_id: None,
+
                     remote: None,
                 },
                 fresh_core::api::WindowInfo {
@@ -11497,6 +13699,8 @@ mod tests {
                     root: std::path::PathBuf::from("/wt/feat-auth"),
                     project_path: std::path::PathBuf::from("/wt/feat-auth"),
                     shared_worktree: false,
+                    selected_agent_terminal_id: None,
+
                     remote: None,
                 },
             ];
@@ -11635,7 +13839,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::StartPrompt {
                 label,
@@ -11664,7 +13868,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::StartPromptWithInitial {
                 label,
@@ -11698,7 +13902,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetPromptSuggestions { suggestions, .. } => {
                 assert_eq!(suggestions.len(), 2);
@@ -12038,8 +14242,11 @@ mod tests {
         // A real file on the local host, for the LocalPath route to read back.
         let local_file =
             std::env::temp_dir().join(format!("fresh_ptp_route_{}.txt", std::process::id()));
+        let missing_local_file = local_file.with_extension("missing");
+        std::fs::remove_file(&missing_local_file).ok();
         std::fs::write(&local_file, b"LOCALDATA").unwrap();
         let local_file_js = local_file.to_string_lossy().replace('\\', "\\\\");
+        let missing_local_file_js = missing_local_file.to_string_lossy().replace('\\', "\\\\");
 
         let js = format!(
             r#"
@@ -12054,8 +14261,10 @@ mod tests {
             globalThis._winRead = editor.readFile(editor.windowPath(7, "/definitely/not/on/disk/xyz"));
             // localPath(...) → the local host, reading the real temp file.
             globalThis._localRead = editor.readFile(editor.localPath("{local}"));
+            globalThis._missingLocalReadIsNull = editor.readFile(editor.localPath("{missing}")) === null;
         "#,
             local = local_file_js,
+            missing = missing_local_file_js,
         );
 
         backend.execute_js(&js, "test.js").unwrap();
@@ -12075,9 +14284,57 @@ mod tests {
                 assert_eq!(global.get::<_, String>("_winRead").unwrap(), "SENTINEL");
                 // LocalPath hits the local host and reads the real file.
                 assert_eq!(global.get::<_, String>("_localRead").unwrap(), "LOCALDATA");
+                assert!(global.get::<_, bool>("_missingLocalReadIsNull").unwrap());
             });
 
         std::fs::remove_file(&local_file).ok();
+    }
+    #[test]
+    fn remove_path_allows_data_dir_descendants_but_not_the_data_root() {
+        let (mut backend, _rx) = create_test_backend();
+        backend
+            .execute_js("globalThis._dataDir = getEditor().getDataDir();", "test.js")
+            .unwrap();
+        let data_dir = backend
+            .plugin_contexts
+            .borrow()
+            .get("test")
+            .unwrap()
+            .clone()
+            .with(|ctx| ctx.globals().get::<_, String>("_dataDir").unwrap());
+        let data_dir = PathBuf::from(data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let target = data_dir.join("child");
+        std::fs::write(&target, b"state").unwrap();
+        let target_js = target.to_string_lossy().replace('\\', "\\\\");
+        let data_dir_js = data_dir.to_string_lossy().replace('\\', "\\\\");
+
+        backend
+            .execute_js(
+                &format!(
+                    r#"
+                    const editor = getEditor();
+                    globalThis._removedDataChild = editor.removePath(editor.localPath("{target_js}"));
+                    globalThis._removedDataRoot = editor.removePath(editor.localPath("{data_dir_js}"));
+                    "#,
+                ),
+                "test.js",
+            )
+            .unwrap();
+
+        backend
+            .plugin_contexts
+            .borrow()
+            .get("test")
+            .unwrap()
+            .clone()
+            .with(|ctx| {
+                let global = ctx.globals();
+                assert!(global.get::<_, bool>("_removedDataChild").unwrap());
+                assert!(!global.get::<_, bool>("_removedDataRoot").unwrap());
+            });
+        assert!(!target.exists());
+        assert!(data_dir.exists());
     }
 
     #[test]
@@ -12129,13 +14386,639 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::ExecuteAction { action_name } => {
                 assert_eq!(action_name, "move_cursor_up");
             }
             _ => panic!("Expected ExecuteAction, got {:?}", cmd),
         }
+    }
+
+    #[test]
+    fn omp_companion_async_api_rejects_untrusted_context() {
+        let (backend, rx) = create_test_backend();
+        let api = backend.build_editor_api("test");
+
+        backend.main_context.clone().with(|ctx| {
+            assert!(api
+                .send_omp_companion_command_start(
+                    ctx,
+                    fresh_core::WindowTerminalId::new(
+                        fresh_core::WindowId(7),
+                        fresh_core::TerminalId(11),
+                    ),
+                    fresh_core::api::OmpCompanionCommandType::Cancel,
+                    fresh_core::api::OmpCompanionCommandTargetV1 {
+                        incarnation: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                        session_generation: 3,
+                        session_id: "018f1d74-7f7b-7d31-8d93-9a21c7b95bb1".to_string(),
+                        work_epoch: 9,
+                    },
+                )
+                .is_err());
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn promise_rejection_tracker_waits_for_checkpoint_and_reports_only_unhandled() {
+        let (mut backend, rx) = create_test_backend();
+        let plugin_instance_id = PluginInstanceId::fresh();
+        let authority = fresh_core::api::AuthorityStamp {
+            id: 12,
+            generation: 4,
+        };
+        backend
+            .prepare_plugin_load(
+                "agent-script-91",
+                PluginLoadKind::AgentScript {
+                    request_id: 91,
+                    plugin_instance_id,
+                    window_id: fresh_core::WindowId(12),
+                    authority,
+                    state_snapshot: Arc::new(RwLock::new(EditorStateSnapshot::new())),
+                },
+            )
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                globalThis.__handledBeforeCheckpoint = false;
+                Promise.reject(new Error("handled before checkpoint")).catch(() => {
+                    globalThis.__handledBeforeCheckpoint = true;
+                });
+                Promise.reject(new Error("still unhandled"));
+                "#,
+                "agent-script-91",
+                false,
+            )
+            .unwrap();
+
+        {
+            let pending = backend.pending_promise_rejections.borrow();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].error_msg.contains("still unhandled"));
+        }
+        backend.poll_event_loop_once();
+        assert!(backend.pending_promise_rejections.borrow().is_empty());
+        backend
+            .plugin_contexts
+            .borrow()
+            .get("agent-script-91")
+            .unwrap()
+            .clone()
+            .with(|ctx| {
+                assert!(ctx
+                    .globals()
+                    .get::<_, bool>("__handledBeforeCheckpoint")
+                    .unwrap());
+            });
+
+        let envelope = rx.try_recv().expect("unhandled rejection completion");
+        assert_eq!(envelope.context.plugin_name.as_ref(), "agent-script-91");
+        assert_eq!(envelope.context.plugin_instance_id, plugin_instance_id);
+        assert_eq!(envelope.context.source_authority, Some(authority));
+        match envelope.command {
+            PluginCommand::CompleteCommand {
+                request_id,
+                ok,
+                output,
+                error,
+            } => {
+                assert_eq!(request_id, 91);
+                assert!(!ok);
+                assert!(output.is_none());
+                assert!(error.unwrap().contains("still unhandled"));
+            }
+            command => panic!("expected CompleteCommand, got {command:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn trusted_plugin_api_is_host_whitelisted_and_structured_cloned() {
+        let (mut backend, _rx) = create_test_backend();
+        backend
+            .prepare_plugin_load("orchestrator", trusted_orchestrator_kind())
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                editor.exportPluginApi("orchestrator", {
+                    runAgent: async (options, windowId) => {
+                        options.nested.value = 99;
+                        return { owner: getEditor().pluginName(), options, windowId };
+                    },
+                    newWorkspace: async (options, windowId) => {
+                        if (options.reject) {
+                            throw new Error("expected privileged rejection");
+                        }
+                        return { options, windowId };
+                    },
+                    listWorkspaces: () => [{ id: "one" }],
+                    focusWorkspace: async () => true,
+                });
+                "#,
+                "orchestrator",
+                false,
+            )
+            .unwrap();
+
+        backend
+            .prepare_plugin_load("api-caller", PluginLoadKind::External)
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                const api = editor.getPluginApi("orchestrator");
+                const input = { nested: { value: 1 } };
+                globalThis.__apiKeys = Object.keys(api).sort().join(",");
+                globalThis.__apiNullPrototype = Object.getPrototypeOf(api) === null;
+                globalThis.__apiConstructorOwner = api.runAgent.constructor(
+                    "return getEditor().pluginName()"
+                )();
+                globalThis.__apiListCallerPrototype =
+                    Object.getPrototypeOf(api.listWorkspaces()[0]) === Object.prototype;
+                globalThis.__apiLeakedTemporary = "__freshScopedPluginApi" in globalThis;
+                globalThis.__apiSettled = false;
+                api.runAgent(input).then((result) => {
+                    globalThis.__apiInputUnchanged = input.nested.value === 1;
+                    globalThis.__apiResultCloned =
+                        result.options.nested.value === 99 &&
+                        Object.getPrototypeOf(result) === Object.prototype;
+                    globalThis.__apiOwner = result.owner;
+                    globalThis.__apiSettled = true;
+                });
+                globalThis.__apiRejected = false;
+                (async () => {
+                    try {
+                        await api.newWorkspace({ reject: true });
+                    } catch (error) {
+                        globalThis.__apiRejected =
+                            error.message === "expected privileged rejection";
+                    }
+                })();
+                "#,
+                "api-caller",
+                false,
+            )
+            .unwrap();
+        assert!(
+            backend.pending_promise_rejections.borrow().is_empty(),
+            "the bridge must attach its exporter rejection handler synchronously"
+        );
+        backend.poll_event_loop_once();
+
+        backend
+            .plugin_contexts
+            .borrow()
+            .get("api-caller")
+            .unwrap()
+            .clone()
+            .with(|ctx| {
+                let globals = ctx.globals();
+                assert_eq!(
+                    globals.get::<_, String>("__apiKeys").unwrap(),
+                    "focusWorkspace,listWorkspaces,newWorkspace,runAgent"
+                );
+                assert!(globals.get::<_, bool>("__apiNullPrototype").unwrap());
+                assert_eq!(
+                    globals.get::<_, String>("__apiConstructorOwner").unwrap(),
+                    "api-caller"
+                );
+                assert!(globals.get::<_, bool>("__apiListCallerPrototype").unwrap());
+                assert!(!globals.get::<_, bool>("__apiLeakedTemporary").unwrap());
+                assert!(globals.get::<_, bool>("__apiSettled").unwrap());
+                assert!(globals.get::<_, bool>("__apiInputUnchanged").unwrap());
+                assert!(globals.get::<_, bool>("__apiResultCloned").unwrap());
+                assert!(globals.get::<_, bool>("__apiRejected").unwrap());
+                assert_eq!(
+                    globals.get::<_, String>("__apiOwner").unwrap(),
+                    "orchestrator"
+                );
+            });
+
+        let authority = fresh_core::api::AuthorityStamp {
+            id: 9,
+            generation: 2,
+        };
+        backend
+            .prepare_plugin_load(
+                "agent-script-88",
+                PluginLoadKind::AgentScript {
+                    request_id: 88,
+                    plugin_instance_id: PluginInstanceId::fresh(),
+                    window_id: fresh_core::WindowId(9),
+                    authority,
+                    state_snapshot: Arc::new(RwLock::new(EditorStateSnapshot::new())),
+                },
+            )
+            .unwrap();
+        backend
+            .execute_source(
+                r#"
+                const api = editor.getPluginApi("orchestrator");
+                globalThis.__scopedKeys = Object.keys(api).sort().join(",");
+                globalThis.__scopedWindow = 0;
+                api.runAgent({ nested: { value: 1 } }).then((result) => {
+                    globalThis.__scopedWindow = result.windowId;
+                });
+                "#,
+                "agent-script-88",
+                false,
+            )
+            .unwrap();
+        backend.poll_event_loop_once();
+        backend
+            .plugin_contexts
+            .borrow()
+            .get("agent-script-88")
+            .unwrap()
+            .clone()
+            .with(|ctx| {
+                let globals = ctx.globals();
+                assert_eq!(
+                    globals.get::<_, String>("__scopedKeys").unwrap(),
+                    "newWorkspace,runAgent"
+                );
+                assert_eq!(globals.get::<_, u64>("__scopedWindow").unwrap(), 9);
+            });
+    }
+
+    #[test]
+    fn reserved_builtin_name_requires_bundled_loader_provenance() {
+        let (backend, _rx) = create_test_backend();
+        assert!(backend
+            .validate_plugin_load("orchestrator", &PluginLoadKind::External)
+            .is_err());
+        assert!(backend
+            .validate_plugin_load(
+                "orchestrator",
+                &PluginLoadKind::AgentScript {
+                    request_id: 3,
+                    plugin_instance_id: PluginInstanceId::fresh(),
+                    window_id: fresh_core::WindowId(3),
+                    authority: fresh_core::api::AuthorityStamp {
+                        id: 3,
+                        generation: 1,
+                    },
+                    state_snapshot: Arc::new(RwLock::new(EditorStateSnapshot::new())),
+                },
+            )
+            .is_err());
+        assert!(backend
+            .validate_plugin_load("orchestrator", &PluginLoadKind::bundled(Default::default()),)
+            .is_err());
+        assert!(backend
+            .validate_plugin_load("orchestrator", &trusted_orchestrator_kind())
+            .is_ok());
+    }
+
+    #[test]
+    fn private_snapshot_subscription_rejects_external_and_window_script_contexts() {
+        let (backend, _rx) = create_test_backend();
+        let external_api = backend.build_editor_api("test");
+        backend.main_context.clone().with(|ctx| {
+            external_api.on(
+                ctx,
+                PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT.to_string(),
+                "externalHandler".to_string(),
+            );
+        });
+        assert!(!backend.has_handlers(PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT));
+
+        backend
+            .prepare_plugin_load(
+                "agent-script-77",
+                PluginLoadKind::AgentScript {
+                    request_id: 77,
+                    plugin_instance_id: PluginInstanceId::fresh(),
+                    window_id: fresh_core::WindowId(9),
+                    authority: fresh_core::api::AuthorityStamp {
+                        id: 9,
+                        generation: 1,
+                    },
+                    state_snapshot: Arc::new(RwLock::new(EditorStateSnapshot::new())),
+                },
+            )
+            .unwrap();
+        let window_script_api = backend.build_editor_api("agent-script-77");
+        backend.main_context.clone().with(|ctx| {
+            window_script_api.on(
+                ctx,
+                PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT.to_string(),
+                "windowScriptHandler".to_string(),
+            );
+        });
+        assert!(!backend.has_handlers(PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT));
+    }
+
+    #[test]
+    fn private_snapshot_subscription_accepts_trusted_orchestrator() {
+        let (backend, _rx) = create_test_backend();
+        backend
+            .prepare_plugin_load("orchestrator", trusted_orchestrator_kind())
+            .unwrap();
+        let api = backend.build_editor_api("orchestrator");
+        backend.main_context.clone().with(|ctx| {
+            api.on(
+                ctx,
+                PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT.to_string(),
+                "trustedHandler".to_string(),
+            );
+        });
+        assert!(backend.has_handlers(PRIVATE_OMP_COMPANION_SNAPSHOT_EVENT));
+    }
+
+    #[test]
+    fn bundled_orchestrator_command_carries_trusted_provenance() {
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .prepare_plugin_load("orchestrator", trusted_orchestrator_kind())
+            .unwrap();
+        backend
+            .execute_source(
+                r#"getEditor().sendOmpCompanionCommand({ windowId: 7, terminalId: 11 }, "cancel", { incarnation: "550e8400-e29b-41d4-a716-446655440000", sessionGeneration: 3, sessionId: "018f1d74-7f7b-7d31-8d93-9a21c7b95bb1", workEpoch: 9 });"#,
+                "orchestrator",
+                false,
+            )
+            .unwrap();
+
+        let envelope = rx.try_recv().unwrap();
+        assert_eq!(envelope.context.plugin_name.as_ref(), "orchestrator");
+        assert!(envelope.context.is_trusted_orchestrator());
+        match envelope.command {
+            PluginCommand::SendOmpCompanionCommand {
+                terminal_id,
+                command_type,
+                target,
+                request_id,
+            } => {
+                assert_eq!(
+                    terminal_id,
+                    fresh_core::WindowTerminalId::new(
+                        fresh_core::WindowId(7),
+                        fresh_core::TerminalId(11),
+                    )
+                );
+                assert_eq!(
+                    command_type,
+                    fresh_core::api::OmpCompanionCommandType::Cancel
+                );
+                assert_eq!(
+                    target,
+                    fresh_core::api::OmpCompanionCommandTargetV1 {
+                        incarnation: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                        session_generation: 3,
+                        session_id: "018f1d74-7f7b-7d31-8d93-9a21c7b95bb1".to_string(),
+                        work_epoch: 9,
+                    }
+                );
+                assert!(request_id > 0);
+            }
+            command => panic!("Expected SendOmpCompanionCommand, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_script_api_cannot_escape_its_window_or_plugin_context() {
+        let (backend, rx) = create_test_backend();
+        let snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        let plugin_instance_id = PluginInstanceId::fresh();
+        backend
+            .prepare_plugin_load(
+                "agent-script-41",
+                PluginLoadKind::AgentScript {
+                    request_id: 41,
+                    plugin_instance_id,
+                    window_id: fresh_core::WindowId(7),
+                    authority: fresh_core::api::AuthorityStamp {
+                        id: 7,
+                        generation: 1,
+                    },
+                    state_snapshot: snapshot,
+                },
+            )
+            .unwrap();
+        let api = backend.build_editor_api("agent-script-41");
+
+        assert_eq!(api.active_window(), 7);
+        assert!(!api.set_active_window(8));
+        assert!(!api.create_window("/other".to_string(), "other".to_string()));
+        assert!(!api.execute_action("next_window".to_string()));
+        assert!(!api.complete_command(42.0, true, None, None));
+        backend.main_context.clone().with(|ctx| {
+            assert!(api
+                .load_plugin_start(ctx.clone(), "/tmp/escape.ts".to_string())
+                .is_err());
+            let object = rquickjs::Object::new(ctx.clone()).unwrap();
+            assert!(!api
+                .export_plugin_api(ctx, "escape".to_string(), object.into_value())
+                .unwrap());
+        });
+        assert!(rx.try_recv().is_err());
+        assert!(api.complete_command(41.0, true, None, None));
+        let envelope = rx.try_recv().unwrap();
+        assert_eq!(envelope.context.plugin_name.as_ref(), "agent-script-41");
+        assert_eq!(envelope.context.plugin_instance_id, plugin_instance_id);
+        assert_eq!(
+            envelope.context.source_window,
+            Some(fresh_core::WindowId(7))
+        );
+        match envelope.command {
+            PluginCommand::CompleteCommand { request_id, .. } => {
+                assert_eq!(request_id, 41);
+            }
+            command => panic!("Expected CompleteCommand, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn command_envelopes_preserve_interleaved_sender_contexts() {
+        let (tx, rx) = mpsc::channel();
+        let retained_constructor_sender = tx.clone();
+        let snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        let default_sender = PluginCommandSender::new(tx, Rc::new(RefCell::new(None)));
+        let scoped_sender = default_sender.with_context(PluginCommandContext {
+            window_scope: Some(fresh_core::WindowId(9)),
+            state_snapshot: Some(Arc::clone(&snapshot)),
+            ..PluginCommandContext::default()
+        });
+
+        default_sender
+            .send(PluginCommand::SetStatus {
+                message: "default".to_string(),
+            })
+            .unwrap();
+        retained_constructor_sender
+            .send(PluginCommandEnvelope {
+                command: PluginCommand::SetStatus {
+                    message: "retained-scoped".to_string(),
+                },
+                context: PluginCommandContext {
+                    window_scope: Some(fresh_core::WindowId(8)),
+                    state_snapshot: Some(snapshot),
+                    ..PluginCommandContext::default()
+                },
+            })
+            .unwrap();
+        scoped_sender
+            .send(PluginCommand::SetStatus {
+                message: "scoped".to_string(),
+            })
+            .unwrap();
+
+        let envelopes = rx.try_iter().collect::<Vec<_>>();
+        let contexts = envelopes
+            .iter()
+            .map(|envelope| envelope.context.window_scope)
+            .collect::<Vec<_>>();
+        let messages = envelopes
+            .iter()
+            .map(|envelope| match &envelope.command {
+                PluginCommand::SetStatus { message } => message.as_str(),
+                command => panic!("Expected SetStatus, got {command:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, ["default", "retained-scoped", "scoped"]);
+        assert_eq!(
+            contexts,
+            [
+                None,
+                Some(fresh_core::WindowId(8)),
+                Some(fresh_core::WindowId(9)),
+            ]
+        );
+        assert_eq!(
+            envelopes
+                .iter()
+                .map(|envelope| envelope.context.state_snapshot.is_some())
+                .collect::<Vec<_>>(),
+            [false, true, true]
+        );
+    }
+
+    #[test]
+    fn terminal_creation_does_not_enter_plugin_cleanup_ownership() {
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .execute_js("getEditor().createTerminal({});", "test.js")
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            PluginCommand::CreateTerminal { .. }
+        ));
+        assert!(backend.async_resource_owners.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn plugin_cleanup_enqueues_remote_attach_cancellation_before_retirement() {
+        let (backend, rx) = create_test_backend();
+        let unloading_instance = backend
+            .plugin_load_records
+            .borrow()
+            .get("test")
+            .unwrap()
+            .context
+            .plugin_instance_id;
+        let api = backend.build_editor_api("test");
+        let request_id = backend.main_context.clone().with(|ctx| {
+            let payload = rquickjs::Object::new(ctx.clone()).unwrap();
+            api.attach_remote_agent(ctx, payload.into_value()).unwrap()
+        });
+        let attach = rx.try_recv().unwrap();
+        assert!(matches!(
+            &attach.command,
+            PluginCommand::AttachRemoteAgent {
+                request_id: attached,
+                ..
+            } if *attached == request_id
+        ));
+        assert_eq!(attach.context.plugin_instance_id, unloading_instance);
+        assert!(backend.callback_contexts.borrow().contains_key(&request_id));
+
+        backend.cleanup_plugin("test");
+
+        let cancel = rx.try_recv().unwrap();
+        assert!(matches!(
+            &cancel.command,
+            PluginCommand::CancelRemoteAttaches
+        ));
+        assert_eq!(cancel.context.plugin_instance_id, unloading_instance);
+        assert!(!backend.callback_contexts.borrow().contains_key(&request_id));
+        assert!(!backend
+            .active_plugin_instances
+            .read()
+            .unwrap()
+            .contains(&unloading_instance));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn watch_cleanup_preserves_exact_owner_context() {
+        let (backend, rx) = create_test_backend();
+        let snapshot = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        let mut context = backend
+            .plugin_load_records
+            .borrow()
+            .get("test")
+            .unwrap()
+            .context
+            .clone();
+        context.source_window = Some(fresh_core::WindowId(7));
+        context.source_authority = Some(fresh_core::api::AuthorityStamp {
+            id: 17,
+            generation: 3,
+        });
+        context.window_scope = Some(fresh_core::WindowId(7));
+        context.state_snapshot = Some(Arc::clone(&snapshot));
+        let instance = context.plugin_instance_id;
+
+        backend.record_or_cleanup_async_resource(
+            AsyncResourceOwner {
+                plugin_name: "test".to_string(),
+                plugin_instance_id: instance,
+                context,
+            },
+            TrackedAsyncResource::WatchHandle(91),
+        );
+        backend.cleanup_plugin("test");
+
+        let cancel = rx.try_recv().unwrap();
+        assert!(matches!(
+            &cancel.command,
+            PluginCommand::CancelRemoteAttaches
+        ));
+        assert_eq!(cancel.context.plugin_instance_id, instance);
+        let envelope = rx.try_recv().unwrap();
+        assert!(matches!(
+            envelope.command,
+            PluginCommand::UnwatchPath { handle: 91 }
+        ));
+        assert_eq!(envelope.context.plugin_instance_id, instance);
+        assert_eq!(
+            envelope.context.source_window,
+            Some(fresh_core::WindowId(7))
+        );
+        assert_eq!(
+            envelope.context.source_authority,
+            Some(fresh_core::api::AuthorityStamp {
+                id: 17,
+                generation: 3,
+            })
+        );
+        assert_eq!(envelope.context.window_scope, Some(fresh_core::WindowId(7)));
+        assert_eq!(
+            envelope.context.purpose,
+            fresh_core::api::PluginCommandPurpose::CompensatingCleanup
+        );
+        assert!(Arc::ptr_eq(
+            envelope.context.state_snapshot.as_ref().unwrap(),
+            &snapshot
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     // ==================== Debug Test ====================
@@ -12217,7 +15100,7 @@ mod tests {
             .unwrap();
 
         // Verify the LoadPlugin command was sent
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::LoadPlugin { path, callback_id } => {
                 assert_eq!(path.to_str().unwrap(), "/path/to/plugin.ts");
@@ -12243,7 +15126,7 @@ mod tests {
             .unwrap();
 
         // Verify the UnloadPlugin command was sent
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::UnloadPlugin { name, callback_id } => {
                 assert_eq!(name, "my-plugin");
@@ -12269,7 +15152,7 @@ mod tests {
             .unwrap();
 
         // Verify the ReloadPlugin command was sent
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::ReloadPlugin { name, callback_id } => {
                 assert_eq!(name, "my-plugin");
@@ -12298,7 +15181,7 @@ mod tests {
             .unwrap();
 
         // Get the callback_id from the command
-        let callback_id = match rx.try_recv().unwrap() {
+        let callback_id = match rx.try_recv().unwrap().command {
             PluginCommand::LoadPlugin { callback_id, .. } => callback_id,
             cmd => panic!("Expected LoadPlugin, got {:?}", cmd),
         };
@@ -12353,7 +15236,7 @@ mod tests {
             .clone()
             .with(|ctx| {
                 let version: u32 = ctx.globals().get("_apiVersion").unwrap();
-                assert_eq!(version, 2);
+                assert_eq!(version, 3);
             });
     }
 
@@ -12376,7 +15259,7 @@ mod tests {
             .unwrap();
 
         // Get the callback_id from the command
-        let callback_id = match rx.try_recv().unwrap() {
+        let callback_id = match rx.try_recv().unwrap().command {
             PluginCommand::UnloadPlugin { callback_id, .. } => callback_id,
             cmd => panic!("Expected UnloadPlugin, got {:?}", cmd),
         };
@@ -12423,7 +15306,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetGlobalState {
                 plugin_name,
@@ -12454,7 +15337,7 @@ mod tests {
             )
             .unwrap();
 
-        let cmd = rx.try_recv().unwrap();
+        let cmd = rx.try_recv().unwrap().command;
         match cmd {
             PluginCommand::SetGlobalState {
                 plugin_name,

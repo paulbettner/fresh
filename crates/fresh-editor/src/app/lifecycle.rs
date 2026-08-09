@@ -352,6 +352,10 @@ impl Editor {
                 self.focus_gained();
                 Ok(true)
             }
+            Ev::FocusLost => {
+                self.cancel_active_mouse_gesture();
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -381,6 +385,7 @@ impl Editor {
     /// plugin hook is signature-deduped, so callers never need to decide
     /// "did this actually change the layout?" — they just call `relayout`.
     pub fn relayout(&mut self) {
+        self.mouse_layout_generation = self.mouse_layout_generation.wrapping_add(1);
         // Derive the dock width from its placement (the source of truth),
         // exactly as the renderer's `compute_dock_split` does, so the
         // geometry we push down matches what gets painted.
