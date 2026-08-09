@@ -152,6 +152,7 @@ Keyboard and mouse input is now parsed by our own `fresh-input-parser` crate ins
   * Fixed a crash when navigating to an unreachable remote workspace.
 * **Terminal**
   * Scrollback no longer loses output or gets stuck mid-scroll (#2649, reported by @dmknght).
+  * Drag selection now includes the cell under the pointer and publishes the completed selection on mouse-up, fixing the one-cell-behind right edge and macOS `Command+C` clipboard behavior.
 * **Tabs & splits**
   * A long filename no longer hides other tabs, and per-split scrolling is fixed (#2650, reported by @dmknght).
   * Closing a split now asks for confirmation first.
