@@ -15073,15 +15073,15 @@ editor.on("widget_event", (e) => {
         // Up/Down on a focused action button (Stop / Archive /
         // Delete / Details / +New Session) routes to the sessions
         // list via the host's smart-key dispatch but leaves focus
-        // on the button. Snap focus back to Visit so the user can
-        // press Enter to open the newly-highlighted session — the
-        // dialog's whole reason for being. Idempotent when focus
-        // is already on Visit. Skipped in bulk mode and during a
-        // confirm, where "visit" isn't in the spec.
+        // on the button. Keep Enter routed through Visit, while
+        // giving Space back to the sessions list so the highlighted
+        // row can be checkbox-selected for bulk actions. Skipped in
+        // bulk mode and during a confirm, where "visit" isn't in the
+        // spec.
         if (selectedSessions().length < 2 && !openDialog.pendingConfirm) {
           const focusKey = selectedPreviewPrimaryKey();
           openPanel.setFocusKey(focusKey);
-          pickerFocusKey = focusKey;
+          pickerFocusKey = "sessions";
         }
       }
       return;

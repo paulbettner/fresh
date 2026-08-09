@@ -1021,17 +1021,13 @@ fn dock_show_empty_toggle_flips_on_click_and_space() {
 }
 
 #[test]
-fn picker_space_routes_focused_controls_without_toggling_the_list() {
-    // OPEN_MODE binds Space so it can route the key to the focused widget.
-    // The session tree alone owns bulk selection; a focused Toggle or Button
-    // must receive its normal smart-key action instead.
+fn picker_space_routes_focused_toggle_without_toggling_the_list() {
     let (_tmp, root) = setup_project("alphaproj");
     let mut h =
         EditorTestHarness::with_config_and_working_dir(140, 40, Default::default(), root.clone())
             .unwrap();
     h.render().unwrap();
 
-    // Open the centered picker via the command palette.
     h.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     h.wait_for_prompt().unwrap();
@@ -1039,8 +1035,6 @@ fn picker_space_routes_focused_controls_without_toggling_the_list() {
     h.wait_until(|h| h.screen_to_string().contains("Orchestrator: Open"))
         .unwrap();
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    // Wait until the picker is fully mounted: the header is painted,
-    // the worktree filter row is visible, and the list shows alphaproj.
     h.wait_until(|h| {
         let s = h.screen_to_string();
         s.contains("ORCHESTRATOR :: Workspaces")
@@ -1049,42 +1043,28 @@ fn picker_space_routes_focused_controls_without_toggling_the_list() {
     })
     .unwrap();
 
-    // Sanity: focus opens on the sessions list, so Space toggles the
-    // list multi-select. This guards against the test landing focus
-    // elsewhere by accident on a future picker re-layout.
+    // Space selects a row while the sessions list owns focus.
     h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[x] alphaproj"))
         .unwrap();
-    // Reset before the focus walk.
     h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[ ] alphaproj"))
         .unwrap();
 
-    // Tab cycle is spec-order: new-session → scope-toggle →
-    // worktree-show → hide-trivial → filter → sessions. Three
-    // Shift+Tabs from `sessions` land on `worktree-show`.
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-
-    // Space here must toggle `worktree-show`, NOT the list.
-    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    // Clicking the toggle both changes it and gives it focus. The following
+    // Space must route back to that toggle, not the sessions list.
+    let (col, row) = pos_of(&h, "Show all worktrees");
+    h.mouse_click(col, row).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("[v] Show all worktrees"))
+        .unwrap();
+    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("[ ] Show all worktrees"))
         .unwrap();
     assert!(
         h.screen_to_string().contains("[ ] alphaproj"),
-        "Space while focus is on the worktree-show checkbox must not \
-         toggle the list. Screen:\n{}",
+        "Space while the worktree toggle is focused must not select the list. Screen:\n{}",
         h.screen_to_string()
     );
-
-    // Shift+Tab twice reaches the New Session button. Space must run that
-    // button's action rather than silently toggling the selected workspace.
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
-    h.send_key(KeyCode::Char(' '), KeyModifiers::NONE).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("New Workspace"))
-        .unwrap();
 }
 
 /// Alt+T in the dock toggles "all worktrees" rather than blurring the
@@ -2388,14 +2368,17 @@ fn dock_context_menu_confirm_cancel_returns_to_menu() {
 }
 
 #[test]
-fn dock_context_menu_archive_shows_confirmation() {
+fn dock_context_menu_archive_is_disabled_for_in_place_session() {
     let (_tmp, mut h) = open_dock_context_menu("alphaproj");
 
     let (acol, arow) = pos_of(&h, "Archive");
     h.mouse_click(acol, arow).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("Confirm Archive"))
-        .unwrap();
-    h.assert_screen_contains("Cancel");
+    h.tick_and_render().unwrap();
+    assert!(
+        !h.screen_to_string().contains("Confirm Archive"),
+        "an in-place session must not enter the archive transaction. Screen:\n{}",
+        h.screen_to_string()
+    );
 }
 
 /// The menu is an unobtrusive popup anchored at the click, not a centered

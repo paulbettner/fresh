@@ -42,6 +42,21 @@ fn editor_in(project: &Path, dir_context: &DirectoryContext) -> fresh::app::Edit
     .unwrap()
 }
 
+fn wait_for_workspace(dir_context: &DirectoryContext, root: &Path) -> Workspace {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(workspace) = Workspace::load_in(dir_context, root).unwrap() {
+            return workspace;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace checkpoint was not published for {}",
+            root.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Switching away from a window writes its workspace immediately — a later
 /// hard kill (no clean quit) still finds it in the registry.
 #[test]
@@ -75,9 +90,7 @@ fn switching_away_persists_the_outgoing_window_without_a_quit() {
     let win_b = e.create_window_at(proj_b.clone(), "b".into());
     e.set_active_window(win_b);
 
-    let saved = Workspace::load_in(&dir_context, &proj_a)
-        .unwrap()
-        .expect("switching away must persist the outgoing window without a quit");
+    let saved = wait_for_workspace(&dir_context, &proj_a);
     assert_eq!(
         saved.working_dir, proj_a,
         "the persisted workspace is window A's, keyed on its own root"
@@ -332,9 +345,7 @@ fn tagging_a_new_session_persists_it_without_a_quit() {
         },
     ));
 
-    let after = Workspace::load_in(&dir_context, &proj_b)
-        .unwrap()
-        .expect("tagging a session's identity must persist it without a quit");
+    let after = wait_for_workspace(&dir_context, &proj_b);
     assert_eq!(after.working_dir, proj_b);
     assert_eq!(
         after.session_plugin_state["orchestrator"]["project_path"],
@@ -378,10 +389,7 @@ fn deleting_an_in_place_session_forgets_its_persisted_workspace() {
     // registry (and leaves A non-active, non-last so it can be closed).
     let win_b = e.create_window_at(proj_b.clone(), "b".into());
     e.set_active_window(win_b);
-    assert!(
-        Workspace::load_in(&dir_context, &proj_a).unwrap().is_some(),
-        "precondition: switching away persisted A's workspace"
-    );
+    let _ = wait_for_workspace(&dir_context, &proj_a);
 
     // Closing the window alone does NOT forget the persisted workspace —
     // exactly why a deleted in-place row used to reappear after a restart.

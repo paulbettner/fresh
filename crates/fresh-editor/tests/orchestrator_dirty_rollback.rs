@@ -67,8 +67,9 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 fn dirty_after_precheck_refuses_worktree_rollback_and_keeps_journal() {
     fresh::i18n::set_locale("en");
     let base = tempfile::tempdir().unwrap();
-    let dir_context = isolated_dir_context(base.path());
-    let repo = base.path().join("repo");
+    let base_path = base.path().canonicalize().unwrap();
+    let dir_context = isolated_dir_context(&base_path);
+    let repo = base_path.join("repo");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["config", "user.name", "Test User"]);
@@ -91,7 +92,7 @@ fn dirty_after_precheck_refuses_worktree_rollback_and_keeps_journal() {
     assert!(real_git.status.success());
     let real_git = String::from_utf8(real_git.stdout).unwrap();
     let shim_dir = tempfile::tempdir().unwrap();
-    let removed_target = base.path().join("rollback-target");
+    let removed_target = base_path.join("rollback-target");
     let shim = shim_dir.path().join("git");
     fs::write(
         &shim,
@@ -150,7 +151,6 @@ exec "{real_git}" "$@"
             h.editor()
                 .get_status_message()
                 .is_some_and(|status| status.contains("PASS dirty rollback"))
-                && removed_target.exists()
         })
         .unwrap_or_else(|_| {
             panic!(
@@ -159,6 +159,21 @@ exec "{real_git}" "$@"
                 harness.screen_to_string(),
             )
         });
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir_context
+                .data_dir
+                .join("orchestrator/state/orchestrator.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        removed_target.exists(),
+        "rollback never attempted git worktree remove: {:?}\n{}",
+        harness.editor().get_status_message(),
+        harness.screen_to_string(),
+    );
 
     let worktree = fs::read_to_string(&removed_target).unwrap();
     let worktree = Path::new(worktree.trim());
@@ -171,15 +186,6 @@ exec "{real_git}" "$@"
             .contains(worktree.to_string_lossy().as_ref()),
         "refused rollback detached the dirty worktree",
     );
-    let state: serde_json::Value = serde_json::from_slice(
-        &fs::read(
-            dir_context
-                .data_dir
-                .join("orchestrator/state/orchestrator.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
     assert!(state.as_object().unwrap().iter().any(|(key, value)| {
         key.starts_with("orchestrator.create_journal:")
             && value["worktree"]["root"].as_str() == Some(worktree.to_string_lossy().as_ref())

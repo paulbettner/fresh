@@ -308,7 +308,6 @@ fn old_terminal_exit_before_reconnect_event_preserves_binding_by_published_gener
             .with_filesystem(fs),
     )
     .unwrap();
-    let window_id = harness.editor().active_session_id();
     let (old_id, buffer_id) = harness
         .editor_mut()
         .active_window_mut()
@@ -328,18 +327,12 @@ fn old_terminal_exit_before_reconnect_event_preserves_binding_by_published_gener
     generation.store(1, Ordering::SeqCst);
     connected.store(true, Ordering::SeqCst);
     harness
-        .editor()
-        .active_window()
-        .bridge
-        .sender()
-        .send(
-            fresh::services::async_bridge::AsyncMessage::TerminalExited {
-                terminal: fresh_core::WindowTerminalId::new(window_id, old_id),
-                exit_code: Some(0),
-            },
-        )
-        .unwrap();
-    harness.editor_mut().process_async_messages();
+        .wait_until(|h| {
+            h.editor()
+                .get_status_message()
+                .is_some_and(|status| status.contains("Terminal 0 exited"))
+        })
+        .expect("the concrete terminal exit should drain and preserve the binding");
 
     assert_eq!(
         harness.editor().active_window().get_terminal_id(buffer_id),

@@ -1060,16 +1060,17 @@ impl Editor {
         // factory picks the persisted active id/root, attaches the
         // seed buffer + LSP to it directly, and the constructor
         // sees a well-formed windows map.
-        // Orchestrator persistence lives under the local `data_dir`, so it
-        // must be read through the local filesystem — never the authority's
-        // (which is the *remote* SSH backend on an SSH launch). Routing these
-        // local-disk reads over SSH is both wrong (it queries the remote
-        // host's copy of a local-machine question) and catastrophically slow
-        // (one network round-trip per workspace file). The window content
-        // below still flows through the authority filesystem; only this
-        // editor-wide registry read is pinned local.
+        // Orchestrator persistence always stays on the local backend. A local
+        // authority may carry an injected filesystem (tests, slow I/O, fault
+        // injection), so reuse it; remote authorities remain pinned to the
+        // host's real local filesystem rather than routing data-dir reads over
+        // SSH.
         let orchestrator_filesystem: Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> =
-            Arc::new(crate::model::filesystem::StdFileSystem);
+            if authority.filesystem.remote_connection_info().is_none() {
+                Arc::clone(&authority.filesystem)
+            } else {
+                Arc::new(crate::model::filesystem::StdFileSystem)
+            };
         crate::workspace::recover_terminal_extractions(&dir_context).map_err(|error| {
             anyhow::anyhow!("terminal extraction recovery remains unresolved: {error}")
         })?;

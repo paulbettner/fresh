@@ -70,15 +70,18 @@ async function probeSupersededFocus(): Promise<void> {
     editor.setStatus("SUPERSEDED_ERROR:not enough discovered workspaces");
     return;
   }
+  const sourceRoot = editor.listWindows().find((window) =>
+    window.id === editor.activeWindow()
+  )?.root;
   const firstRoot = discovered[0].root;
   const first = api.focusWorkspace(discovered[0].windowId);
   const second = api.focusWorkspace(discovered[1].windowId);
   const [firstFocused, secondFocused] = await Promise.all([first, second]);
   const firstRows = api.listWorkspaces().filter((row) => row.root === firstRoot);
-  editor.setStatus(
-    `SUPERSEDED:${firstFocused}:${secondFocused}:${firstRows.length}:` +
-      `${firstRows.every((row) => row.windowId > 0)}`,
-  );
+  const result = `SUPERSEDED:${firstFocused}:${secondFocused}:${firstRows.length}:` +
+    `${firstRows.every((row) => row.windowId > 0)}`;
+  if (sourceRoot) editor.writeFile(`${sourceRoot}/.focus-probe-result`, result);
+  editor.setStatus(result);
 }
 registerHandler("probeSupersededFocus", probeSupersededFocus);
 editor.registerCommand(
@@ -143,6 +146,27 @@ fn cell_text_position(harness: &EditorTestHarness, needle: &str) -> Option<(u16,
         }
     }
     None
+}
+
+fn select_two_discovered_sessions(harness: &mut EditorTestHarness) {
+    // The base checkout is selected first. Move through the two stably-sorted
+    // discovered rows and use the picker's Space action to checkbox-select each.
+    for _ in 0..2 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        harness
+            .send_key(KeyCode::Char(' '), KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            ["feature-x", "feature-y"].iter().all(|label| {
+                screen
+                    .lines()
+                    .any(|line| line.contains(label) && line.contains("[x]"))
+            })
+        })
+        .unwrap_or_else(|_| panic!("Space did not select both discovered sessions"));
 }
 
 /// Run a git subcommand in `cwd`, panicking with stderr on failure.
@@ -255,31 +279,11 @@ fn wait_for_command(harness: &mut EditorTestHarness, name: &str) {
 
 fn run_palette_command(harness: &mut EditorTestHarness, name: &str) {
     wait_for_command(harness, name);
-    harness
-        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    harness.wait_for_prompt().unwrap();
-    harness.type_text(name).unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains(name))
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
+    harness.run_palette_command(name).unwrap();
 }
 
 fn open_orchestrator_dialog(harness: &mut EditorTestHarness) {
-    harness
-        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    harness.wait_for_prompt().unwrap();
-    harness.type_text("Orchestrator: Open").unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Orchestrator: Open"))
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
+    harness.run_palette_command("Orchestrator: Open").unwrap();
     harness
         .wait_until(|h| h.screen_to_string().contains("ORCHESTRATOR :: Workspaces"))
         .unwrap();
@@ -303,15 +307,7 @@ fn ensure_worktrees_shown(harness: &mut EditorTestHarness) {
 
 fn open_new_session_form(harness: &mut EditorTestHarness) {
     harness
-        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    harness.wait_for_prompt().unwrap();
-    harness.type_text("Orchestrator: New Workspace").unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Orchestrator: New Workspace"))
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .run_palette_command("Orchestrator: New Workspace")
         .unwrap();
     harness
         .wait_until(|h| {
@@ -682,11 +678,9 @@ fn rows_sort_stably_main_checkout_above_worktrees() {
     );
 }
 
-/// Space-selecting two rows shows the dedicated bulk selection bar
-/// (Layout B) with per-action counts. Uses the two discovered
-/// worktree rows (selectable, no PTY needed). Space is the rebindable
-/// `orchestrator_toggle_select` mode chord, so it fires regardless of
-/// which control holds focus.
+/// Checking two rows with Space shows the dedicated bulk selection bar
+/// (Layout B) with per-action counts. Uses the two discovered worktree rows
+/// (selectable, no PTY needed).
 #[test]
 fn space_selects_rows_and_shows_bulk_bar() {
     let (_temp, repo, _wt1, _wt2) = set_up_repo_with_two_worktrees();
@@ -704,17 +698,7 @@ fn space_selects_rows_and_shows_bulk_bar() {
         })
         .unwrap();
 
-    // Highlight the first discovered row and check it; move down and
-    // check the second.
-    navigate_to_discovered_row(&mut harness);
-    harness
-        .send_key(KeyCode::Char(' '), KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness
-        .send_key(KeyCode::Char(' '), KeyModifiers::NONE)
-        .unwrap();
+    select_two_discovered_sessions(&mut harness);
 
     harness
         .wait_until(|h| {
@@ -730,10 +714,9 @@ fn space_selects_rows_and_shows_bulk_bar() {
         });
 }
 
-/// Bulk-deleting two checked discovered worktrees runs `git worktree
-/// remove` on both, so their directories disappear from disk. Drives
-/// the selection → Delete (2) → Confirm Delete flow entirely from the
-/// keyboard.
+/// Bulk-deleting two checked discovered worktrees runs `git worktree remove`
+/// on both, so their directories disappear from disk. Drives the destructive
+/// selection → Delete (2) → Confirm Delete transaction.
 #[test]
 fn bulk_delete_removes_selected_worktrees() {
     let (temp, repo, wt1, wt2) = set_up_repo_with_two_worktrees();
@@ -762,27 +745,16 @@ fn bulk_delete_removes_selected_worktrees() {
         })
         .unwrap();
 
-    // Check both discovered rows.
-    navigate_to_discovered_row(&mut harness);
-    harness
-        .send_key(KeyCode::Char(' '), KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness
-        .send_key(KeyCode::Char(' '), KeyModifiers::NONE)
-        .unwrap();
+    select_two_discovered_sessions(&mut harness);
     harness
         .wait_until(|h| h.screen_to_string().contains("Delete (2)"))
         .unwrap();
 
-    // Entering bulk mode lands focus on `Archive`; Tab to `Delete`
-    // (Stop is disabled for discovered rows, so it's out of the Tab
-    // cycle), Enter to open the confirm panel.
-    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
+    // Click the enabled bulk Delete action. This test owns the destructive
+    // transaction after the keyboard selection path above.
+    let (delete_col, delete_row) =
+        cell_text_position(&harness, "Delete (2)").expect("bulk delete action should be visible");
+    harness.mouse_click(delete_col, delete_row).unwrap();
     harness
         .wait_until(|h| h.screen_to_string().contains("Confirm Delete"))
         .unwrap_or_else(|_| {
@@ -1294,23 +1266,24 @@ fn superseded_attach_flight_is_still_finalized() {
     }
     let (_temp, repo, _wt1, wt2) = set_up_repo_with_two_worktrees();
     install_focus_probe(&repo);
-    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo).unwrap();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
     harness.tick_and_render().unwrap();
     open_orchestrator_dialog(&mut harness);
     ensure_worktrees_shown(&mut harness);
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
 
+    let focus_result = repo.join(FOCUS_RESULT_FILE);
     run_palette_command(&mut harness, "Test: Supersede Discovered Workspace Focus");
     harness
-        .wait_until(|h| {
-            h.editor()
-                .get_status_message()
-                .is_some_and(|status| status.contains("SUPERSEDED:false:true:1:true"))
+        .wait_until(|_| {
+            std::fs::read_to_string(&focus_result)
+                .ok()
+                .is_some_and(|result| result.contains("SUPERSEDED:false:true:1:true"))
         })
         .unwrap_or_else(|_| {
             panic!(
                 "superseded attach was not finalized exactly once: {:?}\n{}",
-                harness.editor().get_status_message(),
+                std::fs::read_to_string(&focus_result).ok(),
                 harness.screen_to_string(),
             )
         });
@@ -1338,7 +1311,7 @@ fn post_create_target_lease_loss_compensates_exact_workspace() {
         160,
         50,
         HarnessOptions::new()
-            .with_working_dir(repo)
+            .with_working_dir(repo.clone())
             .with_shared_dir_context(dir_context.clone())
             .with_filesystem(fault_fs.clone()),
     )
@@ -1349,17 +1322,18 @@ fn post_create_target_lease_loss_compensates_exact_workspace() {
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     fault_fs.arm();
 
+    let focus_result = repo.join(FOCUS_RESULT_FILE);
     run_palette_command(&mut harness, "Test: Focus Discovered Workspace");
     harness
-        .wait_until(|h| {
-            h.editor()
-                .get_status_message()
-                .is_some_and(|status| status.contains("FOCUS_ERROR:"))
+        .wait_until(|_| {
+            std::fs::read_to_string(&focus_result)
+                .ok()
+                .is_some_and(|result| result.contains("FOCUS_ERROR:"))
         })
         .unwrap_or_else(|_| {
             panic!(
                 "post-create lease loss did not reject: {:?}\n{}",
-                harness.editor().get_status_message(),
+                std::fs::read_to_string(&focus_result).ok(),
                 harness.screen_to_string(),
             )
         });
